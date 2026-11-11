@@ -2,11 +2,40 @@
 import argparse
 import ast
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def write_report(path, result):
+    """Replace the directory entry, never truncate an existing aliased inode.
+
+    The report directory and its ancestors must remain trusted/stable during
+    this call. This is not a sandbox against concurrent directory mutation.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         dir=path, prefix='.result-',
+                                         suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(result, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        if (path / 'result.json').is_symlink():
+            raise OSError('report file must not be a symlink')
+        os.replace(temporary, path / 'result.json')
+    except OSError as exc:
+        print('report write failed: ' + str(exc), file=sys.stderr)
+        return False
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
 
 
 def main():
@@ -27,7 +56,6 @@ def main():
                    'tests/' + args.suite, '-v']
         # Import the package without installs; native integration retains all
         # inherited runtime authorization and fencing unchanged.
-        import os
         env = dict(os.environ)
         env['PYTHONPATH'] = str(ROOT / 'src') + os.pathsep + env.get('PYTHONPATH', '')
         try:
@@ -36,10 +64,9 @@ def main():
             status, output = run.returncode, run.stdout + run.stderr
         except subprocess.TimeoutExpired:
             status, output = 124, 'test timeout after 120 seconds'
-        (path / 'result.json').write_text(json.dumps(
-            {'command': command, 'exit': status, 'output': output}, indent=2) + '\n')
+        written = write_report(path, {'command': command, 'exit': status, 'output': output})
         print(output)
-        return status
+        return status if written else (status or 1)
     output = []
     status = 0
     try:
@@ -58,9 +85,9 @@ def main():
         output.append(str(exc))
         status = 1
     result = {'command': args.command, 'exit': status, 'output': output}
-    (path / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    written = write_report(path, result)
     print('\n'.join(output))
-    return status
+    return status if written else (status or 1)
 
 
 if __name__ == '__main__':
