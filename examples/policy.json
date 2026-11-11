@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "board": "seven-bot-v1",
+  "project": "hermes-teams",
+  "repository": "timmypai/hermes-teams",
+  "grants": {
+    "child:EXAMPLE_ROOT:0": {
+      "work_kind": "implementation",
+      "assignee": "developer"
+    },
+    "child:EXAMPLE_ROOT:1": {
+      "work_kind": "research",
+      "assignee": "researcher"
+    }
+  }
+}
