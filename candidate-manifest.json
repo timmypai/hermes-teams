@@ -1,0 +1,200 @@
+{
+  "request_id": "seven-bot-v1-20261111",
+  "requirements_revision": 2,
+  "design_version": "1.0",
+  "source_revision": "WP04-F1-corrective-v2-final-correction2",
+  "task": "t_99ebca9f",
+  "run": 36,
+  "completion_contract": "timmypai/hermes-teams",
+  "status": "SOURCE_FROZEN_NOT_ACCEPTED",
+  "immutable_storage": false,
+  "commit_created": false,
+  "commit": null,
+  "desired_custody_branch": "feat/wp04-f1-corrective-v2",
+  "lineage": {
+    "original_task": "t_2905d883",
+    "rejected_commit": "b76e793c86e15cfb7cacc2c24d0d970d43883398",
+    "rejected_tree": "cd050d4a178c0ac451fb80c5107c9418cc3dc789",
+    "parent": "2aabda641995c2a94cc3a8656d4e2a9e66085d78",
+    "manifest_sha256": "72875a49bc41253d2c74bb10c04ce7f111e0e11952312f32e507226f266e03e8",
+    "independent_original_verdict": "SOURCE_FAIL, Reviewer Run34; preserved",
+    "initialization": "Only 25 fixed publication payload paths, checked by native stat/sha256sum/Git blob comparison; no Git metadata or prior reports copied",
+    "prior_f1_manifest_sha256": "019ecab0f544ae50d2cd692ada901ab760e4a9ca124a5806bf1b0f3c2d443ec2",
+    "prior_f1_native_result": "Operator Ran19/FAIL1; unmanaged control oracle mismatch; preserved, not superseded as PASS"
+  },
+  "upstream_commit": "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
+  "base_hashes": "patches/base.json",
+  "patched_hashes": "patches/patched-sha256.json",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "mode": "100644",
+      "sha256": "8c25ce97a3b09bf224a40bd3cc855a01640b7b4726d51bd562039d9459e15739"
+    },
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "sha256": "5afdef710b7aa723fb36db2d748ab6b966cde5fcdd998716aa241e80b242810a"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "sha256": "f9d183728eaca584c4b04a37bdfd76ba1651ff552cb311b49552b90fe889de48"
+    },
+    {
+      "path": "examples/policy.json",
+      "mode": "100644",
+      "sha256": "10ad32d47686d5b357d16250c3c5d036dabab4ef7128ef1d960b1df6b6d5d0bf"
+    },
+    {
+      "path": "patches/UPSTREAM-LICENSE",
+      "mode": "100644",
+      "sha256": "821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6"
+    },
+    {
+      "path": "patches/base.json",
+      "mode": "100644",
+      "sha256": "e33a2281e2c22869545814985728278688efcc82c72f7afcfdbd06b9b79644ea"
+    },
+    {
+      "path": "patches/contracts.patch",
+      "mode": "100644",
+      "sha256": "beeb8807f7798f4de8a52183f02bc75abee8c2e6c3da1f12112572c3faf0de0e"
+    },
+    {
+      "path": "patches/edits.json",
+      "mode": "100644",
+      "sha256": "58c07e98e5e5c70db46ae92ea93cd8ee38d7f48d71024bc1523ad3e498d168c6"
+    },
+    {
+      "path": "patches/patched-sha256.json",
+      "mode": "100644",
+      "sha256": "4b3325598f2808c40fdb0b922942c7ca8152f42c1a7e30e8f0d4a47ddef63068"
+    },
+    {
+      "path": "patches/runtime-image.json",
+      "mode": "100644",
+      "sha256": "96f8220e8075386d4ed7aff5116587ff84c9ed208b4855be4fd6a66557c3c9b1"
+    },
+    {
+      "path": "scripts/ci/check.sh",
+      "mode": "100644",
+      "sha256": "cde0be543ee353716ef881fb3e61f4b079a74bdfb83dd6627c0cc69102d59be1"
+    },
+    {
+      "path": "scripts/ci/native.py",
+      "mode": "100644",
+      "sha256": "8bad4dea16dac286ba7cf0bb4115bd5f5119f05236bd75ec664ba2ed3a021ffd"
+    },
+    {
+      "path": "scripts/ci/run.py",
+      "mode": "100644",
+      "sha256": "a317312cd97c8d490f731c85554d2bebd0115f678124bdad37d2d46a6f6a820d"
+    },
+    {
+      "path": "scripts/ci/test.sh",
+      "mode": "100644",
+      "sha256": "ff706b64d280ac8d43ac3d99b4421c042372087b023697b9053f6f08d5a034ec"
+    },
+    {
+      "path": "scripts/validate_patch.py",
+      "mode": "100644",
+      "sha256": "9479657c33295008231cd0a29e235397278d17d3b706e388f06e9751d49b6350"
+    },
+    {
+      "path": "src/hermes_teams/__init__.py",
+      "mode": "100644",
+      "sha256": "78455bd74f21fc5cc511fac6d90e2a3162488895a6468c2a267cd90cfa47a5ee"
+    },
+    {
+      "path": "src/hermes_teams/native.py",
+      "mode": "100644",
+      "sha256": "baaf26b30cbcdb9e2a8511033d00bc83ad1aee8a6321f928aa7b48e43cccad74"
+    },
+    {
+      "path": "src/hermes_teams/patching.py",
+      "mode": "100644",
+      "sha256": "d7f81084020508b4c1c0e94f688e7c8fb5fd8f7ebf6c109bcfba0145ccb94102"
+    },
+    {
+      "path": "src/hermes_teams/policy.py",
+      "mode": "100644",
+      "sha256": "902d54bcbc97fd1524d802cde7401978e443ce1f9df95e8d0c2c17940d437edc"
+    },
+    {
+      "path": "src/hermes_teams/site_policy.py",
+      "mode": "100644",
+      "sha256": "ebd8f29cf886514adb294975d2bbb8f324f0496348f7a6e0bfa83cf42cd97423"
+    },
+    {
+      "path": "tests/integration/test_native.py",
+      "mode": "100644",
+      "sha256": "a5ba83fd92ac8e5be6ca0fe230390d4ba927915ddc59f9110914e63adc90f744"
+    },
+    {
+      "path": "tests/integration/test_unmanaged_baseline.py",
+      "mode": "100644",
+      "sha256": "227296dbe154a8880a9302412decb8aebc8e91cf4d2e13384694a22fa1231ff0"
+    },
+    {
+      "path": "tests/unit/test_boundaries.py",
+      "mode": "100644",
+      "sha256": "f483bb322c470b538e51d42038c7b7663bfe71ba8a3251b087395da6cbe170d8"
+    },
+    {
+      "path": "tests/unit/test_ci.py",
+      "mode": "100644",
+      "sha256": "01fdbb7ef9fdf4caeb620e09a16d02fb8d347cc5012a152aa1fbd32d0cb5f362"
+    },
+    {
+      "path": "tests/unit/test_patch.py",
+      "mode": "100644",
+      "sha256": "ef94102167a818436aac6d4ec43a84f86a3f5cc7bad10e5c5710fb1f2974502f"
+    },
+    {
+      "path": "tests/unit/test_policy.py",
+      "mode": "100644",
+      "sha256": "4a3ab41dceb6d3dbdae90661b8b58fbbc7e12e0582a5c07de00d7adb1b8c831b"
+    },
+    {
+      "path": "tests/unit/test_workspace.py",
+      "mode": "100644",
+      "sha256": "4084d051ae0c46a3bc1ee6859bbd51a5f86c0ac7a87c4afbfd07bc3868c55ef0"
+    }
+  ],
+  "deletions": [],
+  "added_paths": [
+    "tests/unit/test_workspace.py",
+    "tests/integration/test_unmanaged_baseline.py"
+  ],
+  "manifest_mode": "100644",
+  "manifest_self_hashed": false,
+  "excluded": [
+    ".git/",
+    ".agents/",
+    ".codex/",
+    "reports/"
+  ],
+  "correction_budget": {
+    "consumed": 2,
+    "maximum": 2,
+    "remaining": 0,
+    "meaning": "Final source correction only; new native and independent acceptance pending; no repair3"
+  },
+  "verification": {
+    "baseline": "18 tests passed,exit0",
+    "cleaner": "intended RED1 -> GREEN0",
+    "direct_graph_portable": "intended RED1 -> GREEN0",
+    "patched_receipt": "intended RED1 -> GREEN0",
+    "final_unit": "Run36:22 tests passed,exit0,no skips",
+    "final_check": "Run36:AST/shell syntax exit0",
+    "exact_source_dry_run": "Run36:DRY_RUN_VALID exit0,input_unchanged true",
+    "native_integration": "NOT_RUN by author;20 tests authored; NEW operator unpatched comparison and full patched suite pending",
+    "independent_verdict": "NOT_RUN for new source",
+    "git_custody": "PENDING",
+    "PR_CI": "NOT_RUN",
+    "oracle_correction": "Pinned static baseline confirms graph NULL; prior operator RED retained; native GREEN pending"
+  },
+  "private_evidence": "reports/f1-r2-author-handoff.md; reports/f1-r2-*.log/.exit; prior reports/f1-* retained unchanged",
+  "wait_external_event": "F1-new-freeze-operator-native-validation-and-durable-Git-custody"
+}

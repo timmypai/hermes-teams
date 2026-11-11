@@ -1,0 +1,4 @@
+{
+  "image": "docker.io/nousresearch/hermes-agent@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002",
+  "verification": "Operator verified registry manifest only; source baseline/runtime tests not yet verified."
+}

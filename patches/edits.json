@@ -1,0 +1,60 @@
+{
+  "hermes_cli/kanban_decompose.py": [
+    [
+      "def _clean_children(task_id: str, raw_tasks: list, routing: _Routing)",
+      "def _clean_children(task_id: str, raw_tasks: list, routing: _Routing, *, policy=None)"
+    ],
+    [
+      "    children: list[dict] = []\n    for idx, entry in enumerate(raw_tasks):",
+      "    if policy is not None:\n        from hermes_teams.policy import clean_children\n        try:\n            return clean_children(policy, task_id, raw_tasks, routing.valid_names), \"\"\n        except ValueError as exc:\n            return [], str(exc)\n    children: list[dict] = []\n    for idx, entry in enumerate(raw_tasks):"
+    ],
+    [
+      "    children, reason = _clean_children(task_id, raw_tasks, routing)\n    if reason:\n        return DecomposeOutcome(task_id, False, reason)\n    try:\n        with kbc.connect_closing() as conn:\n            child_ids = decompose_triage_task(",
+      "    try:\n        with kbc.connect_closing() as conn:\n            from hermes_teams.native import bound_policy\n            children, reason = _clean_children(task_id, raw_tasks, routing, policy=bound_policy(conn))\n            if reason:\n                return DecomposeOutcome(task_id, False, reason)\n            child_ids = decompose_triage_task("
+    ],
+    [
+      "    with kbc.connect_closing() as conn:\n        ok = kb.specify_triage_task(\n            conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,\n        )",
+      "    try:\n        with kbc.connect_closing() as conn:\n            from hermes_teams.native import bound_policy\n            from hermes_teams.policy import prepare\n            policy = bound_policy(conn)\n            managed = {}\n            if policy is not None:\n                managed = prepare(policy, \"single:\" + task.id, parsed,\n                                  previous=task.completion_contract)\n                assignee_val = managed[\"assignee\"]\n                if assignee_val not in routing.valid_names:\n                    raise ValueError(\"trusted specialist is not installed\")\n            ok = kb.specify_triage_task(\n                conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,\n                completion_contract=managed.get(\"completion_contract\"),\n                project_id=managed.get(\"project_id\"),\n            )\n    except ValueError as exc:\n        return DecomposeOutcome(task.id, False, str(exc))"
+    ]
+  ],
+  "hermes_cli/kanban_db_graph.py": [
+    [
+      "    root_ws_kind = root_row[\"workspace_kind\"] or \"scratch\"",
+      "    from hermes_teams.native import bound_policy\n    if bound_policy(conn) is not None:\n        from hermes_teams.policy import validate_child_fields\n        validate_child_fields(child)\n    root_ws_kind = root_row[\"workspace_kind\"] or \"scratch\""
+    ],
+    [
+      "        child_ids = [\n            _insert_decomposed_child",
+      "        from hermes_teams.native import bound_policy\n        from hermes_teams.policy import normalize, validate_edges\n        from hermes_cli.kanban_pr_acceptance import validate_contract\n        policy = bound_policy(conn)\n        if policy is not None:\n            validate_edges(children)\n            children = [normalize(policy, f\"child:{task_id}:{i}\", child)\n                        for i, child in enumerate(children)]\n            for child in children:\n                child[\"completion_contract\"] = validate_contract(child[\"completion_contract\"])\n        child_ids = [\n            _insert_decomposed_child"
+    ],
+    [
+      "    _append_event(\n        conn, new_id, \"created\", {\"by\": author or \"decomposer\", \"from_decompose_of\": root_id},\n    )",
+      "    from hermes_teams.native import bound_policy\n    if bound_policy(conn) is not None:\n        conn.execute(\n            \"UPDATE tasks SET completion_contract = ?, project_id = ?, branch_name = ? WHERE id = ?\",\n            (child[\"completion_contract\"], project_id, branch_name, new_id),\n        )\n    _append_event(\n        conn, new_id, \"created\", {\"by\": author or \"decomposer\", \"from_decompose_of\": root_id},\n    )"
+    ],
+    [
+      "    new_id = _new_task_id()\n    body = child.get(\"body\")",
+      "    new_id = _new_task_id()\n    from hermes_teams.native import bound_policy\n    policy = bound_policy(conn)\n    project_id, branch_name = None, None\n    if policy is not None:\n        from hermes_cli.kanban_db import _resolve_project_link, _project_branch_name\n        import os\n        project_id, project, repo, child_ws_kind = _resolve_project_link(\n            conn, policy[\"project\"], root_id, child_ws_kind, child_ws_path)\n        if project is None or project.slug != policy[\"project\"]:\n            raise ValueError(\"managed project must resolve in native project registry\")\n        if child_ws_kind == \"worktree\":\n            if repo and not child_ws_path:\n                child_ws_path = os.path.join(repo, \".worktrees\", new_id)\n            branch_name = _project_branch_name(project, new_id, child[\"title\"])\n    body = child.get(\"body\")"
+    ]
+  ],
+  "hermes_cli/kanban_db.py": [
+    [
+      "    completion_contract = validate_contract(completion_contract)\n    model_override, provider_override",
+      "    from hermes_teams.native import bound_policy\n    from hermes_teams.policy import prepare\n    policy = bound_policy(conn)\n    if policy is not None:\n        proposal = {key: value for key, value in {\n            \"completion_contract\": completion_contract, \"project_id\": project_id,\n            \"assignee\": assignee,\n        }.items() if value is not None}\n        managed = prepare(policy, \"create:\" + (idempotency_key or \"\"), proposal)\n        completion_contract = managed[\"completion_contract\"]\n        project_id, assignee = managed[\"project_id\"], managed[\"assignee\"]\n    completion_contract = validate_contract(completion_contract)\n    model_override, provider_override"
+    ],
+    [
+      "    body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,\n) -> bool:",
+      "    body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,\n    completion_contract: Optional[str] = None, project_id: Optional[str] = None,\n) -> bool:"
+    ],
+    [
+      "            \"SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'\",",
+      "            \"SELECT title, body, assignee, completion_contract, project_id, workspace_kind, workspace_path FROM tasks WHERE id = ? AND status = 'triage'\","
+    ],
+    [
+      "        changed_fields: list[str] = []\n        if title is not None and title.strip()",
+      "        changed_fields: list[str] = []\n        from hermes_teams.native import bound_policy\n        from hermes_teams.policy import prepare\n        from hermes_cli.kanban_pr_acceptance import validate_contract\n        policy = bound_policy(conn)\n        if policy is not None:\n            # Existing exact PR bindings are not model proposals; preserve them.\n            proposal = {key: value for key, value in {\n                \"assignee\": assignee, \"project_id\": project_id,\n            }.items() if value is not None}\n            if completion_contract is not None and completion_contract != existing[\"completion_contract\"]:\n                proposal[\"completion_contract\"] = completion_contract\n            managed = prepare(policy, \"single:\" + task_id, proposal,\n                              previous=existing[\"completion_contract\"])\n            assignee = _canonical_assignee(managed[\"assignee\"])\n            native_project, project, repo, kind = _resolve_project_link(\n                conn, policy[\"project\"], task_id, existing[\"workspace_kind\"], existing[\"workspace_path\"])\n            if project is None or project.slug != policy[\"project\"]:\n                raise ValueError(\"managed project must resolve in native project registry\")\n            path = existing[\"workspace_path\"]\n            branch = None\n            if kind == \"worktree\":\n                if repo and not path:\n                    path = os.path.join(repo, \".worktrees\", task_id)\n                branch = _project_branch_name(project, task_id, title or existing[\"title\"])\n            sets.extend([\"completion_contract = ?\", \"project_id = ?\", \"workspace_kind = ?\",\n                         \"workspace_path = ?\", \"branch_name = ?\"])\n            params.extend([validate_contract(managed[\"completion_contract\"]), native_project, kind, path, branch])\n            changed_fields.extend([\"completion_contract\", \"project_id\"])\n        elif completion_contract is not None or project_id is not None:\n            raise ValueError(\"contract/project specification requires an explicit managed binding\")\n        if title is not None and title.strip()"
+    ],
+    [
+      "        conn, project_id, project_source_task_id, workspace_kind, workspace_path\n    )\n    parents = tuple",
+      "        conn, project_id, project_source_task_id, workspace_kind, workspace_path\n    )\n    if policy is not None and (project_obj is None or project_obj.slug != policy[\"project\"]):\n        raise ValueError(\"managed project must resolve in native project registry\")\n    parents = tuple"
+    ]
+  ]
+}
