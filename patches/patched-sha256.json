@@ -1,0 +1,5 @@
+{
+  "hermes_cli/kanban_decompose.py": "382399d9f6322a4ab3c0891d9d0381ae871efcdb11d3c31ab32ca57a660ec321",
+  "hermes_cli/kanban_db_graph.py": "6f0621b6212a3d2edeb2295bcc87a03cb82c593d8b1b961531e826393c05c7fc",
+  "hermes_cli/kanban_db.py": "79b3d8a5ae9a0764eaad65f1ed8253f3a580184a2d47d25580a468484f698743"
+}

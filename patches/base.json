@@ -1,0 +1,12 @@
+{
+  "upstream_commit": "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
+  "source_sha256": {
+    "hermes_cli/kanban_db.py": "fee49c5e11e86154d4946713b6c9e31b95b507d5394e8197784367d42739ca4e",
+    "hermes_cli/kanban_decompose.py": "a6e538e6d26ef0e87860c01bdb6bed5ecb42a00ed2af60967a25d40e567acbfd",
+    "hermes_cli/kanban_db_graph.py": "b3aada2c8ec77fa0b4bcdcd6be084e2e91b9c9d57c68f7200b872232b94360ed",
+    "hermes_cli/kanban_pr_acceptance.py": "6a1c9bd41a4b36b9a55bff940bd6aeac4e24e9290829e20f10fd5386f89e21df",
+    "hermes_cli/kanban_pr_acceptance_store.py": "cb5ad362162a645a2f5ae9042b86c9980bcc8a4212bddd6d1fb3d63b46fdc8cc",
+    "hermes_cli/kanban_db_connect.py": "4b6e14bd4796db77c255d8267ff2ae24cc463db25a4ee80abe3d80d83d29ccbc",
+    "tools/kanban_tools.py": "e5f48cb0b471c8624322d6d452be959a1f9505ef11398f67a6f079aeaab0d02f"
+  }
+}

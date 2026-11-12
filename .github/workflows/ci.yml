@@ -1,0 +1,24 @@
+name: Candidate checks
+on:
+  pull_request:
+  push:
+    branches: [feat/wp04-contracts]
+permissions:
+  contents: read
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: docker.io/nousresearch/hermes-agent@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Syntax checks
+        run: sh scripts/ci/check.sh --report-dir reports/ci-check
+      - name: Portable unit tests
+        run: sh scripts/ci/test.sh --suite unit --report-dir reports/ci-unit
+      - name: Mandatory exact-base native SQLite integration
+        run: python3 scripts/ci/native.py --base /opt/hermes
