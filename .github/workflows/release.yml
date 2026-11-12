@@ -1,0 +1,49 @@
+name: Release preflight only
+'on':
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full approved merged source SHA (live provenance verification not yet bound)
+        required: true
+        type: string
+      request_id:
+        description: Correlation identifier, not a command or authorization
+        required: true
+        type: string
+      task_id:
+        description: Native task correlation only
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: hermes-teams-release-${{ inputs.source_sha }}
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: ${{ github.repository == 'timmypai/hermes-teams' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Reject unbound release before credentials or publication
+        id: guard
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          TASK_ID: ${{ inputs.task_id }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$REPOSITORY" != 'timmypai/hermes-teams' || "$SOURCE_REF" != 'refs/heads/main' || "$WORKFLOW_REF" != 'timmypai/hermes-teams/.github/workflows/release.yml@refs/heads/main' ]]; then
+            printf '%s\n' 'UNTRUSTED_SOURCE' >&2
+            exit 64
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ || ! "$REQUEST_ID" =~ ^[A-Za-z0-9_-]{1,80}$ || ! "$TASK_ID" =~ ^t_[0-9a-f]{8}$ ]]; then
+            printf '%s\n' 'INVALID_INPUT' >&2
+            exit 64
+          fi
+          printf '%s\n' 'RELEASE_BINDINGS_UNBOUND: executable artifact, merged-source CI/review, registry and protected publisher not configured' >&2
+          exit 78

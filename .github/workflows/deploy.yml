@@ -1,0 +1,85 @@
+name: Deploy or rollback preflight only
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Both modes share the same lock and remain disabled
+        type: choice
+        options: [deploy, rollback]
+        required: true
+      environment:
+        description: No live environment is bound
+        type: choice
+        options: [unbound]
+        required: true
+      source_sha:
+        description: Full immutable source SHA
+        type: string
+        required: true
+      release_digest:
+        description: Immutable sha256 digest, not a tag
+        type: string
+        required: true
+      expected_current_digest:
+        description: Expected current immutable sha256 digest
+        type: string
+        required: true
+      request_id:
+        description: Correlation identifier only
+        type: string
+        required: true
+      reason:
+        description: Required for rollback; data only
+        type: string
+        required: false
+      knownhealthy_record:
+        description: Required for rollback; record reference only, not authority
+        type: string
+        required: false
+permissions:
+  contents: read
+# Fixed lock intentionally serializes BOTH modes; replace only with reviewed binding.
+concurrency:
+  group: hermes-teams-unbound-service-unbound-environment
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: ${{ github.repository == 'timmypai/hermes-teams' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Reject unbound target before credentials or mutation
+        id: guard
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_DIGEST: ${{ inputs.release_digest }}
+          EXPECTED_CURRENT_DIGEST: ${{ inputs.expected_current_digest }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          REASON: ${{ inputs.reason }}
+          KNOWNHEALTHY_RECORD: ${{ inputs.knownhealthy_record }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$REPOSITORY" != 'timmypai/hermes-teams' || "$SOURCE_REF" != 'refs/heads/main' || "$WORKFLOW_REF" != 'timmypai/hermes-teams/.github/workflows/deploy.yml@refs/heads/main' ]]; then
+            printf '%s\n' 'UNTRUSTED_SOURCE' >&2
+            exit 64
+          fi
+          if [[ "$MODE" != 'deploy' && "$MODE" != 'rollback' ]]; then
+            printf '%s\n' 'INVALID_MODE' >&2
+            exit 64
+          fi
+          if [[ "$TARGET_ENVIRONMENT" != 'unbound' || ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ || ! "$RELEASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ || ! "$EXPECTED_CURRENT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ || ! "$REQUEST_ID" =~ ^[A-Za-z0-9_-]{1,80}$ ]]; then
+            printf '%s\n' 'INVALID_INPUT' >&2
+            exit 64
+          fi
+          if [[ "$MODE" == 'rollback' && ( ! "$REASON" =~ ^[A-Za-z0-9_.-]{1,80}$ || ! "$KNOWNHEALTHY_RECORD" =~ ^[A-Za-z0-9_.-]{1,80}$ ) ]]; then
+            printf '%s\n' 'INVALID_ROLLBACK_RECORD' >&2
+            exit 64
+          fi
+          printf '%s\n' 'DEPLOY_BINDINGS_UNBOUND: service, environment, transport, approved digest/current-version readback, health and knownhealthy recovery not configured' >&2
+          exit 78
