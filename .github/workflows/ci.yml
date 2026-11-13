@@ -11,67 +11,21 @@ concurrency:
   group: configuration-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 jobs:
+  tests:
+    uses: ./.github/workflows/reusable-ci.yml
+    with:
+      test-profile: python-stdlib-http-v1
   ci:
     name: ci
+    needs: [tests]
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 1
     steps:
-      - name: Checkout event source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - name: Fixed Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.14.9'
-      - name: Locked validation dependencies
-        run: |
-          timeout 600 python3 -m pip install --require-hashes --only-binary=:all: --no-deps -r tests/requirements-workflow.txt
-      - name: Workflow syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ../reports/n3-v2 .lint-cache
-          curl -q --fail --silent --show-error --location --max-time 60 --output .lint-cache/actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
-          printf '%s  %s\n' '023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757' '.lint-cache/actionlint.tar.gz' | sha256sum --check
-          tar -xzf .lint-cache/actionlint.tar.gz -C .lint-cache actionlint
-          .lint-cache/actionlint -version > ../reports/n3-v2/actionlint-version.txt
-          timeout 600 .lint-cache/actionlint -color=false .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/deploy.yml > ../reports/n3-v2/actionlint.log 2>&1
-      - name: Configuration safety and guard negatives
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ../reports/n3-v2
-          timeout 600 python3 -m unittest discover -s tests -p test_workflow_safety.py -v > ../reports/n3-v2/unittest.log 2>&1
-      - name: Source receipt even on failure
-        if: ${{ always() }}
+      - name: Require successful common CI
         shell: bash
         env:
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          EVENT_SHA: ${{ github.sha }}
-          WORKFLOW_REVISION: ${{ github.workflow_sha }}
+          TEST_RESULT: ${{ needs.tests.result }}
         run: |
           set -euo pipefail
-          mkdir -p ../reports/n3-v2
-          {
-            printf 'pr_head=%s\nevent_sha=%s\nworkflow_revision=%s\nrun=%s\nattempt=%s\n' "$PR_HEAD" "$EVENT_SHA" "$WORKFLOW_REVISION" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-            git rev-parse HEAD
-          } > ../reports/n3-v2/source.txt
-      - name: Resolve bounded evidence path
-        id: evidence
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test ! -L ../reports/n3-v2
-          test -s ../reports/n3-v2/source.txt
-          evidence_path="$(realpath -e ../reports/n3-v2)"
-          printf 'path=%s\n' "$evidence_path" >> "$GITHUB_OUTPUT"
-      - name: Retain bounded validation evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: configuration-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.evidence.outputs.path }}
-          retention-days: 7
-          if-no-files-found: error
+          test "$TEST_RESULT" = success
