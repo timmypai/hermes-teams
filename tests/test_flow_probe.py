@@ -142,13 +142,45 @@ class FlowProbe(unittest.TestCase):
         self.assertEqual(self.request(server, '/healthz'), (200, {'healthy': True}))
 
     def test_foreground_cli_http_and_sigterm(self):
+        # Keep the ordinary CLI control; inject the real signal at the vulnerable
+        # stdlib construction boundary as a separate, deterministic control.
+        for mode in ('ordinary', 'socket-construction', 'idle'):
+            with self.subTest(mode=mode):
+                self.check_cli_shutdown(mode)
+
+    def check_cli_shutdown(self, mode):
         cache = ROOT / '.cache'
         cache.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='probe-', dir=cache) as directory:
+            armed = Path(directory) / 'armed'
+            injected = Path(directory) / 'injected'
+            command = [sys.executable, str(ENTRY), '--port', '0', '--source-sha', SHA]
+            if mode == 'socket-construction':
+                # Trace the actual SocketIO constructor, without replacing it or
+                # HTTP handling. Fail loudly if the runtime seam ever changes.
+                script = (
+                    "import inspect, os, runpy, signal, socket, sys\n"
+                    "from pathlib import Path\n"
+                    "armed, injected = map(Path, sys.argv[1:3])\n"
+                    "sys.argv = sys.argv[3:]\n"
+                    "code = socket.SocketIO.__init__.__code__\n"
+                    "lines, start = inspect.getsourcelines(socket.SocketIO.__init__)\n"
+                    "target, = [start+i for i, line in enumerate(lines)\n"
+                    "           if line.strip() == 'self._sock = sock']\n"
+                    "def trace(frame, event, arg):\n"
+                    "    if (frame.f_code is code and event == 'line'\n"
+                    "            and frame.f_lineno == target and armed.exists()\n"
+                    "            and not injected.exists()):\n"
+                    "        injected.write_text('SIGTERM before SocketIO._sock assignment\\n')\n"
+                    "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                    "    return trace\n"
+                    "sys.settrace(trace)\n"
+                    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                )
+                command = [sys.executable, '-c', script, str(armed), str(injected), *command[1:]]
             with open(Path(directory) / 'stdout', 'w+') as output, \
                  open(Path(directory) / 'stderr', 'w+') as errors:
-                proc = subprocess.Popen([sys.executable, str(ENTRY), '--port', '0',
-                                         '--source-sha', SHA], cwd=ROOT,
+                proc = subprocess.Popen(command, cwd=ROOT,
                                         stdout=output, stderr=errors)
                 try:
                     deadline = time.monotonic() + 3
@@ -170,11 +202,19 @@ class FlowProbe(unittest.TestCase):
                         self.assertEqual(json.loads(response.read())['source_sha'], SHA)
                     finally:
                         conn.close()
-                    # SIGTERM must also terminate promptly with an incomplete request in flight.
-                    with socket.create_connection((address['host'], address['port']), timeout=2) as idle:
-                        idle.sendall(b'GET / HTTP/1.1\r\n')
+                    armed.touch()
+                    if mode == 'idle':
                         proc.terminate()
                         self.assertEqual(proc.wait(timeout=3), 0)
+                    else:
+                        # SIGTERM must terminate with an incomplete request in flight.
+                        with socket.create_connection((address['host'], address['port']), timeout=2) as idle:
+                            idle.sendall(b'GET / HTTP/1.1\r\n')
+                            if mode == 'ordinary':
+                                proc.terminate()
+                            self.assertEqual(proc.wait(timeout=3), 0)
+                        if mode == 'socket-construction':
+                            self.assertTrue(injected.is_file(), 'signal injection must actually execute')
                     with socket.socket() as closed:
                         closed.settimeout(1)
                         self.assertNotEqual(closed.connect_ex((address['host'], address['port'])), 0)

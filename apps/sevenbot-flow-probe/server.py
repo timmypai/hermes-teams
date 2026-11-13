@@ -82,13 +82,20 @@ def main(argv=None):
     except OSError:
         parser.error('BIND_FAILED')
 
+    stopping = False
+
     def stop(signum, frame):
-        raise KeyboardInterrupt
+        # Raising here can interrupt SocketIO before its fields are initialized,
+        # leaving finalization to fail. Let the bounded request finish instead.
+        nonlocal stopping
+        stopping = True
 
     previous = signal.signal(signal.SIGTERM, stop)
     try:
         print(json.dumps({'host': server.server_address[0], 'port': server.server_address[1]}), flush=True)
-        server.serve_forever(poll_interval=0.1)
+        server.timeout = 0.1
+        while not stopping:
+            server.handle_request()
     except KeyboardInterrupt:
         pass
     finally:
