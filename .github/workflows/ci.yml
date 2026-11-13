@@ -57,11 +57,21 @@ jobs:
             printf 'pr_head=%s\nevent_sha=%s\nworkflow_revision=%s\nrun=%s\nattempt=%s\n' "$PR_HEAD" "$EVENT_SHA" "$WORKFLOW_REVISION" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
             git rev-parse HEAD
           } > ../reports/n3-v2/source.txt
+      - name: Resolve bounded evidence path
+        id: evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -L ../reports/n3-v2
+          test -s ../reports/n3-v2/source.txt
+          evidence_path="$(realpath -e ../reports/n3-v2)"
+          printf 'path=%s\n' "$evidence_path" >> "$GITHUB_OUTPUT"
       - name: Retain bounded validation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: configuration-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ../reports/n3-v2/
+          path: ${{ steps.evidence.outputs.path }}
           retention-days: 7
           if-no-files-found: error

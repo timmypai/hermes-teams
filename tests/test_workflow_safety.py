@@ -112,7 +112,12 @@ def validate(config):
     require(len(uploads) == 1 and uploads[0]['if'] == '${{ always() }}' and
             uploads[0]['with']['retention-days'] == 7 and
             uploads[0]['with']['if-no-files-found'] == 'error' and
-            uploads[0]['with']['path'] == '../reports/n3-v2/', 'bounded failure evidence')
+            uploads[0]['with']['path'] == '${{ steps.evidence.outputs.path }}',
+            'bounded failure evidence')
+    resolvers = [s for s in steps if s.get('id') == 'evidence']
+    require(len(resolvers) == 1 and resolvers[0]['if'] == '${{ always() }}' and
+            resolvers[0]['shell'] == 'bash' and
+            steps.index(resolvers[0]) < steps.index(uploads[0]), 'evidence resolver before upload')
     for name in ('release', 'deploy'):
         w = config[name]
         require(set(w['on']) == {'workflow_dispatch'}, 'manual trusted preflight only')
@@ -163,6 +168,73 @@ class WorkflowSafety(unittest.TestCase):
                 (target / (name + '.yml')).write_text(yaml.safe_dump(workflow, sort_keys=False))
             with self.assertRaises((ValueError, KeyError, FileNotFoundError), msg=label):
                 validate(load(root))
+
+    def test_upload_path_resolves_real_evidence_and_missing_files_fail(self):
+        steps = self.config['ci']['jobs']['ci']['steps']
+        upload = next(s for s in steps if s.get('uses', '').startswith('actions/upload-artifact@'))
+        pattern = upload['with']['path']
+        # Check raw segments BEFORE pathlib normalization: the hosted glob rejects
+        # dot/dotdot even when an ordinary filesystem lookup would succeed.
+        self.assertNotIn('.', pattern.split('/'), 'upload glob rejects dot segments')
+        self.assertNotIn('..', pattern.split('/'), 'upload glob rejects dotdot segments')
+        self.assertEqual(pattern, '${{ steps.evidence.outputs.path }}')
+        resolver = next(s for s in steps if s.get('id') == 'evidence')
+        self.assertEqual(resolver['if'], '${{ always() }}')
+        self.assertLess(steps.index(resolver), steps.index(upload))
+        with tempfile.TemporaryDirectory(prefix='upload-', dir=FIXTURES) as directory:
+            root = Path(directory).resolve()
+            checkout = root / 'checkout'
+            checkout.mkdir()
+            evidence = root / 'reports/n3-v2'
+            evidence.mkdir(parents=True)
+            output = root / 'step-output'
+            script = root / 'resolve.sh'
+            script.write_text(resolver['run'])
+            env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'GITHUB_OUTPUT': str(output)}
+
+            def resolve():
+                return subprocess.run(['/bin/bash', '--noprofile', '--norc', str(script)],
+                                      cwd=checkout, env=env, text=True, capture_output=True, timeout=10)
+
+            # Empty/missing evidence must not yield an upload output (even if
+            # if-no-files-found were accidentally changed in a later edit).
+            missing = resolve()
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertFalse(output.exists())
+            (evidence / 'source.txt').write_text('exact-source-receipt\n')
+            (evidence / 'unittest.log').write_text('FAILED deliberate control\n')
+            (evidence / 'guard.json').write_text('{"exit":78}\n')
+            present = resolve()
+            self.assertEqual(present.returncode, 0, present.stderr)
+            lines = output.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith('path='))
+            resolved = lines[0].removeprefix('path=')
+            self.assertTrue(Path(resolved).is_absolute())
+            self.assertFalse({'.', '..'} & set(resolved.split('/')))
+            self.assertEqual(Path(resolved), evidence)
+            self.assertEqual((Path(resolved) / 'unittest.log').read_text(),
+                             'FAILED deliberate control\n')
+            self.assertEqual((Path(resolved) / 'guard.json').read_text(), '{"exit":78}\n')
+            self.assertEqual(sorted(p.name for p in Path(resolved).iterdir()),
+                             ['guard.json', 'source.txt', 'unittest.log'])
+            # Do not follow a directory symlink into an unrelated upload source.
+            output.unlink()
+            evidence.rename(root / 'other-evidence')
+            evidence.symlink_to(root / 'other-evidence', target_is_directory=True)
+            linked = resolve()
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertFalse(output.exists())
+
+    def test_upload_dot_segments_and_retention_mutations_rejected(self):
+        for path in ('../reports/n3-v2/', './reports/n3-v2/', '/tmp/../reports', ''):
+            with self.subTest(path=path):
+                self.mutated_copy_rejected('invalid upload path', lambda c:
+                    c['ci']['jobs']['ci']['steps'][-1]['with'].update(path=path))
+        self.mutated_copy_rejected('retention weakened', lambda c:
+            c['ci']['jobs']['ci']['steps'][-1]['with'].update(**{'retention-days': 1}))
+        self.mutated_copy_rejected('missing files ignored', lambda c:
+            c['ci']['jobs']['ci']['steps'][-1]['with'].update(**{'if-no-files-found': 'ignore'}))
 
     def test_floating_action_rejected(self):
         self.mutated_copy_rejected('floating action', lambda c: c['ci']['jobs']['ci']['steps'][0].update(
