@@ -24,6 +24,12 @@ PINS = {
     'actions/upload-artifact': 'ea165f8d65b6e75b540449e92b4886f43607fa02',
 }
 COMMAND = 'timeout 600 python3 -m unittest discover -s tests -p test_workflow_safety.py -v'
+APP_COMMAND = '''set -euo pipefail
+mkdir -p ../reports/n3-v2
+test -f apps/sevenbot-flow-probe/server.py
+test -f tests/test_flow_probe.py
+timeout 600 python3 -m unittest discover -s tests -p 'test_flow_probe*.py' -v > ../reports/n3-v2/application.log 2>&1
+'''
 
 
 def require(condition, message):
@@ -50,7 +56,7 @@ UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, uni
 def load(root):
     return {name: yaml.load((root / '.github/workflows' / (name + '.yml')).read_text(),
                             Loader=UniqueLoader)
-            for name in ('ci', 'release', 'deploy')}
+            for name in ('ci', 'reusable-ci', 'release', 'deploy')}
 
 
 def validate_guard(script):
@@ -68,17 +74,23 @@ def validate_guard(script):
 
 
 def validate(config):
-    require(set(config) == {'ci', 'release', 'deploy'}, 'mandatory workflows')
+    require(set(config) == {'ci', 'reusable-ci', 'release', 'deploy'}, 'mandatory workflows')
     for name, workflow in config.items():
         require(isinstance(workflow, dict), 'workflow mapping')
         require(workflow['permissions'] == {'contents': 'read'}, 'read-only permissions')
-        require(workflow['concurrency']['cancel-in-progress'] is False, 'no cancellation')
+        if name != 'reusable-ci':
+            require(workflow['concurrency']['cancel-in-progress'] is False, 'no cancellation')
         require('pull_request_target' not in workflow['on'], 'untrusted privileged event')
         text = json.dumps(workflow)
         for forbidden in ('secrets.', 'id-token', 'self-hosted', 'continue-on-error',
                           'kanban_', 'hermes ', 'worker', 'nextEpic', 'eval ', 'bash -c'):
             require(forbidden not in text, 'forbidden operational authority: ' + forbidden)
         for job in workflow['jobs'].values():
+            if 'uses' in job:
+                require(name == 'ci' and job == {
+                    'uses': './.github/workflows/reusable-ci.yml',
+                    'with': {'test-profile': 'python-stdlib-http-v1'}}, 'fixed common caller')
+                continue
             require(0 < job['timeout-minutes'] <= 10, 'bounded job')
             require(job['runs-on'] == 'ubuntu-24.04', 'fixed hosted runner')
             require(job.get('permissions', {'contents': 'read'}) == {'contents': 'read'},
@@ -98,11 +110,36 @@ def validate(config):
                          'pull_request': {'branches': ['main'],
                                           'types': ['opened', 'synchronize', 'reopened']}},
             'restricted CI triggers')
-    require(set(ci['jobs']) == {'ci'} and ci['jobs']['ci']['name'] == 'ci', 'required check ci')
+    require(set(ci['jobs']) == {'tests', 'ci'} and ci['jobs']['ci']['name'] == 'ci', 'required check ci')
+    gate = ci['jobs']['ci']
+    require(gate == {
+        'name': 'ci', 'needs': ['tests'], 'if': '${{ always() }}',
+        'runs-on': 'ubuntu-24.04', 'timeout-minutes': 1,
+        'steps': [{'name': 'Require successful common CI', 'shell': 'bash',
+                   'env': {'TEST_RESULT': '${{ needs.tests.result }}'},
+                   'run': 'set -euo pipefail\ntest "$TEST_RESULT" = success\n'}]},
+        'exact fail-closed required gate')
+    common = config['reusable-ci']
+    require(common['on'] == {'workflow_call': {'inputs': {'test-profile': {
+        'description': 'Closed test contract; only python-stdlib-http-v1 is supported',
+        'required': True, 'type': 'string'}}}}, 'closed common interface')
+    require(set(common['jobs']) == {'tests'}, 'single common test job')
+    require(set(common['jobs']['tests']) == {'name', 'runs-on', 'timeout-minutes', 'steps'},
+            'common job cannot be skipped or given credentials')
     require('github.event_name' in ci['concurrency']['group'] and
             'github.event.pull_request.number || github.ref' in ci['concurrency']['group'],
             'event-separated concurrency')
-    steps = ci['jobs']['ci']['steps']
+    steps = common['jobs']['tests']['steps']
+    require(all('if' not in s for s in steps if 'run' in s and s.get('id') != 'evidence'
+                and s['name'] != 'Source receipt even on failure'), 'mandatory steps not conditional')
+    require(steps[0] == {
+        'name': 'Validate closed project profile', 'shell': 'bash',
+        'env': {'TEST_PROFILE': '${{ inputs.test-profile }}'},
+        'run': 'set -euo pipefail\ntest "$TEST_PROFILE" = python-stdlib-http-v1\n'},
+        'closed profile validation before checkout')
+    require(any(s.get('run') == APP_COMMAND for s in steps), 'mandatory real HTTP app command')
+    require(any('timeout 600 python3 -m unittest discover -s tests -p test_shared_ci.py -v'
+                in s.get('run', '') for s in steps), 'common regression entry')
     require(any(COMMAND in s.get('run', '') for s in steps), 'real unittest entry')
     require(any('timeout 600 .lint-cache/actionlint -color=false' in s.get('run', '')
                 for s in steps), 'real actionlint entry')
@@ -170,7 +207,7 @@ class WorkflowSafety(unittest.TestCase):
                 validate(load(root))
 
     def test_upload_path_resolves_real_evidence_and_missing_files_fail(self):
-        steps = self.config['ci']['jobs']['ci']['steps']
+        steps = self.config['reusable-ci']['jobs']['tests']['steps']
         upload = next(s for s in steps if s.get('uses', '').startswith('actions/upload-artifact@'))
         pattern = upload['with']['path']
         # Check raw segments BEFORE pathlib normalization: the hosted glob rejects
@@ -230,14 +267,14 @@ class WorkflowSafety(unittest.TestCase):
         for path in ('../reports/n3-v2/', './reports/n3-v2/', '/tmp/../reports', ''):
             with self.subTest(path=path):
                 self.mutated_copy_rejected('invalid upload path', lambda c:
-                    c['ci']['jobs']['ci']['steps'][-1]['with'].update(path=path))
+                    c['reusable-ci']['jobs']['tests']['steps'][-1]['with'].update(path=path))
         self.mutated_copy_rejected('retention weakened', lambda c:
-            c['ci']['jobs']['ci']['steps'][-1]['with'].update(**{'retention-days': 1}))
+            c['reusable-ci']['jobs']['tests']['steps'][-1]['with'].update(**{'retention-days': 1}))
         self.mutated_copy_rejected('missing files ignored', lambda c:
-            c['ci']['jobs']['ci']['steps'][-1]['with'].update(**{'if-no-files-found': 'ignore'}))
+            c['reusable-ci']['jobs']['tests']['steps'][-1]['with'].update(**{'if-no-files-found': 'ignore'}))
 
     def test_floating_action_rejected(self):
-        self.mutated_copy_rejected('floating action', lambda c: c['ci']['jobs']['ci']['steps'][0].update(
+        self.mutated_copy_rejected('floating action', lambda c: c['reusable-ci']['jobs']['tests']['steps'][1].update(
             uses='actions/checkout@v4'))
 
     def test_writable_permissions_rejected(self):
@@ -249,7 +286,7 @@ class WorkflowSafety(unittest.TestCase):
     def test_command_and_ref_injection_rejected(self):
         self.mutated_copy_rejected('arbitrary command', lambda c: c['deploy']['jobs']['preflight']['steps'][0].update(
             run='eval "${{ inputs.command }}"\n'))
-        self.mutated_copy_rejected('arbitrary ref', lambda c: c['ci']['jobs']['ci']['steps'][0]['with'].update(
+        self.mutated_copy_rejected('arbitrary ref', lambda c: c['reusable-ci']['jobs']['tests']['steps'][1]['with'].update(
             ref='${{ inputs.ref }}'))
         self.mutated_copy_rejected('extra target step', lambda c: c['deploy']['jobs']['preflight']['steps'].append(
             {'run': 'touch target-mutation'}))
@@ -264,9 +301,9 @@ class WorkflowSafety(unittest.TestCase):
         self.mutated_copy_rejected('missing timeout', lambda c: c['ci']['jobs']['ci'].pop('timeout-minutes'))
 
     def test_failure_masking_and_retention_rejected(self):
-        self.mutated_copy_rejected('masked failure', lambda c: c['ci']['jobs']['ci']['steps'][4].update(
+        self.mutated_copy_rejected('masked failure', lambda c: c['reusable-ci']['jobs']['tests']['steps'][4].update(
             **{'continue-on-error': True}))
-        self.mutated_copy_rejected('missing reports', lambda c: c['ci']['jobs']['ci']['steps'][-1].pop('if'))
+        self.mutated_copy_rejected('missing reports', lambda c: c['reusable-ci']['jobs']['tests']['steps'][-1].pop('if'))
 
     def test_bad_yaml_and_duplicate_policy_rejected(self):
         with self.assertRaises(yaml.YAMLError):
