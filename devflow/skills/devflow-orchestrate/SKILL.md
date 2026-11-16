@@ -32,14 +32,27 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 
 
 ## A. 規劃
-1. `terminal: /opt/data/devflow/bin/devflow repo sync <slug>`，讀 README、目錄結構、`.devflow/`、`.github/workflows/`。EPIC 的 `## 驗收` 沒有 `AC-1`、`AC-2`… 編號時，先把每條改寫成可觀察的結果並編號，用 `devflow-ops` 的 `edit` 改 EPIC body（原文保留在「使用者原話」）；子卡照新編號寫。
+1. `terminal: /opt/data/devflow/bin/devflow repo sync <slug>`，讀 README、目錄結構、`.devflow/`、`.github/workflows/`。EPIC 的 `## 驗收` 沒有 `AC-1`、`AC-2`… 編號或類型標記（`[ui]`/`[api]`/`[cli]`/`[lib]`/`[manual]`）時，先把每條改寫成可觀察的結果、編號並標類型。
+   然後把每條非 `[manual]` AC 展開成情境（讀過 repo 才寫得出具體資料與畫面文字）：至少一個正常情境；有輸入的 AC 再加一個錯誤或邊界情境；只讀、不寫資料的情境標 `[smoke]`（部署後只跑這些）。格式固定：
+   ```
+   - AC-1 [ui] 使用者可新增待辦，重新整理後仍存在
+     - S1 新增後重新整理仍存在
+       - Given 已登入、清單為空
+       - When 輸入「買牛奶」並按「新增」
+       - Then 清單只有「買牛奶」，重新整理後仍在
+     - S2 [smoke] 待辦頁可開啟並顯示新增表單
+       - Given 服務已啟動
+       - When 開啟待辦頁
+       - Then 看到標題「我的待辦」與「新增」按鈕
+   ```
+   Given 寫要先成立的狀態（developer 會在 Given 結尾斷言它），When 只寫一個操作，Then 寫使用者或呼叫端看得到的結果與具體值。情境完整 id 是 `<EPIC id>/AC-n.Sm`；Given/When/Then 文字就是測試步驟名稱，之後要改只能改 EPIC 並讓相關 PR 重跑。用 `devflow-ops` 的 `edit` 改 EPIC body（原文保留在「使用者原話」）；子卡照新編號寫。
 2. 判斷 repo 狀態，決定第一段：
    | 狀態 | 第一段卡片 |
    |---|---|
    | 空 repo（新專案） | `[ARCH]` → `[DEV] 建立骨架與 devflow 契約` → `[SHIP]` |
    | 既有 repo、沒有 `.devflow/` 或 workflow，且需要部署 | `[OPS] 接入 devflow CI/CD` → `[SHIP]` |
    | 已接入 | 直接進功能卡 |
-   devflow repo 契約 = `/opt/data/devflow/templates/repo/`（`.devflow/test.sh`、`check.sh`、`check.py`、`rules/`、`verify.sh`、`up.sh`、`playwright.sh`、`deploy.sh`、`capture.sh`、`redact.py`、`quality.sh`、`config.env`、`deploy/compose.yml`、`.github/workflows/ci.yml`、`deploy.yml`、`repro.yml`、`quality.yml`）。已接入但缺 `verify.sh`、或 `ci.yml` 沒有 `verify`／`check` job（`devflow contract <slug> <主 checkout>` 會列出差異）→ 第一段加 `[OPS] 升級 devflow 契約`（body 寫明：合併 `ci.yml` 的 `check` job 並列入 `devflow-ci` 的 needs、`check.sh --write-baseline` 收舊違規）；缺 `capture.sh` / `repro.yml` / `quality.yml`（`devflow contract` 會直接補上缺的檔）→ 同一張或另一張 `[OPS] 升級 devflow 契約` 補齊，不擋功能卡並行。
+   devflow repo 契約 = `/opt/data/devflow/templates/repo/`（`.devflow/test.sh`、`check.sh`、`check.py`、`rules/`、`verify.sh`、`verify-base.sh`、`acceptance.py`、`up.sh`、`playwright.sh`、`deploy.sh`、`capture.sh`、`redact.py`、`quality.sh`、`config.env`、`deploy/compose.yml`、`.github/workflows/ci.yml`、`deploy.yml`、`repro.yml`、`quality.yml`）。已接入但缺 `acceptance.py`／`verify-base.sh`、或 `ci.yml` 沒有 `verify`／`verify-base`／`check` job（`devflow contract <slug> <主 checkout>` 會列出差異）→ 第一段加 `[OPS] 升級 devflow 契約`（body 寫明：合併 `ci.yml` 的 `check`、`verify-base` job 並列入 `devflow-ci` 的 needs、把舊的 `journey` 改寫成 `scenario`、`check.sh --write-baseline` 收舊違規）；缺 `capture.sh` / `repro.yml` / `quality.yml`（`devflow contract` 會直接補上缺的檔）→ 同一張或另一張 `[OPS] 升級 devflow 契約` 補齊，不擋功能卡並行。
    `[ADJ]` 找到根因、且同類錯誤可能再犯時，修正卡的 `## 驗收` 要寫「`fix:` PR，新增教訓 `.devflow/lessons/L-NNNN.toml`（PR 說明 `Lesson: L-NNNN`），優先以規則或測試擋住」。CI `check` job 會擋沒有 `Lesson:`／`No-lesson:` 的 fix PR、證明新教訓在修正前的程式上會失敗，並要求同一根因再出現時更新原本的教訓。
 3. 先寫吞吐檢查（`pstack` feature playbook）：哪些步驟必須先做、哪些可並行、哪裡會同時寫同一份檔案（先拆開，真的要共用才串行）、最小可行的切法。然後切卡（`pstack:principle-sequence-verifiable-units`）：
    - `[RES]` 只在有實際未知時建；`[ARCH]` 只在有跨模組或難回頭決策時建。
@@ -57,14 +70,19 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。goal judge 用 title+body 判斷能否交 review，所以 body 一定要有上面的 `## 本卡完成`，否則會因「還沒部署」擋下 review。goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。
 5. 把每條路徑的最後一張卡（通常是 `[SHIP]`）連成 EPIC 的 parent：`kanban_link(parent_id=<leaf>, child_id=<EPIC>)`。
-6. 自查：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`findings` 裡的規則問題（assignee、workspace、contract、缺 `[SHIP]`、AC 沒人負責、沒接到 EPIC）自己修掉再跑一次；`Decisions …` 開頭的是風險判斷，不用自己處理。
+6. 自查：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`findings` 裡的規則問題（assignee、workspace、contract、缺 `[SHIP]`、AC 沒人負責、AC 沒類型、缺情境或 Given/When/Then、沒接到 EPIC）自己修掉再跑一次；`[manual]` 的提醒是給 advisor 判斷的，不用自己處理；`Decisions …` 開頭的是風險判斷，不用自己處理。
 7. `kanban_comment(EPIC, 計畫摘要：卡片清單、順序、AC 對應)`，然後 `kanban_block(kind="dependency", reason="等待子卡完成：t_a, t_b…")`。EPIC 等待期間，dispatcher tick 會在計畫有變動時跑 `devflow check plan`：有疑慮就自動建 `[ADV]`（Opus 5.5）並在 EPIC 留言；含不可回復操作時 `[ADV]` 會成為各 `[SHIP]` 的 parent。你不用等它。
 8. 想主動請 advisor 看（目標有多種解讀、架構取捨）：`kanban_create(title="[ADV] ...", assignee="default", workspace_kind="scratch", model="claude-opus-5.5", provider="copilot", body="EPIC: <id>\n<要它判斷什麼>")`，不加 parent、不連到 EPIC。
 
 ## B. 驗收
-1. 讀所有 parent 的 summary/metadata：PR、`deploy_run_id`、部署後 verify 結果、`acceptance`、`followups`。
-2. 逐條判定 AC：`terminal: devflow check acceptance <slug> <EPIC> --run <deploy_run_id> [--run <PR CI run>] --json`（會下載 Actions artifact 的證據：journey 輸出、Playwright 截圖、報告，交 Decisions API 逐條判斷）。FAIL 的 AC 自己看證據：真的沒做到或缺證據 → 補卡（缺 journey → `[DEV]` 補 verify journey），連成 EPIC parent，再 `kanban_block(kind="dependency")`；證據其實已足夠（判斷偏嚴）→ 記下是哪份證據、為什麼足夠，當 PASS。
-3. 全部 PASS → `kanban_complete`：summary 用繁中寫給使用者（做了什麼、PR 連結、部署結果/網址、每條 AC 的結果與證據、已知限制）；metadata 放 `prs`、`deploy_runs`、`acceptance`（`[{ac, verdict, probability, evidence}]`）、`followups`。
+1. 讀所有 parent 的 summary/metadata：PR 號、`merged_sha`、部署與整合 run、`acceptance`、`followups`。這些只用來找出 PR 號；證據一律由下一步向 GitHub 核對。
+2. 逐條判定 AC：`terminal: devflow check acceptance <slug> <EPIC> --pr <N> [--pr <M> ...] --json`（列出本 EPIC 所有已合併的 PR）。它會：
+   - 由 GitHub 找每個 PR head 的 `ci.yml` run（`pull_request`、最新 attempt、成功），核對 `acceptance.json` 的 repo／SHA／run／attempt，以及 base 紅綠判定；
+   - 找最新成功的部署 run（SHA = D）與 D 上的整合 run（`ci.yml` `workflow_dispatch`），確認每個 PR 的合併 commit 都在 D 之內、全部情境在 D 通過、`[smoke]` 情境在部署後通過；
+   - 情境的 Given/When/Then 文字必須和目前 EPIC 一致（EPIC 改過就要重跑）；
+   - 上面任一項不符，該 AC 直接 FAIL（`reasons` 寫原因）；全部符合才對每條 AC 呼叫一次 Decisions（證據是否顯示達成、斷言是否足以證明）。`[manual]` AC 只有 Decisions，可用 `--evidence <檔>` 附證據。
+   FAIL 的處理（依 `reasons`）：缺整合 run、整合 run 不在部署 SHA → 建 `[SHIP] 整合驗收 <EPIC>`（devops、dir、不設 contract，body 寫「`EPIC: <id>`；在目前部署 SHA 跑 ci.yml 整合 run，見 devflow-devops §4 第 5 步」），連成 EPIC parent；情境沒做到、缺情境、base 不是紅燈、步驟文字和 EPIC 不一致 → 補 `[DEV]` 卡（body 寫情境 id、哪一段失敗、run URL），後接 `[SHIP]`，連成 EPIC parent。之後 `kanban_block(kind="dependency")`。只有 Decisions 偏嚴（確定性檢查全過、證據確實足夠）時，才可記下是哪份證據、為什麼足夠，當 PASS；確定性檢查的 FAIL 不能自行改判。
+3. 全部 PASS → `kanban_complete`：summary 用繁中寫給使用者（做了什麼、PR 連結、部署結果/網址、每條 AC 的結果與證據、已知限制）；metadata 放 `prs`、`deploy_runs`、`integration_run`、`acceptance`（`check acceptance` 的 `criteria`）、`followups`。
 
 ## C. 調整（`[ADJ]` 卡：Advisor 建議或失敗卡處理）
 - 讀 body 指到的 EPIC / 卡片：`kanban_show`；失敗原因看卡片 runs 與留言（`terminal: hermes kanban --board <slug> log <id>` 是唯讀，可用）。

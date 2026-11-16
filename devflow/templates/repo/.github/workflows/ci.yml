@@ -1,7 +1,7 @@
 name: ci
 on:
   pull_request:
-    # edited: PR 說明的 Lesson:／No-lesson: 改了要重新判定
+    # edited: PR 說明的 Lesson:／No-lesson:／Covers:／Already-met:／Base-unverifiable: 改了要重新判定
     types: [opened, synchronize, reopened, edited]
   push:
     branches-ignore: [main, master]
@@ -43,27 +43,36 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 .devflow/check.py --pr "$BASE_SHA"
 
-  # Acceptance journeys against a running copy of the service (same compose file as deploy).
+  # 驗收情境（.devflow/verify.sh + .devflow/ui）對一份真的跑起來的服務（與部署同一個 compose 檔）。
+  # 不再因為沒有 Dockerfile 就靜默略過：config.env 宣告了服務卻沒有 Dockerfile 時 up.sh 失敗；
+  # DEVFLOW_SERVICE 空 = 沒有服務，只跑 shell 情境。報告的 head_sha 綁定 PR head（測的就是它）。
+  # gate：每個情境都要 passed（不可 skipped），PR 說明 `Covers:` 列出的情境都要在報告裡。
   verify:
     runs-on: ubuntu-latest
+    env:
+      DEVFLOW_KIND: ${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'workflow_dispatch' && 'integration' || 'push' }}
+      DEVFLOW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_BODY: ${{ github.event.pull_request.body }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: up
-        if: hashFiles('Dockerfile') != ''
         run: bash .devflow/up.sh
+      # up 失敗也跑：health 失敗要記進報告（gate 仍會失敗）。
       - name: verify
-        if: hashFiles('Dockerfile') != ''
+        if: ${{ !cancelled() }}
         run: bash .devflow/verify.sh
       - name: evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: devflow-evidence-pr-${{ github.sha }}
+          name: devflow-evidence-${{ env.DEVFLOW_KIND }}-${{ env.DEVFLOW_HEAD_SHA }}-${{ github.run_attempt }}
           path: .devflow/evidence
           if-no-files-found: ignore
-      # 失敗時採證（容器狀態、退出原因、log；已遮罩），與 AC 證據分開存、只留 7 天。
+      # 失敗時採證（容器狀態、退出原因、log；已遮罩），與驗收證據分開存、只留 7 天。
       - name: diagnostics
-        if: failure() && hashFiles('Dockerfile') != ''
+        if: failure()
         run: |
           . .devflow/config.env
           bash .devflow/capture.sh "ci-${DEVFLOW_APP}" ci
@@ -71,7 +80,40 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: devflow-diagnostics-pr-${{ github.sha }}
+          name: devflow-diagnostics-${{ env.DEVFLOW_KIND }}-${{ env.DEVFLOW_HEAD_SHA }}-${{ github.run_attempt }}
+          path: .devflow/diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # 紅綠證明：PR 說明 `Covers:` 列出的情境放到 PR 的 base 上跑（head 的 .devflow/ 蓋在 base 的程式上），
+  # 每個都要 RED（Given 通過、When / Then 失敗），或 GREEN + `Already-met:`、INVALID + `Base-unverifiable:`。
+  # 獨立 job：base 那份服務的 compose 專案不會和 verify 的撞在一起。
+  verify-base:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      DEVFLOW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: verify on base
+        run: bash .devflow/verify-base.sh "$BASE_SHA"
+      - name: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-evidence-base-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          path: .devflow/evidence-base
+          if-no-files-found: ignore
+      - name: upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-diagnostics-base-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
           path: .devflow/diagnostics
           retention-days: 7
           if-no-files-found: ignore
@@ -81,7 +123,7 @@ jobs:
   # ub-mode metrics run in quality.yml: a separate workflow, never part of this check.
   devflow-ci:
     if: always()
-    needs: [test, check, verify]
+    needs: [test, check, verify, verify-base]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed

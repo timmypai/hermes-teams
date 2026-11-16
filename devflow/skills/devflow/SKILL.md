@@ -15,16 +15,16 @@ metadata:
 ## 流程
 
 ```
-使用者 ⇄ Hermes（語音/文字）：目標 + 編號驗收 AC-1..n（語音確認一次）
-   └─ [EPIC] → orchestrator：sync repo、拆卡（每張標「覆蓋：AC-n」）、最後的卡設為 EPIC 的 parent、block(dependency)
-        │     └─ devflow check plan（dispatcher tick 自動）：規則 + Decisions API 風險 → 有疑慮自動建 [ADV]
+使用者 ⇄ Hermes（語音/文字）：目標 + 編號驗收 AC-1..n（含類型 [ui]/[api]/[cli]/[lib]/[manual]，語音確認一次）
+   └─ [EPIC] → orchestrator：sync repo、每條 AC 寫 Given/When/Then 情境 <EPIC>/AC-n.Sm、拆卡（每張標「覆蓋：AC-n」）、最後的卡設為 EPIC 的 parent、block(dependency)
+        │     └─ devflow check plan（dispatcher tick 自動）：規則（含 AC 類型與情境）+ Decisions API 風險 → 有疑慮自動建 [ADV]
         ├─ [RES]  researcher   （有未知才建，可並行）
         ├─ [ARCH] architect    （有跨模組/難回頭決策才建）
-        ├─ [DEV]  developer    → 實作 + 每條 AC 一個 verify journey → PR + CI（test + verify + 證據 artifact）綠
-        │     → request_review → reviewer（獨立探測 + 看證據）→ 通過才 done
-        │     └─ [SHIP] devops → merge → deploy workflow → health + 部署後 verify（失敗回滾）
+        ├─ [DEV]  developer    → 先寫情境（紅）再實作（綠）→ PR（Covers:）+ CI：test + check + verify（head）+ verify-base（base 必須在 When/Then 失敗）
+        │     → request_review → reviewer（devflow check acceptance --review + 獨立探測 + 看證據）→ 通過才 done
+        │     └─ [SHIP] devops → merge → deploy（health + 唯讀 smoke，失敗回滾）→ 在部署 SHA 跑整合驗收（ci.yml workflow_dispatch，全部情境）
         ├─ [ADV]  hermes(default) advisor：判斷疑慮；只有「含不可回復操作」時擋 [SHIP]
-        └─ 全部完成 → EPIC 回到 orchestrator → devflow check acceptance（AC × 證據逐條判定）
+        └─ 全部完成 → EPIC 回到 orchestrator → devflow check acceptance --pr ...（GitHub 核對證據身分 → 情境逐條 → 每條 AC 一次 Decisions）
               → 全 PASS 才 complete → Hermes 收到通知回報使用者
 ```
 
@@ -48,8 +48,8 @@ metadata:
 | `[ADJ]` | orchestrator | `dir` | 依 advisor 建議或失敗卡調整計畫 |
 
 ## 交接規則
-- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠。EPIC 的驗收是編號 `AC-n`（可觀察的結果）；子卡在驗收寫「覆蓋：AC-n」。
-- 證據：每條 AC 由 repo 的 `.devflow/verify.sh` journey（UI 用 Playwright 截圖）在 PR CI 與部署後各跑一次，證據存 GitHub Actions artifact；卡片 metadata 只放 run id / URL，不貼長 log。
+- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收寫「覆蓋：AC-n」。
+- 證據：每個情境在 repo 是一個 Given/When/Then 可執行情境（`[ui]`/`[api]` 用 `.devflow/ui` 的 Playwright `scenario`，`[cli]`/`[lib]` 用 `.devflow/verify.sh` 的 `scenario`），測試標題以完整 id `<EPIC>/AC-n.Sm` 開頭、步驟文字與 EPIC 一字不差。PR CI（head + base 紅綠證明）、部署後（smoke）、整合驗收（部署 SHA 全部情境）各產生 `acceptance.json`，存 GitHub Actions artifact；卡片 metadata 只放 PR 號與 run URL，不貼長 log。證據身分（repo、SHA、workflow、run attempt）由 `devflow check acceptance` 向 GitHub 核對，不信卡片或報告自述。
 - 交付寫在 `kanban_complete`（或 `kanban_request_review`）：`summary` 1–3 句；`metadata` 放結構化事實（`pr_url`、`branch`、`head_sha`、`tests`、`decisions`、`findings`…）。下游卡自動在 context 看到 parent 的 summary/metadata。
 - 不寫額外交接文件；需要給人看的長內容用 `artifacts` 附檔。
 - 外部 skill 說的 "issue tracker / tickets / issues" 一律指這個 board 的 Kanban 卡；"PR" 指 GitHub PR。
@@ -83,7 +83,7 @@ metadata:
 | `devflow contract SLUG [DIR] [--ui]` | 把 devflow repo 契約檔（CI/CD、deploy、test、verify；`--ui` 加 Playwright）補進 DIR，不覆蓋既有檔，列出與範本不同的檔 |
 | `devflow check plan SLUG EPIC [--advise]` | 檢查計畫（唯讀）：卡型/assignee/workspace/contract/SHIP/parent 鏈/AC 覆蓋 + Decisions API 風險；`--advise` 有新疑慮時建 `[ADV]`（dispatcher tick 會自動跑） |
 | `devflow tick SLUG` | 看板自動化（由 `on_kanban_dispatch_tick` hook 觸發）：執行 orchestrator 的 `devflow-ops`、計畫變動時跑 check plan |
-| `devflow check acceptance SLUG EPIC --run ID... [--json]` | 下載 run 的證據 artifact，以 Decisions API 逐條判定 AC PASS/FAIL |
+| `devflow check acceptance SLUG EPIC --pr N... [--review] [--evidence FILE] [--json]` | 向 GitHub 核對 PR CI／base／部署／整合 run 的身分與情境結果，再每條 AC 一次 Decisions 判定 PASS/FAIL；`--review` 只檢查開著的 PR（reviewer 用） |
 | `devflow runner request OWNER/REPO` | 為 repo 註冊 Oracle VM self-hosted runner（需 repo admin） |
 | `devflow runner status OWNER/REPO` | 查 runner 狀態 |
 | `devflow resume SLUG TASK [--note TEXT]` | 只限 Hermes 聊天：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |

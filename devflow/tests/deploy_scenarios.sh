@@ -3,7 +3,7 @@
 #   1 成功：上線並標記 :live
 #   2 build 失敗：回 1，執行中的版本不變
 #   3 health 失敗：採證後回滾到 :live
-#   4 verify 失敗：採證後回滾到 :live
+#   4 smoke 情境失敗（verify.sh 的 scenario，--smoke 才會在部署後跑）：採證後回滾到 :live
 # 用法：bash devflow/tests/deploy_scenarios.sh   （需要 docker compose、curl、python3、git）
 set -euo pipefail
 KIT=$(cd "$(dirname "$0")/.." && pwd)
@@ -23,9 +23,18 @@ cd "$W"
 sed -i "s/__APP__/$APP/; s/__PORT__/$PORT/" .devflow/config.env
 # 每次健康探測間隔 2 秒，5 次夠小型 app 起來，也讓失敗情境不必等 2 分鐘。
 export DEVFLOW_HEALTH_TRIES=5
-cat >>.devflow/verify.sh <<'EOF'
-journey AC-1 "版本頁不是壞的" sh -c 'curl -fsS "$DEVFLOW_BASE_URL/version" | grep -vq broken'
+# 唯讀的 smoke 情境（部署後會對正式服務跑：不 seed、不寫入），插在 verify.sh 的情境區結尾。
+AC=$(cat <<'EOF'
+ac1_s1_given() { curl -fsS "$DEVFLOW_BASE_URL/health" >/dev/null; }
+ac1_s1_when() { curl -fsS "$DEVFLOW_BASE_URL/version" >"$W/version"; }
+ac1_s1_then() { ! grep -q broken "$W/version"; }
+scenario t_kit/AC-1.S1 "版本頁不是壞的" ac1_s1 --given "服務已上線" --when "讀取 /version" --then "版本不是 broken" --smoke
 EOF
+)
+export AC
+awk '/^# devflow: end of scenarios/ { print ENVIRON["AC"] } { print }' .devflow/verify.sh >.devflow/verify.sh.new
+mv .devflow/verify.sh.new .devflow/verify.sh
+grep -q '^scenario t_kit/AC-1.S1' .devflow/verify.sh || { echo "verify.sh 沒有情境插入點（# devflow: end of scenarios）" >&2; exit 2; }
 git init -q && git config user.email t@t && git config user.name t
 
 release() {  # release <version> <health status> [dockerfile extra]
@@ -75,6 +84,6 @@ release v3 500; deploy health
 check "3 health 失敗回滾" 1 "$rc" v1 candidate
 
 release broken 200; deploy verify
-check "4 verify 失敗回滾" 1 "$rc" v1 candidate
+check "4 smoke 情境失敗回滾" 1 "$rc" v1 candidate
 
 [[ $fails == 0 ]] && echo "deploy scenarios: 4/4 passed" || { echo "deploy scenarios: $fails failed"; exit 1; }

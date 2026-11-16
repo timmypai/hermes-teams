@@ -14,10 +14,10 @@ flowchart TD
   O -- 選用 --> R[researcher]
   O -- 選用 --> A[architect]
   R --> D
-  A --> D[developer<br/>Codex app-server<br/>實作 + AC journeys]
-  D -- "PR + CI 綠<br/>(test + verify + 證據)" --> V[reviewer<br/>Opus 5.5]
+  A --> D[developer<br/>Codex app-server<br/>先寫情境（紅）+ 實作（綠）]
+  D -- "PR + CI 綠<br/>(test + verify + verify-base 紅綠)" --> V[reviewer<br/>Opus 5.5]
   V -- request_changes --> D
-  V -- 通過 --> S["devops [SHIP]<br/>merge → Actions deploy<br/>health + 部署後 verify"]
+  V -- 通過 --> S["devops [SHIP]<br/>merge → Actions deploy<br/>health + smoke → 整合驗收"]
   S --> O2["orchestrator 驗收<br/>devflow check acceptance"]
   O2 -- "全 PASS：完成通知" --> H
   O2 -- FAIL：補卡 --> D
@@ -25,8 +25,8 @@ flowchart TD
 
 - **一個 repo = 一個 Kanban board**；卡片依賴就是流程，dispatcher（default gateway 內）依依賴自動派工。
 - 卡片 body（目標/驗收/提示）是規格；`kanban_complete` / `kanban_request_review` 的 summary + metadata 是交接。沒有額外交接文件。
-- **驗收貫穿全程**：Hermes 把「怎樣算完成」寫成編號 `AC-n`（可觀察結果，語音確認一次）→ 子卡標「覆蓋：AC-n」→ repo 的 `.devflow/verify.sh` 一條 AC 一個 journey（UI 用 Playwright 截圖）在 PR CI 與部署後各跑一次，證據存 Actions artifact → orchestrator 用 `devflow check acceptance` 逐條判定，全 PASS 才完成 EPIC。
-- **計畫檢查**：EPIC 等子卡期間，計畫一有變動（建卡、改卡、`[ADJ]` 調整），dispatcher tick 自動跑 `devflow check plan`：規則（卡型、assignee、workspace、contract、`[SHIP]`、parent 鏈、AC 覆蓋）+ Decisions API 風險分數；有新疑慮才建 `[ADV]` 給 Hermes（Opus 5.5）判斷，同樣的疑慮不重複送。只有「含不可回復操作」時 `[ADV]` 擋 `[SHIP]`，其他情況不擋。
+- **驗收貫穿全程**：Hermes 把「怎樣算完成」寫成編號 `AC-n` 並標類型（`[ui]`/`[api]`/`[cli]`/`[lib]`/`[manual]`，語音確認一次）→ orchestrator 把每條展開成 Given/When/Then 情境 `<EPIC>/AC-n.Sm` → developer 先寫可執行情境再實作 → 證據鏈見下方「驗收證據鏈」，全 PASS 才完成 EPIC。
+- **計畫檢查**：EPIC 等子卡期間，計畫一有變動（建卡、改卡、`[ADJ]` 調整），dispatcher tick 自動跑 `devflow check plan`：規則（卡型、assignee、workspace、contract、`[SHIP]`、parent 鏈、AC 覆蓋、AC 類型與 Given/When/Then 情境）+ Decisions API 風險分數；有新疑慮才建 `[ADV]` 給 Hermes（Opus 5.5）判斷，同樣的疑慮不重複送。只有「含不可回復操作」時 `[ADV]` 擋 `[SHIP]`，其他情況不擋。
 - **看板自動化**：default profile 的 shell hook `on_kanban_dispatch_tick` 在 gateway 內的 dispatcher 每個 tick 觸發 `devflow tick`（board 沒變動就立即結束；有變動才背景執行，不拖慢派工）。它做兩件事：計畫檢查，以及執行 orchestrator 在自己卡上留的 `devflow-ops`（edit / archive / link / unlink / assign / resume）。
 - 不設次數/時間卡控：沒有 run budget、沒有輪詢 cron；review 退件不限次數；失敗卡由 Hermes 自動轉 `[ADJ]` 給 orchestrator，只有需要使用者決定的事才問人。檢查工具出錯時只記錄，不擋流程。
 
@@ -38,7 +38,7 @@ flowchart TD
 | orchestrator | 拆解（吞吐檢查）、AC 覆蓋、串依賴、等待、逐條驗收、處理失敗 | `[EPIC]` `[ADJ]` | devflow-orchestrate；to-tickets/to-spec/wayfinder；pstack figure-it-out/sequence-verifiable-units/outcome-oriented-execution/encode-lessons-in-structure… |
 | researcher | 一手來源、方案比較、PoC | `[RES]` | devflow-research；research/prototype；pstack how/why/explain-the-number… |
 | architect | 架構、模組邊界、資料模型、介面、ADR | `[ARCH]` | devflow-architect；codebase-design/domain-modeling/improve-codebase-architecture；pstack architect/statechart/boundary-discipline… |
-| developer | Codex app-server 在 worktree 實作、測試、AC journeys、PR、CI | `[DEV]` | Codex skill `ub-mode`（寫程式規則）；devflow-develop；implement/tdd/diagnosing-bugs/pr；pstack prove-it-works/migrate-callers/create-verification-skill… |
+| developer | Codex app-server 在 worktree 實作、測試、驗收情境、PR、CI | `[DEV]` | Codex skill `ub-mode`（寫程式規則）；devflow-develop；implement/tdd/diagnosing-bugs/pr；pstack prove-it-works/migrate-callers/create-verification-skill… |
 | reviewer | 獨立審查（不同 GitHub 帳號、Opus 5.5，Copilot 不可用時退回 Codex）、跑測試、不提交的獨立探測、看證據、approve 或退件 | review 欄 | devflow-review；ub-mode（同一份規則審 Make it Right）；code-review/diagnosing-bugs；pstack interrogate/blast-radius/correct… |
 | devops | repo 接入、runner、merge、部署、回滾 | `[OPS]` `[SHIP]` | devflow-devops；wizard/diagnosing-bugs/pr；pstack make-operations-idempotent/build-the-lever/encode-lessons-in-structure… |
 
@@ -55,11 +55,20 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 
 | 階段 | 執行位置 | 內容 |
 |---|---|---|
-| PR CI | GitHub-hosted `ubuntu-latest` | `ci.yml`：`test`（`.devflow/test.sh` + `docker build`）、`check`（`.devflow/check.sh`：規則自測 + 教訓紀錄 + 規則掃描）、`verify`（`.devflow/up.sh` 起服務 → `.devflow/verify.sh`，AC journeys，UI 用 Playwright 官方映像 → artifact `devflow-evidence-pr-<sha>`，失敗時 `.devflow/capture.sh` → `devflow-diagnostics-pr-<sha>`）；彙總 job `devflow-ci`（needs `test`、`check`、`verify`）是 default branch 的 required check。`quality.yml`（獨立 workflow，不擋）：`.devflow/quality.sh`（ub-mode 指標）→ artifact `devflow-quality-<sha>` |
-| Deploy | Oracle VM 主機 `devflow` 使用者（rootless Docker）上的 self-hosted runner `[self-hosted, devflow]` | `.devflow/deploy.sh`：compose build → up → health → `verify.sh`；up / health / verify 失敗先採證再回滾，build 失敗不動執行中版本；artifact `devflow-evidence-deploy-<sha>`、`devflow-diagnostics-deploy-<sha>` |
-| Repro（除錯） | GitHub-hosted `ubuntu-latest`，`workflow_dispatch` | `repro.yml`：任一分支起服務、只跑指定 AC（`DEVFLOW_ONLY`）、全程 trace、採證 → artifact `devflow-repro-<run>`。developer 用它在 Hermes 外重現整合層問題，不碰正式主機、沒有部署秘密 |
+| PR CI | GitHub-hosted `ubuntu-latest` | `ci.yml`：`test`（`.devflow/test.sh` + `docker build`）、`check`（`.devflow/check.sh`：規則自測 + 教訓紀錄 + 規則掃描）、`verify`（`.devflow/up.sh` 起服務 → `.devflow/verify.sh` 跑全部情境 → `acceptance.py gate` → artifact `devflow-evidence-pr-<head sha>-<attempt>`，失敗時 `.devflow/capture.sh` → `devflow-diagnostics-pr-<sha>`）、`verify-base`（PR base 紅綠證明 → `devflow-evidence-base-<head sha>-<attempt>`）；彙總 job `devflow-ci`（needs `test`、`check`、`verify`、`verify-base`）是 default branch 的 required check。`workflow_dispatch` 在 default branch = 整合驗收（`devflow-evidence-integration-<sha>-<attempt>`）。`quality.yml`（獨立 workflow，不擋）：`.devflow/quality.sh`（ub-mode 指標）→ artifact `devflow-quality-<sha>` |
+| Deploy | Oracle VM 主機 `devflow` 使用者（rootless Docker）上的 self-hosted runner `[self-hosted, devflow]` | `.devflow/deploy.sh`：compose build → up → health → `verify.sh`（`DEVFLOW_SMOKE=1`，只跑唯讀 `[smoke]` 情境；缺 `verify.sh` 視為失敗）；up / health / verify 失敗先採證再回滾，build 失敗不動執行中版本；artifact `devflow-evidence-deploy-<sha>-<attempt>`、`devflow-diagnostics-deploy-<sha>` |
+| Repro（除錯） | GitHub-hosted `ubuntu-latest`，`workflow_dispatch` | `repro.yml`：任一分支起服務、只跑指定情境（`DEVFLOW_ONLY=<EPIC>/AC-n[.Sm]`）、全程 trace、採證 → artifact `devflow-repro-<run>`。developer 用它在 Hermes 外重現整合層問題，不碰正式主機、沒有部署秘密 |
 
 **診斷與除錯**：`capture.sh` 只讀（容器清單、`State` 的退出碼/OOM/健康/重啟次數、限時 log、健康探測、主機磁碟/記憶體），不輸出 `Config.Env`；`redact.py` 以 `deploy/.env` 的值與常見憑證樣式遮罩，遮罩失敗就刪 log。遮罩是盡力而為，應用程式仍不應記錄秘密。診斷 artifact 與 AC 證據分開，保留 7 天。
+
+**驗收證據鏈（真的驗證，不是空跑）**：
+- 情境：EPIC 每條非 `[manual]` AC 至少一個 `S<m>`，各有 Given/When/Then；`devflow check plan` 檢查類型、情境與三段結構，`[manual]` 送 advisor。
+- 執行：有服務的 `[ui]`/`[api]` 用 `.devflow/ui/ac.ts` 的 `scenario()`（Playwright，`retries: 0`），`[cli]`/`[lib]` 用 `verify.sh` 的 `scenario`（打建好的映像或套件）。兩者寫同一種事件，`acceptance.py` 彙整成 `acceptance.json`／`acceptance-matrix.md`；情境失敗不中斷，最後才以非 0 結束；不再有「沒有 Dockerfile 就略過」。
+- 紅綠證明：`verify-base` 在 PR base 上用 head 的 `.devflow/` 只跑 `Covers:` 的情境。RED = 健康檢查與 Given 通過、第一個失敗在 When/Then；base 也通過（GREEN）只有 `Already-met:`、Given/環境失敗（INVALID）只有 `Base-unverifiable:` 才放行，兩種理由都由 `devflow-judgment` 與 reviewer 判斷。
+- 身分：`devflow check acceptance` 不信卡片與報告自述，由 GitHub API 找 PR head 的 `ci.yml` run（`pull_request`、最新 attempt、成功）、最新成功部署 run（SHA = D）與 D 上的整合 run（`workflow_dispatch`），核對 workflow 路徑、事件、`head_sha`、attempt、artifact 歸屬與 `acceptance.json` 的身分欄位，並確認每個 PR 的合併 commit 是 D 的祖先。情境 id 帶 EPIC，步驟文字要和目前 EPIC 一致。
+- 整合：部署後只跑唯讀 smoke；完整情境在 D 上的一次性 CI 環境重跑，沒有這份證據 EPIC 不能完成。
+- 判斷：確定性檢查有任何不符，該 AC 直接 FAIL；全過才每條 AC 呼叫一次 Decisions（只給該 AC 的情境結果、步驟、base 判定、情境原始碼與截圖），問「證據是否顯示達成」與「斷言是否足以證明」。
+- 限制：PR 可以改自己的 `ci.yml`、`verify.sh`、`acceptance.py`，所以身分核對擋得住用錯 run、舊版本、別的 EPIC 的報告，擋不住刻意偽造；防偽需要驗收程式改由 default branch 或 Hermes 端提供（見「信任邊界」）。
 
 **規則與教訓（用檢查取代 prompt）**：同樣的錯誤不再寫進 skill 提醒，而是變成 `check` job 的檢查。
 - 規則 `.devflow/rules/<id>.toml`：路徑範圍 + 正規表示式，**每條必須附 `expect = "fail"` 與 `"pass"` 範例**；`check` 先用範例自測，規則抓不到自己的錯誤範例就 CI 失敗。範本內建 `no-sleep-fix`（固定等待掩蓋時序問題）、`no-suppress`（壓 lint／型別警告）、`no-skip-test`（跳過或聚焦測試）；各 repo 自行加模組邊界等規則。
@@ -106,7 +115,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | `bin/codex-developer` | developer 的 Codex 啟動器 |
 | `codex/AGENTS.md` | developer Codex 全域指示 |
 | `gitconfig` | 所有 Bot 共用的 git 設定（`GIT_CONFIG_GLOBAL`，經 `gh auth git-credential` 取憑證） |
-| `templates/repo/`、`templates/ui/` | repo 契約（CI/CD、deploy、test、verify）與 Playwright UI journeys 骨架 |
+| `templates/repo/`、`templates/ui/` | repo 契約（CI/CD、deploy、test、驗收情境與 `acceptance.py`）與 Playwright 情境骨架（`ac.ts`） |
 | `install.py` | 套用到 7 個 profile（冪等；舊設定備份到 `/opt/data/devflow-backup/<時間>/`） |
 | `state/repos.json` | 已接入 repo 與埠 |
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # devflow 部署：在 Oracle VM self-hosted runner（rootless Docker）上執行。
-# build → up → 健康檢查 → verify。up / 健康 / verify 失敗時先採證（capture.sh：狀態、退出原因、
-# 本次部署開始後的 log，已遮罩）再回滾到上一個成功版本；採證寫在 .devflow/diagnostics/，由 workflow 上傳。
+# build → up → 健康檢查 → verify（只跑 smoke 情境：唯讀，對正式服務）。up / 健康 / verify 失敗時先採證
+# （capture.sh：狀態、退出原因、本次部署開始後的 log，已遮罩）再回滾到上一個成功版本；採證寫在
+# .devflow/diagnostics/，由 workflow 上傳。驗收報告寫在 .devflow/evidence/（kind deploy）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . .devflow/config.env; set +a
@@ -37,15 +38,20 @@ healthy() {
   return 1
 }
 
-# 部署後驗收：對剛上線的服務跑 .devflow/verify.sh（與 PR CI 同一套 journeys）。
+# 部署後驗收：對剛上線的服務只跑 smoke 情境（唯讀、不 seed、不寫入；完整情境已在 PR CI 與整合驗證跑過）。
+# 沒有 .devflow/verify.sh = 失敗，不能略過。
 verify() {
-  [[ -x .devflow/verify.sh ]] || return 0
-  echo "::group::verify"
-  DEVFLOW_BASE_URL="http://127.0.0.1:${DEVFLOW_PORT}" DEVFLOW_NET="${PROJECT}_default" \
-    DEVFLOW_INNER_URL="http://${DEVFLOW_SERVICE:-app}:${DEVFLOW_APP_PORT}" bash .devflow/verify.sh
-  local rc=$?
+  if [[ ! -f .devflow/verify.sh ]]; then
+    echo "::error::devflow: .devflow/verify.sh 不存在；部署後驗收不能略過" >&2
+    return 1
+  fi
+  local rc=0
+  echo "::group::verify (smoke)"
+  DEVFLOW_KIND=deploy DEVFLOW_SMOKE=1 DEVFLOW_ONLY='' DEVFLOW_HEAD_SHA="$SHA" \
+    DEVFLOW_BASE_URL="http://127.0.0.1:${DEVFLOW_PORT}" DEVFLOW_NET="${PROJECT}_default" \
+    DEVFLOW_INNER_URL="http://${PROJECT}-${DEVFLOW_SERVICE:-app}-1:${DEVFLOW_APP_PORT}" bash .devflow/verify.sh || rc=$?
   echo "::endgroup::"
-  return $rc
+  return "$rc"
 }
 
 # 失敗：先採證（回滾會重建容器，候選版本的 log 就不在了），印出遮罩後的 log 尾端，再回滾。
