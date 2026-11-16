@@ -247,15 +247,15 @@ def pr_changes(base: str) -> dict[str, str]:
     return {out[i + 1]: out[i][0] for i in range(0, len(out) - 1, 2)}
 
 
-def prove_rule(rule: Rule, base: str, changes: dict[str, str]) -> str:
-    """The rule must fire on the pre-fix (BASE) version of a file this PR changes."""
+def prove_rule(rule: Rule, base: str, changes: dict[str, str]) -> tuple[str, str]:
+    """The rule must fire on the pre-fix (BASE) version of a file this PR changes. Returns (error, proof)."""
     for path, status in changes.items():
         if status == "A" or not rule.applies(path):
             continue
         if scan_text([rule], path, git("show", f"{base}:{path}"), set()):
-            return ""
+            return "", f"rule {rule.id} fires on the pre-fix (BASE) version of {path}"
     return (f"rule {rule.id} does not fire on the pre-fix version of any file this PR changes; "
-            f"make its patterns match the error this PR fixes")
+            f"make its patterns match the error this PR fixes"), ""
 
 
 def run_test_file(cwd: Path, path: str, name: str) -> tuple[list[str], str]:
@@ -286,12 +286,17 @@ def run_test_file(cwd: Path, path: str, name: str) -> tuple[list[str], str]:
     return outcomes, ""
 
 
-def prove_test(ref: str, base: str) -> str:
+def tally(outcomes: list[str]) -> str:
+    return ", ".join(f"{k} x{n}" for k, n in sorted(Counter(outcomes).items())) or "not run"
+
+
+def prove_test(ref: str, base: str) -> tuple[str, str]:
     """Overlay the PR's test file and test.sh on BASE, run only that file: the named test must fail
-    by assertion there (not error, skip or vanish through an import/collection error) and pass here."""
+    by assertion there (not error, skip or vanish through an import/collection error) and pass here.
+    Returns (error, proof)."""
     path, _, name = ref.partition("::")
     if not name:
-        return f"cannot prove {ref}: name the test (`path::test_name`)"
+        return f"cannot prove {ref}: name the test (`path::test_name`)", ""
     tmp = Path(tempfile.mkdtemp(prefix="devflow-prove-"))
     tree = tmp / "base"
     try:
@@ -301,25 +306,27 @@ def prove_test(ref: str, base: str) -> str:
             shutil.copyfile(f, tree / f)
         before, err = run_test_file(tree, path, name)
         if err:
-            return f"cannot prove {ref} on BASE: {err}"
+            return f"cannot prove {ref} on BASE: {err}", ""
         if "failure" not in before:
             seen = ", ".join(before) or "not run (import or collection error?)"
             return (f"test {ref} on the pre-fix code (BASE): {seen}; proof needs an assertion failure, "
-                    f"so it does not show this test catches the error this PR fixes")
+                    f"so it does not show this test catches the error this PR fixes"), ""
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(tree)], capture_output=True)
         shutil.rmtree(tmp, ignore_errors=True)
     after, err = run_test_file(Path.cwd(), path, name)
     if err:
-        return f"cannot prove {ref} on this PR: {err}"
+        return f"cannot prove {ref} on this PR: {err}", ""
     if not after or set(after) != {"passed"}:
-        return f"test {ref} on this PR: {', '.join(after) or 'not run'}; it must pass after the fix"
-    return ""
+        return f"test {ref} on this PR: {', '.join(after) or 'not run'}; it must pass after the fix", ""
+    return "", f"test {ref}: BASE {tally(before)}; this PR {tally(after)}"
 
 
-def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> list[str]:
+def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> tuple[list[str], list[str]]:
+    """Returns (problems, proofs): proofs say what each new lesson was checked against, so a
+    passing gate log shows the evidence instead of only a count."""
     changes = pr_changes(base)
-    errs = []
+    errs, proofs = [], []
     cited = LESSON_LINE.findall(body)
     if FIX_TITLE.match(title) and not cited and not NO_LESSON.search(body):
         errs.append("fix/revert PR: add `Lesson: L-NNNN` (a lesson added or updated in this PR) or "
@@ -333,7 +340,7 @@ def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> list[str]:
                         f"so its enforcement did not stop it; strengthen it (e.g. skill-only -> rule/test) and "
                         f"record this event in {path}")
     if NO_PROOF.search(body):
-        return errs
+        return errs, ["No-proof in the PR body: new lessons were not proved; the reviewer judges the reason"]
     by_id = {r.id: r for r in rules}
     for path, status in sorted(changes.items()):
         if status != "A" or not re.fullmatch(rf"{LESSONS_DIR}/L-\d{{4}}\.toml", path):
@@ -344,14 +351,16 @@ def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> list[str]:
             continue  # reported by the normal check
         kind, ref = enf.get("kind"), str(enf.get("ref", "")).strip()
         if kind == "rule" and ref in by_id:
-            err = prove_rule(by_id[ref], base, changes)
+            err, proof = prove_rule(by_id[ref], base, changes)
         elif kind == "test" and ref and Path(ref.partition("::")[0]).is_file():
-            err = prove_test(ref, base)
+            err, proof = prove_test(ref, base)
         else:
-            err = ""
+            err, proof = "", f"{kind} lesson: not proved automatically; the reviewer judges it"
         if err:
             errs.append(f"{path}: {err}")
-    return errs
+        else:
+            proofs.append(f"{path}: {proof}")
+    return errs, proofs
 
 
 def main(argv: list[str]) -> int:
@@ -369,11 +378,13 @@ def main(argv: list[str]) -> int:
         return 0
     if len(argv) == 2 and argv[0] == "--pr":
         try:
-            errs = pr_gate(argv[1], os.environ.get("PR_TITLE", ""), os.environ.get("PR_BODY", ""), rules)
+            errs, proofs = pr_gate(argv[1], os.environ.get("PR_TITLE", ""), os.environ.get("PR_BODY", ""), rules)
         except ConfigError as e:
             print(f"CONFIG {e}")
             return 2
         print(f"devflow pr gate: {len(errs)} problem(s)")
+        for p in proofs:
+            print(f"PROOF {p}")
         for e in errs:
             print(f"PR    {e}")
         return 1 if errs else 0
