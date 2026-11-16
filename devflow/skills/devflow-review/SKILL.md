@@ -65,6 +65,6 @@ kanban_request_changes(reason="1. <檔案:行> <問題> → <要怎麼改>\n2. .
 ## 4. kit PR（devflow 本身的 repo，沒有卡片）
 由 `review-kit-pr.sh` 在 Hermes chat 叫你，prompt 給 repo、PR 號與暫存目錄。沒有卡片，不用 `kanban_*`；第 1、2 節的卡片、EPIC、`check acceptance`、`check pr` 不適用。
 1. 讀：`gh pr view <pr> -R <repo> --json title,body,headRefOid,files,statusCheckRollup`、`gh pr diff <pr> -R <repo>`。
-2. 驗：在暫存目錄 `git clone` 該 repo、`git checkout <headRefOid>`，跑 `cd devflow/tests && python3 -m unittest`（失敗 = 退件）；PR 有改的行為，自己寫一次性指令驗證（放暫存目錄）。`ci` check 不是 success 也退件。
+2. 驗：在暫存目錄 `git clone` 該 repo、`git checkout <prompt 給的 head commit>`，跑 `cd devflow/tests && python3 -m unittest`（失敗 = 退件）；PR 有改的行為，自己寫一次性指令驗證（放暫存目錄）。`ci` check 不是 success 也退件。
 3. 查：PR 說明的問題是否真的解決、測試是否測行為；**放寬 gate**（刪檢查、降門檻、跳過情境、擴大豁免、讓 agent 能自己核准自己）沒有在 PR 說明寫出理由與使用者同意 → 退件。其餘同第 2 節「檢查」2–5。
-4. 結論：通過 `gh pr review <pr> -R <repo> --approve --body "LGTM: <理由>"`；否則 `gh pr review <pr> -R <repo> --request-changes --body "1. <檔案:行> <問題> → <要怎麼改>\n2. ..."`。最後一行只輸出 `VERDICT: approved` 或 `VERDICT: changes_requested`。刪掉暫存目錄。
+4. 結論只綁在你審的那個 commit：通過 `gh api repos/<repo>/pulls/<pr>/reviews -f commit_id=<head commit> -f event=APPROVE -f body="LGTM: <理由>"`；否則同樣帶 `commit_id`、`event=REQUEST_CHANGES`、`body="1. <檔案:行> <問題> → <要怎麼改>\n2. ..."`。PR 的 head 已不是那個 commit 就不送 approve，改送 REQUEST_CHANGES 說明「審查期間 head 改變，請重跑 review-kit-pr.sh」。最後一行只輸出 `VERDICT: approved` 或 `VERDICT: changes_requested`。刪掉暫存目錄。
