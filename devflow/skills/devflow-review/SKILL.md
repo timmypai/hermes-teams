@@ -32,7 +32,7 @@ metadata:
   6. 規則與教訓（`check` job 已驗證格式、自測、ref 存在，並在 PR 上證明新教訓抓得到修正前的程式；你判斷內容）：新增或修改的規則，它的 `expect = "fail"` 範例要真的代表這次的錯誤；PR 刪除或放寬既有規則、`baseline.json` 增加條目、新增 `devflow: allow` 豁免，卡片沒有明確授權就退件，寫明要還原哪一處。PR 說明的 `No-lesson:`／`No-proof:` 理由不成立（同類錯誤顯然會再犯、錯誤其實就在這個 PR 修）→ 退件；修 bug 卻不用 `fix:` 標題來避開 lesson gate → 退件。
   7. 自動判斷：`devflow check pr <slug> <pr>`（在 Hermes 主機跑，PR 改不到；結果依 head + 標題 + 說明快取，並寫入 `devflow-judgment` 檢查）。`findings` 列出 PR 改到的 gate 檔案（`check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、刪除教訓）與 Decisions 標出的疑慮（`unlabeled_fix` 修 bug 沒標 `fix:`、`weak_exemption` `No-lesson`/`No-proof` 理由不成立、`lesson_mismatch` 教訓沒對準這次的錯）。每一項在結論裡寫成立或不成立與理由；成立就退件。結束碼：
      - `0`：沒有疑慮或 advisor 已回 `ok`，`devflow-judgment` 已是 success。
-     - `3`：有疑慮，等 `[ADV]` advisor。你自己判斷有成立的疑慮 → 直接退件；否則做完其他檢查後 `kanban_block(reason="devflow check pr：等 advisor 判斷 PR #N")`。tick 會建 `[ADV]`，advisor 完成後自動重跑本卡；重跑時從這一步開始。
+     - `3`：有疑慮，等 `[ADV]` advisor。你自己判斷有成立的疑慮 → 直接退件；否則做完其他檢查後看輸出的 `wait`：`dependency` → `kanban_block(kind="dependency", reason="devflow check pr：等 advisor 判斷 PR #N")`（`[ADV]` 已是本卡 parent，advisor 完成後本卡自動回到 review）；`block` → `kanban_block(reason="devflow check pr：等 advisor 判斷 PR #N")`，tick 會把 `[ADV]` 設為本卡 parent 再重跑本卡。重跑時從這一步開始。
      - `4`：advisor 回 `revise` → 退件，理由引用 advisor 的意見。
      - `1`：Decisions API 失敗 → 等 1 分鐘重跑，最多 3 次，仍失敗就 `kanban_block(kind="needs_input", reason=...)`。
 - 不為風格偏好退件。

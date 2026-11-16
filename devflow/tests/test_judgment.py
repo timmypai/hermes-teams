@@ -266,39 +266,42 @@ class Tick(JudgmentCase):
         self.df.tick_prs("b", REPO, self.tasks("review"))
         self.assertEqual(self.f.statuses, ["success"])
 
-    def test_review_finding_posts_pending_and_opens_one_advisor(self) -> None:
+    def test_review_finding_posts_pending_and_links_one_advisor_as_parent(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.9}
         self.df.tick_prs("b", REPO, self.tasks("review"))
         self.df.tick_prs("b", REPO, self.tasks("review"))
         adv = self.record()["advisor"]
         self.assertEqual([c.get("title") for c in self.f.cards.values() if "title" in c], [f"[ADV] PR 判斷 {REPO}#7"])
         self.assertIn("EPIC: t_00000abc", self.f.cards[adv]["body"])
-        self.assertEqual(self.f.statuses, ["pending"])
+        self.assertEqual((self.f.statuses, self.f.links), (["pending"], [(adv, "t_dev")]))
 
-    def test_parked_reviewer_resumes_after_advisor_ok_and_status_passes(self) -> None:
+    def test_reviewer_waits_on_dependency_once_linked_and_passes_after_ok(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.9}
-        self.assertEqual(self.call(self.df.cmd_check_pr, "t_dev")[0], 3)
-        self.df.tick_prs("b", REPO, self.tasks("blocked"))
-        adv = self.record()["advisor"]
-        self.assertEqual(self.f.resumed, [])
-        self.f.cards[adv].update(status="done", verdict="ok")
-        self.df.tick_prs("b", REPO, self.tasks("blocked"))
-        self.assertEqual(self.f.resumed, ["t_dev"])
-        self.assertEqual(self.f.statuses, ["pending", "success"])
+        self.df.tick_prs("b", REPO, self.tasks("review"))
+        code, out = self.call(self.df.cmd_check_pr, "t_dev")
+        self.assertEqual((code, json.loads(out)["wait"]), (3, "dependency"))
+        self.assertIsNone(self.record().get("parked"))
+        self.f.cards[self.record()["advisor"]].update(status="done", verdict="ok")
         self.assertEqual(self.call(self.df.cmd_check_pr, "t_dev")[0], 0)
+        self.assertEqual(self.f.statuses, ["pending", "success"])
 
-    def test_parked_ship_gets_an_advisor_and_resumes_after_its_verdict(self) -> None:
+    def test_card_blocked_before_the_link_is_linked_and_resumed_once(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
-        self.assertEqual(self.ship()[0], 3)  # body changed after review: findings reach the merge entry
+        code, out = self.ship()  # body changed after review: findings reach the merge entry
+        self.assertEqual((code, json.loads(out)["wait"]), (3, "block"))
         self.f.cards["t_ship"] = {"status": "blocked", "verdict": None, "body": "EPIC: t_00000abc"}
         tasks = [{"id": "t_ship", "title": "[SHIP] x", "assignee": "devops", "status": "blocked", "completion_contract": None}]
         self.df.tick_prs("b", REPO, tasks)
-        adv = self.record()["advisor"]
-        self.assertEqual(self.f.resumed, [])
-        self.f.cards[adv].update(status="done", verdict="ok")
         self.df.tick_prs("b", REPO, tasks)
-        self.assertEqual(self.f.resumed, ["t_ship"])
-        self.assertEqual(self.ship()[0], 0)
+        self.assertEqual((self.f.links, self.f.resumed), ([(self.record()["advisor"], "t_ship")], ["t_ship"]))
+
+    def test_final_verdict_does_not_park(self) -> None:
+        self.f.answers = {"unlabeled_fix": 0.8}
+        self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", advisor="t_adv")
+        self.adv("done", "revise")
+        self.assertEqual(self.ship()[0], 4)
+        self.assertIsNone(self.record().get("parked"))
 
 
 
