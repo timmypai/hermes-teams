@@ -1,0 +1,44 @@
+name: deploy
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, devflow]
+    steps:
+      - uses: actions/checkout@v4
+      - name: app env
+        env:
+          APP_ENV: ${{ secrets.DEVFLOW_APP_ENV }}
+        run: |
+          umask 077
+          printf '%s\n' "$APP_ENV" > deploy/.env
+      - name: deploy
+        run: bash .devflow/deploy.sh
+      - name: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-evidence-deploy-${{ github.sha }}
+          path: .devflow/evidence
+          if-no-files-found: ignore
+      # deploy.sh 失敗時在回滾前寫入的診斷（已遮罩；可能仍含應用資料），只留 7 天。
+      - name: diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-diagnostics-deploy-${{ github.sha }}
+          path: .devflow/diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: summary
+        if: always()
+        run: |
+          . .devflow/config.env
+          echo "### ${DEVFLOW_APP} ${GITHUB_SHA::12}: ${{ job.status }} (127.0.0.1:${DEVFLOW_PORT}${DEVFLOW_HEALTH_PATH})" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,76 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: test
+        run: bash .devflow/test.sh
+      - name: docker build
+        if: hashFiles('Dockerfile') != ''
+        run: docker build -t ci-check .
+
+  # devflow 規則（.devflow/rules/，每條附錯誤範例自測）與教訓紀錄（.devflow/lessons/）。必過：列在 devflow-ci 的 needs。
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: rules and lessons
+        run: bash .devflow/check.sh
+
+  # Acceptance journeys against a running copy of the service (same compose file as deploy).
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: up
+        if: hashFiles('Dockerfile') != ''
+        run: bash .devflow/up.sh
+      - name: verify
+        if: hashFiles('Dockerfile') != ''
+        run: bash .devflow/verify.sh
+      - name: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-evidence-pr-${{ github.sha }}
+          path: .devflow/evidence
+          if-no-files-found: ignore
+      # 失敗時採證（容器狀態、退出原因、log；已遮罩），與 AC 證據分開存、只留 7 天。
+      - name: diagnostics
+        if: failure() && hashFiles('Dockerfile') != ''
+        run: |
+          . .devflow/config.env
+          bash .devflow/capture.sh "ci-${DEVFLOW_APP}" ci
+      - name: upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-diagnostics-pr-${{ github.sha }}
+          path: .devflow/diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Required check on the default branch (devflow repo protect) and the Hermes PR
+  # completion_contract gate. Keep this job name; list every other job in `needs`.
+  # ub-mode metrics run in quality.yml: a separate workflow, never part of this check.
+  devflow-ci:
+    if: always()
+    needs: [test, check, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: all jobs passed
+        run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false

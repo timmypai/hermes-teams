@@ -1,0 +1,11 @@
+# devflow 部署定義。DEVFLOW_* 來自 .devflow/config.env（deploy.sh 載入）。
+services:
+  app:
+    image: ${DEVFLOW_IMAGE}
+    build:
+      context: ..
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${DEVFLOW_PORT}:${DEVFLOW_APP_PORT}"
+    restart: unless-stopped

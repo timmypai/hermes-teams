@@ -1,0 +1,50 @@
+id = "no-sleep-fix"
+message = "固定等待會掩蓋時序問題：改成等待明確條件（狀態、事件、回應），或用有上限的條件式重試。真的需要延遲（如限流退避）時，在這行或上一行加 `devflow: allow no-sleep-fix L-NNNN` 並寫教訓。"
+include = ["**/*.py", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.ts", "**/*.tsx", "**/*.go"]
+patterns = [
+  '\btime\.sleep\(',
+  '\basyncio\.sleep\(',
+  '\btime\.Sleep\(',
+  '\.waitForTimeout\(',
+  'new Promise\(\s*\(?\s*\w+\s*\)?\s*=>\s*setTimeout\(',
+]
+
+[[fixture]]
+path = "app/worker.py"
+text = "    time.sleep(2)  # wait for db"
+expect = "fail"
+
+[[fixture]]
+path = "app/jobs.py"
+text = "await asyncio.sleep(0.5)"
+expect = "fail"
+
+[[fixture]]
+path = "internal/sync/run.go"
+text = "time.Sleep(3 * time.Second)"
+expect = "fail"
+
+[[fixture]]
+path = ".devflow/ui/ac.spec.ts"
+text = "await page.waitForTimeout(1000);"
+expect = "fail"
+
+[[fixture]]
+path = "src/retry.ts"
+text = "await new Promise((r) => setTimeout(r, 500));"
+expect = "fail"
+
+[[fixture]]
+path = "app/worker.py"
+text = "    time.sleep(backoff)  # devflow: allow no-sleep-fix L-0001"
+expect = "pass"
+
+[[fixture]]
+path = ".devflow/ui/ac.spec.ts"
+text = "await expect(page.getByRole('status')).toHaveText('done');"
+expect = "pass"
+
+[[fixture]]
+path = "scripts/wait.sh"
+text = "sleep 2"
+expect = "pass"

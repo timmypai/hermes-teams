@@ -1,0 +1,61 @@
+id = "no-suppress"
+message = "不要用註解壓掉 lint／型別／靜態檢查：修正根因。確實是誤報時，在這行或上一行加 `devflow: allow no-suppress L-NNNN` 並寫教訓說明。"
+include = ["**/*.py", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.ts", "**/*.tsx", "**/*.go", "**/*.rs", "**/*.java", "**/*.kt", "**/*.sh"]
+patterns = [
+  '#\s*noqa\b',
+  '#\s*type:\s*ignore\b',
+  '#\s*(pyright|mypy):\s*ignore',
+  '#\s*pylint:\s*disable',
+  '@ts-(ignore|nocheck|expect-error)\b',
+  '\beslint-disable',
+  '\bbiome-ignore\b',
+  '//\s*nolint\b',
+  '#!?\[allow\(',
+  '@SuppressWarnings\(',
+  '#\s*shellcheck\s+disable=',
+]
+
+[[fixture]]
+path = "app/models.py"
+text = "from app import *  # noqa: F403"
+expect = "fail"
+
+[[fixture]]
+path = "app/models.py"
+text = "user.name = None  # type: ignore[assignment]"
+expect = "fail"
+
+[[fixture]]
+path = "src/api.ts"
+text = "// @ts-ignore"
+expect = "fail"
+
+[[fixture]]
+path = "src/api.ts"
+text = "/* eslint-disable no-console */"
+expect = "fail"
+
+[[fixture]]
+path = "cmd/main.go"
+text = "x := unsafe() //nolint:errcheck"
+expect = "fail"
+
+[[fixture]]
+path = "src/lib.rs"
+text = "#[allow(dead_code)]"
+expect = "fail"
+
+[[fixture]]
+path = "scripts/build.sh"
+text = "# shellcheck disable=SC2086"
+expect = "fail"
+
+[[fixture]]
+path = "src/api.ts"
+text = "// devflow: allow no-suppress L-0002\n// @ts-ignore"
+expect = "pass"
+
+[[fixture]]
+path = "app/models.py"
+text = "name: str | None = None"
+expect = "pass"

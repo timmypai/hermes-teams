@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Hermes devflow 多代理人協作系統：從需求、可觀察驗收、分工實作、獨立審查到 CI/CD、回滾與交付回饋的工程師指南。">
+  <title>Hermes devflow｜多代理人閉環開發與交付</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --paper: #f5f5f5;
+      --paper-2: #ececec;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #5a6580;
+      --rule: rgba(45,49,66,.12);
+      --rule-solid: #bfc0c0;
+      --accent: #bf4520;
+      --accent-tint: rgba(191,69,32,.08);
+      --link: #2e5aa8;
+      --sans: 'Geist', 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', system-ui, sans-serif;
+      --serif: 'Instrument Serif', 'Noto Serif TC', serif;
+      --mono: 'Geist Mono', ui-monospace, monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-padding-top: 24px; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.8 var(--sans); }
+    a { color: var(--link); text-underline-offset: 4px; }
+    a:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--link); outline-offset: 5px; }
+    .shell { max-width: 1376px; min-width: 0; padding: 40px 48px 32px; margin: auto; }
+    .masthead { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; border-bottom: 1px solid var(--ink); padding-bottom: 16px; }
+    .brand { font-weight: 600; font-size: 14px; letter-spacing: .04em; }
+    .edition, .eyebrow, .section-no { font-family: var(--mono); font-size: 10px; letter-spacing: .12em; color: var(--muted); }
+    .hero { display: grid; grid-template-columns: 1.6fr 1fr; gap: 56px; padding: 56px 0 32px; align-items: end; }
+    .eyebrow { margin: 0 0 16px; text-transform: uppercase; }
+    h1 { font: 400 40px/1.35 var(--serif); margin: 0 0 20px; letter-spacing: -.02em; }
+    h1 span { display: block; }
+    .lede { color: var(--muted); margin: 0; max-width: 52ch; }
+    .principle { border-left: 2px solid var(--accent); padding-left: 24px; }
+    .principle h2 { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
+    .principle p { margin: 0; color: var(--muted); font-size: 14px; }
+    .meta { display: flex; gap: 8px 24px; flex-wrap: wrap; color: var(--soft); font-size: 12px; margin: 24px 0 0; }
+    nav { display: flex; gap: 12px 28px; flex-wrap: wrap; padding: 20px 0; margin-bottom: 32px; border-block: 1px solid var(--rule); }
+    nav a { font-size: 13px; color: var(--ink); text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    section { margin-bottom: 52px; min-width: 0; }
+    .section-head { display: flex; gap: 20px; align-items: baseline; margin-bottom: 12px; }
+    .section-head h2 { font-size: 22px; font-weight: 500; margin: 0; }
+    .section-intro { margin: 0 0 16px 44px; max-width: 88ch; color: var(--muted); font-size: 14px; }
+    figure { margin: 0; min-width: 0; }
+    .diagram-container { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
+    svg { width: 100%; min-width: 1280px; display: block; font-family: var(--sans); }
+    svg text { fill: var(--ink); }
+    svg .paper { fill: var(--paper); }
+    svg .zone { fill: rgba(45,49,66,.02); stroke: var(--rule-solid); stroke-dasharray: 4 4; }
+    svg .node { fill: #fff; stroke: var(--ink); stroke-width: 1; }
+    svg .input { fill: rgba(79,93,117,.1); stroke: var(--soft); }
+    svg .focal { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.2; }
+    svg .tag { fill: var(--paper); stroke: var(--rule-solid); stroke-width: .8; }
+    svg .name { font-size: 12px; font-weight: 600; }
+    svg .human { font-size: 12px; font-weight: 500; fill: var(--muted); }
+    svg .group-heading { font-size: 14px; font-weight: 600; }
+    svg .tech { font: 9px var(--mono); fill: var(--muted); }
+    svg .tag-text { font: 8px var(--mono); fill: var(--soft); letter-spacing: .06em; }
+    svg .edge-label { font: 8px var(--mono); fill: var(--soft); letter-spacing: .06em; }
+    svg .route { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+    svg .return { stroke-dasharray: 5 4; }
+    svg .rule { stroke: var(--rule-solid); stroke-width: .8; }
+    svg .focal-text { fill: var(--accent); }
+    figcaption { color: var(--muted); font-size: 12px; padding: 12px 0 0; border-top: 1px solid var(--rule); }
+    .note { color: var(--muted); font-size: 13px; margin: 16px 0; }
+    .two-col { display: grid; grid-template-columns: 1.15fr 1fr; gap: 32px; }
+    .contract { border-top: 2px solid var(--ink); padding-top: 16px; }
+    h3 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+    p { margin: 0 0 12px; }
+    code, pre { font-family: var(--mono); }
+    code { font-size: .86em; overflow-wrap: anywhere; }
+    pre { font-size: 11px; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; padding: 20px; background: var(--paper-2); border: 1px solid var(--rule); border-radius: 6px; margin: 16px 0 0; }
+    dl { margin: 0; }
+    dt { font-weight: 600; font-size: 13px; margin-top: 16px; }
+    dt:first-child { margin-top: 0; }
+    dd { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+    .table-wrap { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+    th { font-weight: 600; border-block: 1px solid var(--ink); padding: 12px 16px 12px 0; vertical-align: top; }
+    td { border-bottom: 1px solid var(--rule); padding: 16px 20px 16px 0; vertical-align: top; color: var(--muted); }
+    td:first-child { color: var(--ink); font-weight: 500; min-width: 136px; }
+    .controls td:first-child { width: 20%; }
+    .controls td:nth-child(2) { width: 40%; }
+    .failure td:first-child { width: 21%; }
+    .failure td:nth-child(2) { width: 43%; }
+    .boundary { border-left: 2px solid var(--accent); padding: 16px 24px; background: var(--accent-tint); margin-top: 24px; }
+    .boundary h3 { color: var(--accent); font-size: 14px; }
+    .boundary p { font-size: 13px; margin: 0; }
+    details { border-bottom: 1px solid var(--rule); padding: 16px 0; }
+    summary { font-size: 14px; cursor: pointer; font-weight: 500; }
+    details p, details ul { color: var(--muted); font-size: 13px; margin: 16px 0 0; }
+    details ul { padding-left: 20px; }
+    .sources { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 12px; }
+    footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; border-top: 1px solid var(--ink); padding-top: 20px; color: var(--soft); font-size: 11px; }
+    @media (max-width: 760px) {
+      .shell { padding: 24px 20px; }
+      .hero { grid-template-columns: 1fr; gap: 28px; padding-top: 32px; }
+      h1 { font-size: 28px; }
+      .edition { font-size: 9px; letter-spacing: 0; }
+      .two-col { grid-template-columns: 1fr; gap: 28px; }
+      .section-head h2 { font-size: 19px; }
+      .section-intro { margin-left: 0; }
+      .table-wrap table { min-width: 700px; }
+    }
+    @media print {
+      body { font-size: 11px; }
+      .shell { max-width: none; padding: 0; }
+      .hero { padding-top: 24px; }
+      nav { display: none; }
+      .diagram-container, .table-wrap { overflow: visible; }
+      svg { min-width: 0; }
+      .table-wrap table { min-width: 0; }
+      figure, .contract, tr { break-inside: avoid; }
+      section { margin-bottom: 24px; }
+    }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header>
+    <div class="masthead"><div class="brand">HERMES / DEVFLOW</div><div class="edition">ENGINEERING SYSTEM NOTE · 2026-11-15</div></div>
+    <div class="hero">
+      <div>
+        <p class="eyebrow">Multi-agent engineering · closed-loop delivery</p>
+        <h1>多代理人協作，<span>從需求到可驗收的部署。</span></h1>
+        <p class="lede">七個 Bot 共用一份任務依賴圖。以可觀察的驗收條件驅動實作，把 PR、獨立審查、CI 與部署證據接回同一個交付閉環。</p>
+      </div>
+      <aside class="principle" aria-label="交付原則">
+        <p class="eyebrow">The completion condition</p>
+        <h2>完成不是「代理人說做完」。</h2>
+        <p>每條 AC 都要有結果與證據。部署成功不等於驗收通過；缺漏回到任務圖，不靠聊天記憶維持進度。</p>
+      </aside>
+    </div>
+    <p class="meta"><span>對象：工程師／平台維運</span><span>依據：此 repo 的 devflow 文件、角色設定與 CI/CD 範本</span><span>設計說明，非線上運行狀態</span></p>
+    <nav aria-label="文件章節"><a href="#collaboration">01 協作閉環</a><a href="#delivery">02 交付與部署</a><a href="#contracts">03 契約與證據</a><a href="#recovery">04 失敗恢復</a><a href="#boundaries">05 控制邊界</a></nav>
+  </header>
+
+  <section id="collaboration" aria-labelledby="collaboration-heading">
+    <div class="section-head"><span class="section-no">01</span><h2 id="collaboration-heading">協作閉環：人給目標，任務圖保存進度</h2></div>
+    <p class="section-intro">圖中連線表示工作交接，不代表 Bot 之間直接呼叫。每個 repo 一個 Kanban board；dispatcher 依 parent 依賴派工，EPIC 等待子卡完成後再驗收。</p>
+    <figure>
+      <div class="diagram-container" tabindex="0" role="region" aria-label="協作系統圖，可左右捲動">
+        <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="system-collaboration-title system-collaboration-desc">
+          <title id="system-collaboration-title">Hermes 多代理人協作與驗收閉環</title>
+          <desc id="system-collaboration-desc">Hermes 接收需求，orchestrator 依需委派研究與架構，developer 實作後交 reviewer 審查與 devops 交付，最終驗收將缺漏補卡或把成果回報使用者。</desc>
+          <defs>
+            <marker id="collab-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+            <marker id="collab-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+            <marker id="collab-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+          </defs>
+          <rect class="paper" width="1280" height="720"/>
+          <rect class="zone" x="440" y="40" width="504" height="160" rx="8"/>
+          <text class="human" x="464" y="65">選用專家 · 解未知，不為每張卡固定跑一輪</text>
+          <text class="tag-text" x="40" y="236">INTAKE / CONTROL</text>
+          <text class="tag-text" x="648" y="236">IMPLEMENT / REVIEW</text>
+          <text class="tag-text" x="648" y="468">DELIVER / VERIFY</text>
+
+          <!-- Work handoffs, optional paths, and feedback are painted before nodes. -->
+          <path class="route" d="M200 320 H248" marker-end="url(#collab-arrow)"/>
+          <path class="route" d="M440 320 H648" marker-end="url(#collab-arrow)"/>
+          <path class="route return" d="M312 272 V136 Q312 128 320 128 H464" marker-end="url(#collab-arrow)"/>
+          <path class="route return" d="M376 272 V232 Q376 224 384 224 H808 Q816 224 816 216 V176" marker-end="url(#collab-arrow)"/>
+          <path class="route" d="M824 320 H1016" marker-end="url(#collab-arrow)"/>
+          <path class="route return" d="M1080 368 V408 Q1080 416 1072 416 H744 Q736 416 736 408 V368" marker-end="url(#collab-arrow)"/>
+          <path class="route" d="M1144 368 V440 Q1144 448 1136 448 H1120 Q1112 448 1112 456 V496" marker-end="url(#collab-arrow)"/>
+          <path class="route" d="M1016 544 H440" marker-end="url(#collab-arrow)"/>
+          <path class="route return" d="M312 496 V368" marker-end="url(#collab-arrow)"/>
+          <path class="route return" d="M248 544 H128 Q120 544 120 536 V368" marker-end="url(#collab-arrow)"/>
+
+          <rect class="paper" x="500" y="292" width="88" height="20" rx="2"/><text class="edge-label" x="544" y="305" text-anchor="middle">[DEV] / [OPS]</text>
+          <rect class="paper" x="876" y="292" width="88" height="20" rx="2"/><text class="edge-label" x="920" y="305" text-anchor="middle">PR + EVIDENCE</text>
+          <rect class="paper" x="860" y="388" width="96" height="20" rx="2"/><text class="edge-label" x="908" y="401" text-anchor="middle">NEEDS CHANGES</text>
+          <rect class="paper" x="1152" y="392" width="72" height="20" rx="2"/><text class="edge-label" x="1188" y="405" text-anchor="middle">APPROVED</text>
+          <rect class="paper" x="672" y="516" width="112" height="20" rx="2"/><text class="edge-label" x="728" y="529" text-anchor="middle">DEPLOY RUN + AC</text>
+          <rect class="paper" x="320" y="424" width="80" height="20" rx="2"/><text class="edge-label" x="360" y="437" text-anchor="middle">FAIL / REPLAN</text>
+          <rect class="paper" x="128" y="448" width="80" height="20" rx="2"/><text class="edge-label" x="168" y="461" text-anchor="middle">ALL AC PASS</text>
+
+          <g>
+            <rect class="paper" x="40" y="272" width="160" height="96" rx="6"/><rect class="node input" x="40" y="272" width="160" height="96" rx="6"/>
+            <rect class="tag" x="52" y="284" width="48" height="16" rx="2"/><text class="tag-text" x="76" y="295" text-anchor="middle">HUMAN</text>
+            <text class="name" x="56" y="321">Hermes 需求入口</text><text class="human" x="56" y="343">語音／文字 → 目標與 AC</text>
+          </g>
+          <g>
+            <rect class="paper" x="248" y="272" width="192" height="96" rx="6"/><rect class="focal" x="248" y="272" width="192" height="96" rx="6"/>
+            <rect class="tag" x="260" y="284" width="72" height="16" rx="2"/><text class="tag-text" x="296" y="295" text-anchor="middle">[EPIC] [ADJ]</text>
+            <text class="name" x="264" y="321">Orchestrator</text><text class="human" x="264" y="343">拆卡、覆蓋 AC、依賴與調整</text>
+          </g>
+          <g>
+            <rect class="paper" x="464" y="80" width="192" height="96" rx="6"/><rect class="node" x="464" y="80" width="192" height="96" rx="6"/>
+            <rect class="tag" x="476" y="92" width="40" height="16" rx="2"/><text class="tag-text" x="496" y="103" text-anchor="middle">[RES]</text>
+            <text class="name" x="480" y="129">Researcher</text><text class="human" x="480" y="151">一手來源、比較、PoC 證據</text>
+          </g>
+          <g>
+            <rect class="paper" x="720" y="80" width="192" height="96" rx="6"/><rect class="node" x="720" y="80" width="192" height="96" rx="6"/>
+            <rect class="tag" x="732" y="92" width="48" height="16" rx="2"/><text class="tag-text" x="756" y="103" text-anchor="middle">[ARCH]</text>
+            <text class="name" x="736" y="129">Architect</text><text class="human" x="736" y="151">模組邊界、介面、資料與 ADR</text>
+          </g>
+          <g>
+            <rect class="paper" x="648" y="272" width="176" height="96" rx="6"/><rect class="node" x="648" y="272" width="176" height="96" rx="6"/>
+            <rect class="tag" x="660" y="284" width="40" height="16" rx="2"/><text class="tag-text" x="680" y="295" text-anchor="middle">[DEV]</text>
+            <text class="name" x="664" y="321">Developer</text><text class="tech" x="664" y="341">Codex app-server / worktree</text><text class="human" x="664" y="358">實作、測試、AC journeys</text>
+          </g>
+          <g>
+            <rect class="paper" x="1016" y="272" width="192" height="96" rx="6"/><rect class="node" x="1016" y="272" width="192" height="96" rx="6"/>
+            <rect class="tag" x="1028" y="284" width="56" height="16" rx="2"/><text class="tag-text" x="1056" y="295" text-anchor="middle">REVIEW</text>
+            <text class="name" x="1032" y="321">Reviewer</text><text class="human" x="1032" y="343">不同 GitHub 帳號，獨立探測</text>
+          </g>
+          <g>
+            <rect class="paper" x="1016" y="496" width="192" height="96" rx="6"/><rect class="node" x="1016" y="496" width="192" height="96" rx="6"/>
+            <rect class="tag" x="1028" y="508" width="48" height="16" rx="2"/><text class="tag-text" x="1052" y="519" text-anchor="middle">[SHIP]</text>
+            <text class="name" x="1032" y="545">DevOps</text><text class="human" x="1032" y="567">合併、Actions 部署、恢復</text>
+          </g>
+          <g>
+            <rect class="paper" x="248" y="496" width="192" height="96" rx="6"/><rect class="focal" x="248" y="496" width="192" height="96" rx="6"/>
+            <rect class="tag" x="260" y="508" width="64" height="16" rx="2"/><text class="tag-text" x="292" y="519" text-anchor="middle">AC-1..N</text>
+            <text class="name" x="264" y="545">Orchestrator 最終驗收</text><text class="tech" x="264" y="567">devflow check acceptance</text>
+          </g>
+
+          <text class="human" x="40" y="636">共用控制面：Kanban 卡片 body = 規格；summary + metadata = 交接。研究／架構輸出由後續卡片讀取，不靠私下訊息。</text>
+          <line class="rule" x1="40" y1="660" x2="1240" y2="660"/>
+          <line class="route" x1="40" y1="688" x2="80" y2="688"/><text class="human" x="92" y="692">必要交接</text>
+          <line class="route return" x1="248" y1="688" x2="288" y2="688"/><text class="human" x="300" y="692">選用／回饋路徑（以標籤區分）</text>
+          <rect class="focal" x="648" y="680" width="16" height="16" rx="2"/><text class="human" x="676" y="692">決策與驗收焦點，非新增角色</text>
+        </svg>
+      </div>
+      <figcaption>Architecture · 8 節點／10 路徑。Hermes 同時承擔按需 Advisor；研究與架構不是固定前置關卡。Reviewer 是原卡的 review 欄，不另建 review 卡。</figcaption>
+    </figure>
+    <p class="note"><strong>派工語意：</strong>可獨立合併的工作才能並行；同檔寫入先拆責任。若後一張 DEV 需要前一張 PR 的程式碼，依賴前一張 <code>[SHIP]</code>，不是只等 DEV 寫完。七個 profile 共用原生工具，並非七套獨立排程系統。</p>
+  </section>
+
+  <section id="delivery" aria-labelledby="delivery-heading">
+    <div class="section-head"><span class="section-no">02</span><h2 id="delivery-heading">交付路徑：同一套 journeys，部署前後各驗一次</h2></div>
+    <p class="section-intro">以下是具備 Dockerfile、啟用部署且已接入 devflow 契約的服務路徑。PR 驗證環境與 VM 正式執行環境分開；不是把 CI 建出的同一份映像直接晉升。</p>
+    <figure>
+      <div class="diagram-container" tabindex="0" role="region" aria-label="CI/CD 階段圖，可左右捲動">
+        <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="system-delivery-title system-delivery-desc">
+          <title id="system-delivery-title">從 PR CI 到部署後驗證的交付階段</title>
+          <desc id="system-delivery-desc">CI 平行測試與驗收後，devops 核對審查與目前 head 再合併，VM 重新建置並啟動候選版本，健康與驗收通過後才標記 live 並產生部署證據。</desc>
+          <defs>
+            <marker id="delivery-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+            <marker id="delivery-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+            <marker id="delivery-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+          </defs>
+          <rect class="paper" width="1280" height="720"/>
+          <path class="route" d="M400 104 H432" marker-end="url(#delivery-arrow)"/>
+          <path class="route" d="M672 104 H704" marker-end="url(#delivery-arrow)"/>
+          <path class="route" d="M944 104 H976" marker-end="url(#delivery-arrow)"/>
+          <text class="tag-text" x="40" y="60">STAGE / CONTRACT</text>
+          <rect class="node" x="160" y="80" width="240" height="48" rx="6"/><text class="tag-text" x="176" y="108">01</text><text class="group-heading" x="208" y="109">PR CI</text>
+          <rect class="node" x="432" y="80" width="240" height="48" rx="6"/><text class="tag-text" x="448" y="108">02</text><text class="group-heading" x="480" y="109">Merge</text>
+          <rect class="node" x="704" y="80" width="240" height="48" rx="6"/><text class="tag-text" x="720" y="108">03</text><text class="group-heading" x="752" y="109">Deploy</text>
+          <rect class="focal" x="976" y="80" width="240" height="48" rx="6"/><text class="tag-text focal-text" x="992" y="108">04</text><text class="group-heading" x="1024" y="109">Verify live</text>
+          <rect class="paper" x="160" y="152" width="240" height="400" rx="6"/><rect class="node" x="160" y="152" width="240" height="400" rx="6"/>
+          <rect class="paper" x="432" y="152" width="240" height="400" rx="6"/><rect class="node" x="432" y="152" width="240" height="400" rx="6"/>
+          <rect class="paper" x="704" y="152" width="240" height="400" rx="6"/><rect class="node" x="704" y="152" width="240" height="400" rx="6"/>
+          <rect class="paper" x="976" y="152" width="240" height="400" rx="6"/><rect class="focal" x="976" y="152" width="240" height="400" rx="6"/>
+          <text class="human" x="40" y="198">執行者／位置</text>
+          <text class="human" x="40" y="298">輸入</text>
+          <text class="human" x="40" y="398">控制</text>
+          <text class="human" x="40" y="498">主要輸出</text>
+          <path class="rule" d="M160 252 H400 M160 352 H400 M160 452 H400 M432 252 H672 M432 352 H672 M432 452 H672 M704 252 H944 M704 352 H944 M704 452 H944 M976 252 H1216 M976 352 H1216 M976 452 H1216"/>
+          <!-- Stable semantic slots: actor/location, input, control, primary output. -->
+          <text class="name" x="176" y="192">GitHub-hosted runner</text><text class="tech" x="176" y="216">ubuntu-latest</text>
+          <text class="human" x="176" y="292">PR 變更與 AC journeys</text><text class="tech" x="176" y="316">test.sh / up.sh / verify.sh</text>
+          <text class="human" x="176" y="392">test 與 verify 平行執行</text><text class="tech" x="176" y="416">devflow-ci needs: [test, verify]</text>
+          <text class="human" x="176" y="492">PR 驗收證據</text><text class="tech" x="176" y="516">devflow-evidence-pr-&lt;sha&gt;</text>
+
+          <text class="name" x="448" y="192">DevOps / GitHub</text><text class="tech" x="448" y="216">[SHIP] / builder identity</text>
+          <text class="human" x="448" y="292">已審查 PR 與目前 head</text><text class="tech" x="448" y="316">approval + required checks</text>
+          <text class="human" x="448" y="392">核對最新 SHA 與合併條件</text><text class="tech" x="448" y="416">completion_contract / ruleset</text>
+          <text class="human" x="448" y="492">預設分支更新觸發部署</text><text class="tech" x="448" y="516">push: main / master</text>
+
+          <text class="name" x="720" y="192">Oracle VM / devflow</text><text class="tech" x="720" y="216">[self-hosted, devflow]</text>
+          <text class="human" x="720" y="292">分支 SHA 與部署環境設定</text><text class="tech" x="720" y="316">GITHUB_SHA / DEVFLOW_APP_ENV</text>
+          <text class="human" x="720" y="392">rootless Docker；主機重新建置</text><text class="tech" x="720" y="416">compose build --pull / up -d</text>
+          <text class="human" x="720" y="492">已啟動的候選版本</text><text class="tech" x="720" y="516">127.0.0.1:&lt;allocated-port&gt;</text>
+
+          <text class="name" x="992" y="192">同一 VM / deploy.sh</text><text class="tech" x="992" y="216">health + verify.sh</text>
+          <text class="human" x="992" y="292">候選服務與相同 AC journeys</text><text class="tech" x="992" y="316">DEVFLOW_BASE_URL / Playwright</text>
+          <text class="human" x="992" y="392">兩項通過才更新 live 標記</text><text class="human" x="992" y="416">未通過 → 先採證再回滾，run 失敗</text>
+          <text class="human" x="992" y="492">部署證據，交回最終驗收</text><text class="tech" x="992" y="516">devflow-evidence-deploy-&lt;sha&gt;</text>
+
+          <text class="human" x="160" y="592">旁路證據：獨立的 quality workflow 產生 CRAP／重複／mutation 報告，不是 required check，不擋合併。</text>
+          <text class="human" x="160" y="620">候選版本先 up 再驗證；這不是 blue-green、canary 或零停機部署承諾。</text>
+          <line class="rule" x1="40" y1="660" x2="1240" y2="660"/>
+          <line class="route" x1="40" y1="688" x2="80" y2="688"/><text class="human" x="92" y="692">受控交付方向</text>
+          <rect class="focal" x="344" y="680" width="16" height="16" rx="2"/><text class="human" x="372" y="692">部署後驗證焦點</text>
+          <text class="tech" x="736" y="692">Process / 4 stages / 4 semantic slots</text>
+        </svg>
+      </div>
+      <figcaption>Process · Stage framework with semantic slots。各階段重複相同的四個契約欄位；實際合併與部署權限由 repo 設定決定，圖中不是額外的強制機制。</figcaption>
+    </figure>
+  </section>
+
+  <section id="contracts" aria-labelledby="contracts-heading">
+    <div class="section-head"><span class="section-no">03</span><h2 id="contracts-heading">協作靠契約，不靠共享聊天記憶</h2></div>
+    <div class="two-col">
+      <article class="contract">
+        <h3>任務與工作空間</h3>
+        <dl>
+          <dt>單位：一張 DEV，一個可獨立合併的 PR</dt>
+          <dd>卡片 body 保存目標、編號 AC、提示與「覆蓋：AC-n」。純研究或文件工作不必建立 SHIP；OPS 負責 repo 接入、CI/CD 與 runner。</dd>
+          <dt>隔離：工作空間不同，並行不等於可同寫</dt>
+          <dd><code>[DEV] / [OPS]</code> 由 dispatcher 配置 worktree；<code>[RES] / [ADV]</code> 用 scratch；<code>[ARCH] / [SHIP] / [EPIC] / [ADJ]</code> 用 dir。Reviewer 在原 worktree 驗證，但不提交或改寫 PR。</dd>
+          <dt>等待：依賴驅動，不讓 worker 睡著輪詢</dt>
+          <dd>EPIC 以 dependency block 等待葉節點。預設 dispatcher 設定同時最多 4 張 in-progress、每個 profile 最多 2 張；這是派工設定，不是實際吞吐量。</dd>
+          <dt>調整：受限操作交給 gateway</dt>
+          <dd>worker 可用原生 <code>kanban_*</code> 工具；edit／archive／resume 等操作寫成 <code>devflow-ops</code> 留言，由 gateway 的 tick 執行，結果留回同一卡。</dd>
+        </dl>
+      </article>
+      <article class="contract">
+        <h3>證據追溯鍵</h3>
+        <p class="note">至少能從一條 AC 找到負責卡、PR head、CI／部署 run，以及 journey 輸出或 UI 截圖。下面是跨階段關聯欄位，不是所有角色共用的單一 JSON schema。</p>
+        <pre aria-label="交接欄位關聯">EPIC.body
+  AC-1..n                 可觀察結果
+
+DEV / REVIEW metadata
+  pr_url · head_sha       變更版本
+  tests · acceptance      測試與逐條證據
+  probes                  reviewer 獨立探測
+
+SHIP metadata
+  deploy_run_id           部署 run
+  acceptance · followups  部署後驗證與缺漏
+
+EPIC completion metadata
+  prs · deploy_runs
+  acceptance[]
+    ac · verdict · probability · evidence</pre>
+        <p class="note"><code>.devflow/evidence/AC-n.txt</code> 保存 journey 輸出；UI journeys 保存截圖。<code>head_sha</code> 指 PR 版本，部署 run 的 SHA 可能是合併提交，不能假設兩者相等。</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="recovery" aria-labelledby="recovery-heading">
+    <div class="section-head"><span class="section-no">04</span><h2 id="recovery-heading">閉環的重點：失敗回到哪裡，恢復靠什麼證據</h2></div>
+    <div class="table-wrap">
+      <table class="failure">
+        <caption class="note">下表補充主圖未展開的失敗分支；回滾成功也不會把失敗的交付判為成功。</caption>
+        <thead><tr><th scope="col">觀察到的失敗</th><th scope="col">回路與責任人</th><th scope="col">再次前進的條件</th></tr></thead>
+        <tbody>
+          <tr><td>需求或計畫有疑慮</td><td>計畫變動觸發 <code>check plan</code>；新疑慮交 Hermes 的 <code>[ADV]</code>。需要修正時，orchestrator 用 <code>[ADJ]</code> 調整卡片與依賴。</td><td>重新建立可觀察的 AC 覆蓋。只有含不可回復操作的 ADV 會阻擋 SHIP；一般建議不擋。</td></tr>
+          <tr><td>PR CI 失敗／審查退件</td><td>Developer 修正同一卡／PR，補足行為實作與 journeys；Reviewer 依最新 head 重審，不能拿舊 SHA 的證據放行。</td><td>目前 head 的必要檢查通過，退件理由已解決；reviewer 的探測與驗收證據充分。</td></tr>
+          <tr><td>候選服務 up／health／verify 失敗</td><td><code>deploy.sh</code> 先以 <code>capture.sh</code> 保存候選容器的狀態、退出原因與本次部署後的 log（已遮罩），再以上一個 <code>:live</code> 映像 <code>--no-build</code> 恢復並重跑 health；本次部署仍以非零結束。build 失敗則不動執行中版本。</td><td>DevOps 讀 <code>devflow-diagnostics-deploy-&lt;sha&gt;</code> 分類問題；程式問題由 developer 用 GitHub-hosted <code>repro.yml</code> 重現後修正並重新部署，不能以回滾健康代替 AC 驗收。</td></tr>
+          <tr><td>部署完成，但 AC 不完整</td><td>Orchestrator 用 <code>check acceptance</code> 下載 run artifacts、逐條判讀。缺實作或缺 journey 就補 DEV／OPS 卡，重新掛到 EPIC。</td><td>所有 AC 有 PASS 與可追溯證據。若自動判讀偏嚴，orchestrator 可附具體證據與理由判 PASS。</td></tr>
+          <tr><td>worker crash／卡片無法續跑</td><td>Hermes 轉 ADJ；orchestrator 修根因，以 <code>devflow-ops resume</code> 續跑；無法修改的卡片契約則建替代卡並移接依賴。</td><td>修復的設定或行為已實測。重複根因應落到 repo 的驗證／CI；kit 層問題列 followups，交使用者決定。</td></tr>
+          <tr><td>方向、成本或破壞性資料操作未決</td><td>標記 <code>needs_input</code>，由 Hermes 問使用者；不是由代理人自行猜測授權。</td><td>使用者決定後才續跑受影響路徑；既有未受阻工作可繼續。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <aside class="boundary">
+      <h3>目前閉環止於部署後驗收，不等於持續營運監控</h3>
+      <p>repo 範本沒有定義持續 metrics／traces／SLO 監控、自動從正式環境事件開卡，或 pager 輪值。日後發現問題可再由 Hermes 建新 EPIC，但不能把這條人工入口描述成已自動化的 production feedback。</p>
+    </aside>
+  </section>
+
+  <section id="boundaries" aria-labelledby="boundaries-heading">
+    <div class="section-head"><span class="section-no">05</span><h2 id="boundaries-heading">哪些是真的閘門，哪些仍是流程約定</h2></div>
+    <div class="table-wrap">
+      <table class="controls">
+        <thead><tr><th scope="col">控制面</th><th scope="col">目前機制</th><th scope="col">限制／例外</th></tr></thead>
+        <tbody>
+          <tr><td>合併／卡片完成</td><td><code>repo protect</code> 建立 <code>devflow</code> ruleset，以 <code>devflow-ci</code> 為 required check；PR completion contract 核對 exact head。</td><td>需要成功接入並設置 contract；admin 可 bypass。獨立 reviewer 是角色流程要求，不代表所有 repo 都有平台強制的 required approval。</td></tr>
+          <tr><td>計畫與 AC 判讀</td><td>規則加 Decisions API 檢查；變動才重新檢查，重複疑慮不重複建 ADV。逐條驗收由 orchestrator 對證據負責。</td><td>檢查工具出錯只記錄、不擋流程；模型判讀不是數學保證。程式碼中的失敗回傳與 GitHub required checks 才是相應的執行閘門。</td></tr>
+          <tr><td>驗收涵蓋範圍</td><td>repo 專屬 <code>verify.sh</code> 必須由 developer 補入每條 AC journey；PR 與部署後共用，UI 用 Playwright。</td><td>範本預設只有 health。沒有 Dockerfile 的 PR 會略過 up／verify；沒有 AC journeys 就沒有完整使用者行為證據，CI 綠也不能補足。</td></tr>
+          <tr><td>規則與教訓</td><td>CI <code>check</code> job（在 <code>devflow-ci</code> 的 needs）：每條規則先用自帶的錯誤範例自測，再掃描程式；豁免必須引用存在的教訓，教訓的 ref 必須指到真實的規則或檔案。</td><td>規則是行為模式比對，不是語意分析。檢查程式在 repo 內，PR 可修改；目前靠 reviewer 擋放寬規則，CODEOWNERS／從 default branch 取檢查程式待治理階段。修正 PR 是否帶教訓尚未自動檢查。</td></tr>
+          <tr><td>執行身分／網路</td><td>builder 與 reviewer 使用不同 GitHub 帳號；部署在主機 <code>devflow</code> 使用者的 rootless Docker，服務綁 <code>127.0.0.1</code>。</td><td>不是完整的權限隔離證明：兩帳號都有 push 權限，developer 的 git／gh 原生升權自動核准。任何有 push 權限的帳號都能在分支上寫 workflow 跑在 self-hosted runner，等同主機 <code>devflow</code> 使用者與共用 Docker 的權限；workflow 內的條件只防誤用。對外 proxy、TLS、DNS 不在範本契約內。</td></tr>
+          <tr><td>回滾與資料</td><td>成功部署標記 <code>:live</code>，up、health 或 verify 失敗時先採證，再用它恢復應用映像。</td><td>沒有上一版就無法回滾。回滾只重驗 health，不還原資料庫、volume、schema 或環境設定。診斷 log 的遮罩是盡力而為，artifact 保留 7 天。</td></tr>
+          <tr><td>供應鏈／發布</td><td>PR 與 VM 使用相同 compose 契約；CI quality 工具在 GitHub-hosted runner，以唯讀 token 與固定 commit 執行。</td><td>VM 會重新 build，尚非 build-once／promote-by-digest；也未定義映像簽章、來源證明、漸進發布或停機時間保證。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <details>
+      <summary>工程師接入一個 repo 時，要確認什麼？</summary>
+      <ul>
+        <li>建立 repo／board、接入契約與 runner；新專案先有可啟動骨架，既有 repo 先比對 <code>devflow contract</code> 列出的差異。</li>
+        <li>替換範本的 test、啟動與 health 設定；為每條 AC 編寫真實 journeys。不要只保留預設 health 就宣稱行為驗收完成。</li>
+        <li>確認 required checks、completion contract、兩個 GitHub 身分與部署環境設定；不需要部署的專案明確選擇不走服務部署路徑。</li>
+        <li>先走一個真實小變更，檢查 PR／部署兩份 artifact，再確認失敗時的回復與人工處理方式。這份 HTML 不會執行任何接入或部署命令。</li>
+      </ul>
+    </details>
+    <details>
+      <summary>模型與技能為什麼沒有放進主圖？</summary>
+      <p>角色責任與交付契約比模型名稱穩定。目前 <code>roles.json</code> 指定 developer 使用 Codex app-server 的 <code>gpt-6.1-sol</code>（推理強度 high）；reviewer／Advisor 使用 <code>claude-opus-5.5</code>，reviewer 有 Codex fallback。實際可用性取決於 provider、登入帳號與 Codex 版本。技能分配請以角色表為準，模型切換不改變 AC 與證據責任。</p>
+    </details>
+  </section>
+
+  <section aria-labelledby="sources-heading">
+    <div class="section-head"><span class="section-no">REF</span><h2 id="sources-heading">可追溯來源</h2></div>
+    <p class="note">本頁說明此 checkout 的流程與範本，不宣稱各 repo／VM 已套用。檔案連結在原 repo 位置可用；HTML 移出 repo 後，圖與正文仍可獨立閱讀。</p>
+    <div class="sources">
+      <a href="README.md">devflow README</a>
+      <a href="roles.json">roles.json</a>
+      <a href="skills/devflow-orchestrate/SKILL.md">Orchestrator 契約</a>
+      <a href="skills/devflow-review/SKILL.md">Reviewer 契約</a>
+      <a href="templates/repo/.github/workflows/ci.yml">PR CI 範本</a>
+      <a href="templates/repo/.github/workflows/quality.yml">Quality workflow（不擋）</a>
+      <a href="templates/repo/.github/workflows/deploy.yml">Deploy workflow</a>
+      <a href="templates/repo/.devflow/deploy.sh">deploy.sh</a>
+      <a href="templates/repo/.devflow/verify.sh">verify.sh</a>
+    </div>
+  </section>
+  <footer><span>HERMES DEVFLOW · ENGINEERING REFERENCE</span><span>靜態 HTML + inline SVG · 預設淺色 · 字型可連線時載入 Google Fonts，離線回退系統字型</span></footer>
+</main>
+</body>
+</html>

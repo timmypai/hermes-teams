@@ -2,6 +2,12 @@
 
 Native seven-role engineering-team integration for Hermes Agent. This repository's product is engineering configuration, workflows and operating procedures, not an unspecified business application.
 
+## Devflow kit
+
+完整的七 Bot 開發流程位於 [`devflow/`](devflow/README.md)，包含角色與技能設定、Kanban CLI、安裝器、repo CI/CD 範本、AC journeys、失敗採證與除錯流程。視覺說明見 [`devflow/system.html`](devflow/system.html)；主機 runner 安裝腳本位於 [`host/`](host/)，入口為 [`deploy-kit.sh`](deploy-kit.sh)。
+
+這些檔案是可安裝的流程原始碼，不代表已部署或已通過 GitHub-hosted 驗證。`devflow/templates/` 是供其他 repo 接入的範本，不取代本 repo 既有的 `.github/workflows/` 或交付政策；部署仍需明確授權。備份、憑證與執行中狀態不納入發布。
+
 ## Architecture
 
 Intake (`hermes`, existing default profile) → orchestrator explicit native planning → native Kanban → sole existing Dispatcher → researcher / architect / developer (`codex_app_server`) / independent reviewer+QA / devops.

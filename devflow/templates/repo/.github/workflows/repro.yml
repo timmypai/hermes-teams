@@ -1,0 +1,55 @@
+name: repro
+# Debug 迴圈：在 GitHub-hosted 暫時 VM 上起服務、只跑指定的 AC journey、保存 log / trace / 截圖。
+# 不碰正式主機，也沒有部署秘密；需要正式資料或主機條件才會出現的問題，這裡重現不了。
+#   gh workflow run repro.yml --ref <分支> -f only="AC-2" -f trace=true
+# 本檔要先在 default branch 上才能 dispatch；執行的是 --ref 分支上的程式與 .devflow 腳本。
+# 非秘密的除錯設定（如 LOG_LEVEL=debug）寫在該分支的 .devflow/repro.env，會併入 deploy/.env。
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "只跑這些 AC（空白分隔，如 AC-2 AC-5）；空 = 全部"
+        type: string
+        default: ""
+      trace:
+        description: "UI journeys 全程錄 Playwright trace"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEVFLOW_ONLY: ${{ inputs.only }}
+      DEVFLOW_TRACE: ${{ inputs.trace && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: debug env
+        if: hashFiles('.devflow/repro.env') != ''
+        run: cat .devflow/repro.env >> deploy/.env
+      - name: up
+        run: bash .devflow/up.sh
+      - name: verify
+        run: bash .devflow/verify.sh
+      - name: diagnostics
+        if: always()
+        run: |
+          . .devflow/config.env
+          bash .devflow/capture.sh "ci-${DEVFLOW_APP}" repro
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: devflow-repro-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .devflow/evidence
+            .devflow/diagnostics
+          retention-days: 7
+          if-no-files-found: ignore

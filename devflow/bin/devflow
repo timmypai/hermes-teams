@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""devflow: repo / board / runner helper for the Hermes 7-bot dev workflow.
+
+Runs inside the Hermes container as the hermes user. Stdlib only.
+State: /opt/data/devflow/state/repos.json (slug -> repo, path, port, default_branch).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+os.umask(0o022)
+
+ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
+DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
+STATE = ROOT / "state" / "repos.json"
+TEMPLATE = ROOT / "templates" / "repo"
+TEMPLATE_UI = ROOT / "templates" / "ui"
+RUNNER_REQ = ROOT / "runner" / "requests"
+RUNNER_STATUS = ROOT / "runner" / "status"
+BOARDS = DATA / "kanban" / "boards"
+ROLES = json.loads((ROOT / "roles.json").read_text())
+GH_DIRS = ROLES["gh"]
+PORT_BASE = 18100
+CODEX_CONFIG = DATA / "profiles" / "developer" / "codex" / "config.toml"
+HERMES = shutil.which("hermes") or "/opt/hermes/bin/hermes"
+
+
+def die(msg: str) -> None:
+    print(f"devflow: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd: list[str], *, gh: str | None = None, check: bool = True, cwd: str | Path | None = None,
+        input: str | None = None) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    if gh:
+        env["GH_CONFIG_DIR"] = GH_DIRS[gh]
+    if cmd[0] == HERMES:
+        # Board admin always targets the shared root kanban, never a worker's pinned board.
+        env = {k: v for k, v in env.items() if not k.startswith("HERMES_KANBAN")}
+        env["HERMES_HOME"] = str(DATA)
+    env.setdefault("GH_PROMPT_DISABLED", "1")
+    env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_CONFIG_GLOBAL", str(ROOT / "gitconfig"))
+    p = subprocess.run(cmd, env=env, cwd=cwd, input=input, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        die(f"{' '.join(cmd[:4])} … failed ({p.returncode}): {(p.stderr or p.stdout).strip()[-800:]}")
+    return p
+
+
+def gh_json(args: list[str], gh: str = "builder", check: bool = True):
+    p = run(["gh", *args], gh=gh, check=check)
+    if p.returncode != 0:
+        return None
+    out = p.stdout.strip()
+    return json.loads(out) if out else None
+
+
+@contextmanager
+def locked(name: str):
+    path = ROOT / "state" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def load_state() -> dict:
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(STATE)
+
+
+def slug_for(repo: str) -> str:
+    name = repo.split("/", 1)[1]
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def entry(slug_or_repo: str) -> dict:
+    state = load_state()
+    if slug_or_repo in state:
+        return state[slug_or_repo]
+    for e in state.values():
+        if e["repo"].lower() == slug_or_repo.lower():
+            return e
+    die(f"unknown repo/slug {slug_or_repo!r}; run `devflow repo list` or `devflow repo add OWNER/REPO`")
+    raise AssertionError
+
+
+def gh_login(role: str) -> str:
+    return run(["gh", "api", "user", "--jq", ".login"], gh=role).stdout.strip()
+
+
+def ensure_access(repo: str) -> list[str]:
+    """Builder and reviewer both need push access; invite + accept whichever lacks it."""
+    notes = []
+    perms = {r: gh_json(["api", f"repos/{repo}", "--jq", ".permissions"], gh=r, check=False) or {}
+             for r in ("builder", "reviewer")}
+    for role, other in (("builder", "reviewer"), ("reviewer", "builder")):
+        if perms[role].get("push"):
+            continue
+        if not perms[other].get("admin"):
+            notes.append(f"{role} has no push access and {other} is not admin: add {gh_login(role)} as collaborator manually")
+            continue
+        login = gh_login(role)
+        run(["gh", "api", "-X", "PUT", f"repos/{repo}/collaborators/{login}", "-f", "permission=push"], gh=other)
+        invites = gh_json(["api", "user/repository_invitations"], gh=role, check=False) or []
+        for inv in invites:
+            if inv.get("repository", {}).get("full_name", "").lower() == repo.lower():
+                run(["gh", "api", "-X", "PATCH", f"user/repository_invitations/{inv['id']}"], gh=role)
+        notes.append(f"{login} ({role}) added as collaborator")
+    admin = next((r for r in ("builder", "reviewer") if perms[r].get("admin")), None)
+    if admin:
+        run(["gh", "api", "-X", "PATCH", f"repos/{repo}", "-F", "delete_branch_on_merge=true",
+             "-F", "allow_squash_merge=true"], gh=admin, check=False)
+    return notes
+
+
+def trust_in_codex(path: Path) -> None:
+    if not CODEX_CONFIG.exists():
+        return
+    text = CODEX_CONFIG.read_text()
+    header = f'[projects."{path}"]'
+    if header not in text:
+        CODEX_CONFIG.write_text(text.rstrip("\n") + f"\n\n{header}\ntrust_level = \"trusted\"\n")
+
+
+def board_exists(slug: str) -> bool:
+    return (BOARDS / slug / "board.json").exists()
+
+
+def cmd_repo_add(a) -> None:
+    repo = a.repo.strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
+    if repo.count("/") != 1:
+        die("use OWNER/REPO")
+    if a.create and gh_json(["repo", "view", repo, "--json", "name"], check=False) is None:
+        run(["gh", "repo", "create", repo, "--public" if a.public else "--private", "--add-readme"], gh="builder")
+    info = gh_json(["repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef,isPrivate,url"], check=False)
+    if info is None:
+        info = gh_json(["repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef,isPrivate,url"], gh="reviewer")
+    repo = info["nameWithOwner"]
+    default_branch = (info.get("defaultBranchRef") or {}).get("name") or "main"
+    notes = ensure_access(repo)
+
+    with locked("repos"):
+        state = load_state()
+        existing = next((e for e in state.values() if e["repo"].lower() == repo.lower()), None)
+        slug = existing["slug"] if existing else (a.slug or slug_for(repo))
+        used = {e["port"] for e in state.values()}
+        port = existing["port"] if existing else next(p for p in range(PORT_BASE, PORT_BASE + 900) if p not in used)
+        path = BOARDS / slug / "repo"
+        if not board_exists(slug):
+            run([HERMES, "kanban", "boards", "create", slug, "--name", repo,
+                 "--description", f"devflow board for {repo}"])
+        if not (path / ".git").exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            run(["git", "clone", "-q", f"https://github.com/{repo}.git", str(path)], gh="builder")
+        exclude = path / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        if ".worktrees/" not in (exclude.read_text() if exclude.exists() else ""):
+            with exclude.open("a") as fh:
+                fh.write("\n.worktrees/\n")
+        run([HERMES, "kanban", "boards", "set-default-workdir", slug, str(path)])
+        trust_in_codex(path)
+        state[slug] = {"slug": slug, "repo": repo, "path": str(path), "port": port,
+                       "default_branch": default_branch, "private": info.get("isPrivate"),
+                       "added_at": existing.get("added_at") if existing else int(time.time())}
+        save_state(state)
+    contract = protect_repo(slug)
+    if a.no_runner:
+        runner = "skipped (--no-runner)"
+    elif has_devflow_runner(repo):
+        runner = "already registered"
+    else:
+        runner = request_runner(repo)
+    print(json.dumps({**entry(slug), **contract, "notes": notes, "runner": runner}, ensure_ascii=False, indent=2))
+
+
+CI_GATE = "devflow-ci"
+RULESET = "devflow"
+
+
+def _rules_error(p: subprocess.CompletedProcess) -> str:
+    err = (p.stderr or p.stdout).strip()
+    if "Upgrade to GitHub Pro" in err or "HTTP 403" in err:
+        return "此 repo 的 GitHub 方案不支援 ruleset（GitHub Free 的 private repo）；PR 卡改用 local-only"
+    return f"設定 ruleset 失敗：{err[-200:]}"
+
+
+def protect_repo(slug: str) -> dict:
+    """Require the devflow-ci check on the default branch through a repository ruleset, so PR
+    cards can use Hermes' completion_contract. A ruleset (not classic branch protection) because
+    the native gate runs as the card's assignee: `rules/branches/*` is readable by any collaborator
+    (reviewer included), classic protection only by admins. Stores and returns
+    {"contract": bool, "contract_note": str}."""
+    e = entry(slug)
+    repo, branch = e["repo"], e["default_branch"]
+    ci = run(["gh", "api", f"repos/{repo}/contents/.github/workflows/ci.yml?ref={branch}", "--jq", ".content"],
+             gh="builder", check=False)
+    text = base64.b64decode(ci.stdout).decode(errors="replace") if ci.returncode == 0 else ""
+    if not re.search(rf"^\s+{CI_GATE}:\s*$", text, re.M):
+        note = f"{branch} 的 ci.yml 還沒有 {CI_GATE} job；devflow 契約合併後執行 devflow repo protect {slug}"
+    else:
+        p = run(["gh", "api", f"repos/{repo}/rulesets"], gh="builder", check=False)
+        if p.returncode != 0:
+            note = _rules_error(p)
+        else:
+            existing = next((r for r in json.loads(p.stdout or "[]") if r.get("name") == RULESET), None)
+            body = {"name": RULESET, "target": "branch", "enforcement": "active",
+                    # Admins may bypass (devops merges after checking CI itself), like enforce_admins=false.
+                    "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}],
+                    "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+                    "rules": [{"type": "required_status_checks", "parameters": {
+                        "strict_required_status_checks_policy": False,
+                        "required_status_checks": [{"context": CI_GATE}]}}]}
+            method, url = (("PUT", f"repos/{repo}/rulesets/{existing['id']}") if existing
+                           else ("POST", f"repos/{repo}/rulesets"))
+            p = run(["gh", "api", "-X", method, url, "--input", "-"], gh="builder", check=False, input=json.dumps(body))
+            note = "" if p.returncode == 0 else _rules_error(p)
+    result = {"contract": not note, "contract_note": note}
+    with locked("repos"):
+        state = load_state()
+        state[slug].update(result)
+        save_state(state)
+    return result
+
+
+def cmd_repo_protect(a) -> None:
+    print(json.dumps({"slug": entry(a.slug)["slug"], **protect_repo(entry(a.slug)["slug"])}, ensure_ascii=False))
+
+
+def cmd_repo_list(a) -> None:
+    state = load_state()
+    if not state:
+        print("(no repos; `devflow repo add OWNER/REPO`)")
+    for e in state.values():
+        print(f"{e['slug']:<28} {e['repo']:<40} port={e['port']} branch={e['default_branch']} "
+              f"contract={'yes' if e.get('contract') else 'no'}")
+
+
+def cmd_repo_path(a) -> None:
+    print(entry(a.slug)["path"])
+
+
+def cmd_repo_sync(a) -> None:
+    e = entry(a.slug)
+    path, br = e["path"], e["default_branch"]
+    with locked(f"sync-{e['slug']}"):
+        run(["git", "-C", path, "fetch", "-q", "--prune", "origin"], gh="builder")
+        run(["git", "-C", path, "checkout", "-q", br])
+        p = run(["git", "-C", path, "merge", "-q", "--ff-only", f"origin/{br}"], check=False)
+        if p.returncode != 0:
+            die(f"main checkout {path} cannot fast-forward (local changes?): {p.stderr.strip()}")
+    head = run(["git", "-C", path, "log", "--oneline", "-1"]).stdout.strip()
+    print(f"{e['slug']}: {br} @ {head}")
+
+
+def cmd_contract(a) -> None:
+    e = entry(a.slug)
+    dest = Path(a.dir).resolve()
+    if not (dest / ".git").exists():
+        die(f"{dest} is not a git checkout/worktree root")
+    added, drift = [], []
+    sources = [(TEMPLATE, p) for p in sorted(TEMPLATE.rglob("*"))]
+    if a.ui:
+        sources += [(TEMPLATE_UI, p) for p in sorted(TEMPLATE_UI.rglob("*"))]
+    for base, src in sources:
+        if src.is_dir():
+            continue
+        rel = src.relative_to(base)
+        out = dest / rel
+        text = src.read_text().replace("__APP__", e["slug"]).replace("__PORT__", str(e["port"]))
+        if out.exists():
+            if out.read_text(errors="replace") != text:
+                drift.append(str(rel))
+            continue
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text)
+        if src.suffix == ".sh":
+            out.chmod(0o755)
+        added.append(str(rel))
+    gi = dest / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    missing = [x for x in ("deploy/.env", ".venv-test/", ".devflow/evidence/", ".devflow/diagnostics/", ".devflow/ui/node_modules/",
+                           ".metrics/", "target/coverage/", "target/mutation-workers/")
+               if x not in lines]
+    if missing:
+        with gi.open("a") as fh:
+            fh.write(("\n" if lines else "") + "\n".join(missing) + "\n")
+        added.append(".gitignore entries")
+    print("added: " + (", ".join(added) if added else "nothing (all present)"))
+    if drift:
+        print("differs from current template (merge by hand, keep project changes; template: "
+              f"{TEMPLATE}): " + ", ".join(drift))
+    if not (dest / "Dockerfile").exists() and "DEVFLOW_DEPLOY=false" not in (dest / ".devflow/config.env").read_text():
+        print("note: no Dockerfile yet — write one, or set DEVFLOW_DEPLOY=false")
+
+
+def runner_key(repo: str) -> str:
+    return repo.replace("/", "__")
+
+
+def has_devflow_runner(repo: str) -> bool:
+    runners = gh_json(["api", f"repos/{repo}/actions/runners"], check=False) or {}
+    return any("devflow" in {l["name"] for l in r.get("labels", [])} for r in runners.get("runners", []))
+
+
+def request_runner(repo: str) -> str:
+    """Drop a registration request for the host watcher; returns a status line."""
+    token = None
+    for role in ("builder", "reviewer"):
+        p = run(["gh", "api", "-X", "POST", f"repos/{repo}/actions/runners/registration-token", "--jq", ".token"],
+                gh=role, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            token = p.stdout.strip()
+            break
+    if not token:
+        return f"error: cannot get runner registration token for {repo} (needs repo admin)"
+    RUNNER_REQ.mkdir(parents=True, exist_ok=True)
+    req = RUNNER_REQ / f"{runner_key(repo)}.json"
+    # Write outside the watched directory, then rename in: the host path unit only sees complete files.
+    tmp = RUNNER_REQ.parent / f".{runner_key(repo)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"repo": repo, "token": token, "labels": "devflow,oracle", "requested_at": int(time.time())}, fh)
+    tmp.replace(req)
+    return f"requested; host registers it within ~1 min (devflow runner status {repo})"
+
+
+def cmd_runner_request(a) -> None:
+    repo = entry(a.repo)["repo"] if "/" not in a.repo else a.repo
+    msg = request_runner(repo)
+    if msg.startswith("error"):
+        die(msg)
+    print(f"runner for {repo}: {msg}")
+
+
+def cmd_runner_status(a) -> None:
+    repo = entry(a.repo)["repo"] if "/" not in a.repo else a.repo
+    st = RUNNER_STATUS / f"{runner_key(repo)}.json"
+    pending = (RUNNER_REQ / f"{runner_key(repo)}.json").exists()
+    print(f"host: {st.read_text().strip() if st.exists() else 'no status yet'}{' (request pending)' if pending else ''}")
+    runners = gh_json(["api", f"repos/{repo}/actions/runners"], check=False) or {}
+    for r in runners.get("runners", []):
+        labels = ",".join(l["name"] for l in r.get("labels", []))
+        print(f"github: {r['name']} {r['status']} busy={r['busy']} labels={labels}")
+    if not runners.get("runners"):
+        print("github: no runners registered")
+
+
+def cmd_resume(a) -> None:
+    """Re-run a blocked/held card from Hermes chat (workers: `board_ops` resume in the handoff)."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("resume runs from Hermes chat, not inside a kanban worker; put it in metadata.board_ops")
+    print(resume(a.slug, a.task, a.note))
+
+
+# --- checks: plan rules, Decisions API, acceptance evidence -------------------------------------
+
+CARDS = ROLES["cards"]          # type -> {assignee, workspace}
+ADVISOR = ROLES["advisor"]      # {"model", "provider"} pinned on [ADV] cards
+DECISIONS = ROLES["decisions"]  # {"url", "model", "flag", "pass"}
+AC_RE = re.compile(r"^\s*[-*]?\s*\**(AC-\d+)\**\s*[:：.、)]?\s*(.+)$", re.M)
+
+
+class DecisionsError(RuntimeError):
+    pass
+
+
+def openai_key() -> str:
+    for k in ("OPENAI_API_KEY", "VOICE_TOOLS_OPENAI_KEY"):
+        if os.environ.get(k):
+            return os.environ[k]
+    env = DATA / ".env"
+    if env.exists():
+        for line in env.read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() in ("OPENAI_API_KEY", "VOICE_TOOLS_OPENAI_KEY") and v.strip():
+                return v.strip().strip("'\"")
+    raise DecisionsError("no OPENAI_API_KEY / VOICE_TOOLS_OPENAI_KEY")
+
+
+def decide(content: list[dict], questions: list[dict]) -> dict[str, dict]:
+    """One POST /v1/decisions call; returns answers by question name."""
+    import urllib.error
+    import urllib.request
+    body = {"model": DECISIONS["model"], "input": [{"role": "user", "content": content}], "questions": questions}
+    req = urllib.request.Request(DECISIONS["url"], data=json.dumps(body).encode(), method="POST", headers={
+        "Authorization": f"Bearer {openai_key()}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise DecisionsError(f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}") from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise DecisionsError(str(e)) from None
+    return {a["name"]: a for a in data.get("answers", [])}
+
+
+def kanban(board: str, *args: str) -> str:
+    return run([HERMES, "kanban", "--board", board, *args]).stdout
+
+
+def card_type(title: str) -> str | None:
+    m = re.match(r"\s*\[([A-Z]+)\]", title or "")
+    return m.group(1) if m else None
+
+
+def criteria(body: str) -> list[tuple[str, str]]:
+    return [(m.group(1), m.group(2).strip()) for m in AC_RE.finditer(body or "")]
+
+
+def plan_cards(board: str, epic: str) -> dict[str, dict]:
+    """EPIC plus the cards of its plan: linked to it (parents/children, transitively) and either a
+    direct EPIC parent or naming it in the body (`EPIC: t_x`). Cards of other EPICs reached through
+    cross-EPIC dependencies are left out.
+
+    Read-only `show` calls only: `kanban list` recomputes readiness (a write), which Hermes
+    refuses inside dispatched workers, and the orchestrator runs these checks there."""
+    shown: dict[str, dict] = {}
+    seen: set[str] = set()
+    direct: set[str] = set()
+    todo = [epic]
+    while todo:
+        tid = todo.pop()
+        if tid in seen:
+            continue
+        seen.add(tid)
+        d = json.loads(kanban(board, "show", tid, "--json"))
+        t = d["task"]
+        if t["status"] == "archived":
+            continue
+        if tid == epic:
+            direct = set(d["parents"])
+        elif tid not in direct and f"EPIC: {epic}" not in (t["body"] or ""):
+            continue
+        shown[tid] = {**t, "parents": d["parents"], "children": d["children"], "runs": d.get("runs") or []}
+        todo.extend(d["parents"])
+        if tid != epic:
+            todo.extend(d["children"])
+    return shown
+
+
+def repo_deploys(board: str) -> bool:
+    cfg = Path(entry(board)["path"]) / ".devflow" / "config.env"
+    return not (cfg.exists() and re.search(r"^DEVFLOW_DEPLOY=false\s*$", cfg.read_text(), re.M))
+
+
+def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
+    e = entry(board)
+    found: list[str] = []
+    feeds = set()  # cards on a parent path into the EPIC
+    stack = list(cards[epic]["parents"])
+    while stack:
+        t = stack.pop()
+        if t not in feeds:
+            feeds.add(t)
+            stack.extend(cards.get(t, {}).get("parents", []))
+    acs = [ac for ac, _ in criteria(cards[epic]["body"])]
+    if not acs:
+        found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
+    for tid, c in cards.items():
+        kind = card_type(c["title"])
+        if kind not in CARDS:
+            found.append(f"{tid}: 標題沒有已知卡片類型 [{'/'.join(CARDS)}]")
+            continue
+        if c["status"] == "done":
+            continue  # history; only pending work can still go wrong
+        want = CARDS[kind]
+        # PR cards move to the reviewer while in the review column.
+        if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
+            found.append(f"{tid}: [{kind}] assignee 應為 {want['assignee']}，現在是 {c['assignee']}")
+        if (c["workspace_kind"] or "scratch") != want["workspace"]:
+            found.append(f"{tid}: [{kind}] workspace 應為 {want['workspace']}，現在是 {c['workspace_kind']}")
+        if kind in ("DEV", "OPS"):
+            contract = c.get("completion_contract") or "local-only"
+            # Hermes pins OWNER/REPO to the exact PR URL once the card publishes its PR.
+            ok_yes = contract == e["repo"] or contract.startswith(f"https://github.com/{e['repo']}/pull/")
+            if e.get("contract") and not ok_yes:
+                found.append(f"{tid}: repo contract=yes，completion_contract 應為 {e['repo']}，現在是 {contract}")
+            if not e.get("contract") and contract != "local-only":
+                found.append(f"{tid}: repo contract=no，不應設 completion_contract（{contract}），卡片會永遠無法完成")
+            ships = [x for x in c["children"] if card_type(cards.get(x, {}).get("title", "")) == "SHIP"]
+            if repo_deploys(board) and not ships:
+                found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
+        if kind not in ("EPIC", "ADV", "ADJ") and tid not in feeds:
+            found.append(f"{tid}: 沒有接到 EPIC 的 parent 鏈，EPIC 驗收不會等它")
+    work = "\n".join(f"{c['title']}\n{c['body'] or ''}" for t, c in cards.items() if t != epic)
+    for ac in acs:
+        if len(cards) > 1 and not re.search(rf"\b{ac}\b", work):
+            found.append(f"{epic}: {ac} 沒有任何卡片負責（卡片 body 要寫明覆蓋哪些 AC）")
+    return found
+
+
+PLAN_QUESTIONS = [
+    ("modifies_hermes", "Does any card ask to change Hermes itself: files under /opt/hermes, the Hermes container "
+     "image, Hermes source code, or Hermes runtime/profile configuration? Cards that only say not to modify Hermes, "
+     "or that use Hermes features as they are, do not count."),
+    ("misses_goal", "Does the plan leave out or contradict any acceptance criterion of the EPIC, so that finishing "
+     "every card would still not meet the user's goal?"),
+    ("scope_creep", "Does the plan include substantial work that the EPIC does not ask for?"),
+    ("irreversible", "Does the plan include an irreversible or high-impact operation: deleting or migrating "
+     "production data, exposing a service to the public internet, spending money, or changing credentials "
+     "or permissions?"),
+]
+
+
+def plan_risks(epic: str, cards: dict[str, dict]) -> tuple[dict[str, float], str]:
+    plan = [{"id": t, "title": c["title"], "assignee": c["assignee"], "status": c["status"],
+             "parents": c["parents"], "body": (c["body"] or "")[:2500]} for t, c in cards.items() if t != epic]
+    content = [{"type": "input_text", "text": "Judge this development plan against the EPIC (the user's goal)."},
+               {"type": "input_json", "data": {"epic": {"title": cards[epic]["title"], "body": cards[epic]["body"]},
+                                               "cards": plan}}]
+    try:
+        answers = decide(content, [{"type": "predicate", "name": n, "instructions": q} for n, q in PLAN_QUESTIONS])
+    except DecisionsError as err:
+        return {}, f"Decisions API 無法使用：{err}"
+    return {n: float(answers.get(n, {}).get("probability", 0.0)) for n, _ in PLAN_QUESTIONS}, ""
+
+
+def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: list[str], risky: bool) -> str:
+    import hashlib
+    key = f"adv-{epic}-" + hashlib.sha1("\n".join(sorted(findings)).encode()).hexdigest()[:8]
+    body = (f"EPIC: {epic}\n\n## 目標\n檢查 orchestrator 的計畫是否對準 EPIC 的驗收條件，對每一項疑慮給結論與具體建議。\n\n"
+            "## 自動檢查發現\n" + "\n".join(f"- {f}" for f in findings) +
+            f"\n\n## 使用者目標（EPIC 原文）\n{cards[epic]['body']}\n\n## 計畫\n" +
+            "\n".join(f"- {t} {c['status']} {c['assignee']} {c['title']}" for t, c in cards.items() if t != epic) +
+            ("\n\n## 注意\n含不可回復操作：本卡已設為各 [SHIP] 的 parent，你完成後才會出貨。" if risky else ""))
+    out = run([HERMES, "kanban", "--board", board, "create", f"[ADV] 計畫檢查 {epic}", "--assignee", CARDS["ADV"]["assignee"],
+               "--workspace", "scratch", "--body", body, "--idempotency-key", key, "--created-by", "devflow-check",
+               "--model", ADVISOR["model"], "--provider", ADVISOR["provider"]]).stdout
+    adv = re.search(r"t_[0-9a-f]{8}", out).group(0)
+    if risky:
+        for t, c in cards.items():
+            if card_type(c["title"]) == "SHIP" and c["status"] in ("todo", "ready", "triage", "scheduled"):
+                run([HERMES, "kanban", "--board", board, "link", adv, t], check=False)
+    return adv
+
+
+def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | None = None,
+               advised: frozenset[str] = frozenset()) -> dict:
+    """Rules + Decisions risks. With `advise`, findings not in `advised` open an [ADV] card."""
+    cards = cards or plan_cards(board, epic)
+    if card_type(cards[epic]["title"]) != "EPIC":
+        die(f"{epic} is not an [EPIC] card")
+    findings = plan_rules(board, epic, cards)
+    risks, note = plan_risks(epic, cards)
+    flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
+    findings += [f"Decisions {n}：{q}" for n, q in PLAN_QUESTIONS if n in flagged]
+    report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note}
+    new = [f for f in findings if f not in advised]
+    if new and advise:
+        report["advisor_card"] = open_advisor_card(board, epic, cards, new, "irreversible" in flagged)
+    return report
+
+
+def cmd_check_plan(a) -> None:
+    print(json.dumps(check_plan(a.board, a.epic, advise=a.advise), ensure_ascii=False, indent=2))
+
+
+# --- tick: board automation from the dispatcher's own tick hook ---------------------------------
+# Dispatched workers cannot mutate the board through the CLI (Hermes write fence), so plan checks,
+# [ADV] cards and the orchestrator's board_ops run here: `on_kanban_dispatch_tick` fires in the
+# gateway's dispatcher once per board per tick, outside any worker.
+
+TICK = ROOT / "state" / "tick.json"
+BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
+
+
+def board_mtime(board: str) -> float:
+    return max((p.stat().st_mtime for p in (BOARDS / board).glob("kanban.db*")), default=0.0)
+
+
+def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
+    import hashlib
+    rows = []
+    for t, c in sorted(cards.items()):
+        contract = c.get("completion_contract") or ""
+        if contract.startswith(f"https://github.com/{repo}/pull/"):
+            contract = repo  # Hermes pins the PR URL on publish; same plan
+        rows.append([t, c["title"], c["assignee"], c["workspace_kind"], contract, sorted(c["parents"]),
+                     c["body"] if t == epic or card_type(c["title"]) != "ADV" else ""])
+    return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+def resume(board: str, task_id: str, note: str | None = None) -> str:
+    """Re-run a blocked/held card. Hermes holds back a card for 24h once a comment carries a PR URL
+    unless an assignee handoff follows, and unblock keeps the crash streak; an unassign/reassign is
+    that handoff and resets the streak, done while blocked so the dispatcher stays off the card."""
+    task = json.loads(kanban(board, "show", task_id, "--json"))["task"]
+    status, assignee = task["status"], task["assignee"]
+    if status not in ("blocked", "scheduled", "ready"):
+        die(f"{task_id} is {status}; only blocked/scheduled/ready cards can be resumed")
+    if not assignee:
+        die(f"{task_id} has no assignee")
+    if note:
+        kanban(board, "comment", task_id, note)
+        time.sleep(1.1)  # the guard needs the handoff strictly after the newest comment
+    if status == "ready":
+        kanban(board, "block", task_id, "devflow resume")
+    kanban(board, "assign", task_id, "none")
+    kanban(board, "assign", task_id, assignee)
+    kanban(board, "unblock", task_id)
+    return f"resumed {task_id} ({assignee})"
+
+
+def apply_op(board: str, op: dict) -> str:
+    kind = op.get("op")
+    if kind not in BOARD_OPS:
+        raise ValueError(f"unknown op {kind!r}")
+    if kind == "archive":
+        kanban(board, "archive", op["task"])
+    elif kind in ("link", "unlink"):
+        kanban(board, kind, op["parent"], op["child"])
+    elif kind == "assign":
+        kanban(board, "assign", op["task"], op["to"])
+    elif kind == "edit":
+        args = [x for k in ("title", "body") if op.get(k) for x in (f"--{k}", op[k])]
+        kanban(board, "edit", op["task"], *args)
+    elif kind == "resume":
+        return resume(board, op["task"], op.get("note"))
+    return f"{kind} " + " ".join(str(op[k]) for k in ("task", "parent", "child", "to") if op.get(k))
+
+
+OPS_RE = re.compile(r"```devflow-ops\s*\n(.*?)```", re.S)
+
+
+def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[str]) -> None:
+    """Run ```devflow-ops``` JSON blocks the orchestrator posted on its own card, once each."""
+    import hashlib
+    for c in comments:
+        if c.get("author") != "orchestrator":
+            continue
+        for block in OPS_RE.findall(c.get("body") or ""):
+            key = f"{board}/{tid}/{c.get('created_at')}/" + hashlib.sha1(block.encode()).hexdigest()[:8]
+            if key in applied:
+                continue
+            applied.append(key)
+            try:
+                ops = json.loads(block)
+                ops = ops if isinstance(ops, list) else [ops]
+            except ValueError as err:
+                kanban(board, "comment", tid, f"devflow-ops：JSON 無法解析（{err}），沒有執行")
+                continue
+            done = []
+            for op in ops:
+                try:
+                    done.append("✓ " + apply_op(board, op))
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - report, keep going
+                    done.append(f"✗ {json.dumps(op, ensure_ascii=False)}：{err}")
+            kanban(board, "comment", tid, "devflow-ops 結果：\n" + "\n".join(done))
+
+
+def tick_board(board: str, st: dict) -> None:
+    repo = entry(board)["repo"]
+    plans, advised = st.setdefault("plans", {}), st.setdefault("advised", {})
+    applied, settled = st.setdefault("applied", []), st.setdefault("settled", [])
+    for t in json.loads(kanban(board, "list", "--json")):
+        kind, tid = card_type(t["title"]), t["id"]
+        if t["assignee"] != "orchestrator" or kind not in ("EPIC", "ADJ"):
+            continue
+        final = f"{board}/{tid}@{t.get('completed_at')}"
+        if t["status"] == "done" and final in settled:
+            continue
+        d = json.loads(kanban(board, "show", tid, "--json"))
+        # 1. board edits the orchestrator asked for (workers cannot mutate other cards).
+        apply_comment_ops(board, tid, d.get("comments") or [], applied)
+        if t["status"] == "done":
+            settled.append(final)
+        # 2. plan check when an EPIC waits on a plan that changed since the last check
+        #    (dependency block parks the EPIC in todo until its parents finish).
+        if kind == "EPIC" and t["status"] in ("todo", "blocked", "scheduled") and d["parents"]:
+            cards = plan_cards(board, tid)
+            fp = plan_fingerprint(tid, cards, repo)
+            if plans.get(tid) != fp:
+                rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
+                advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["findings"]))
+                kanban(board, "comment", tid, "devflow check plan：" + (
+                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（皆已交 advisor 判斷過）")
+                    if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
+                plans[tid] = fp
+    del applied[:-1000]
+    del settled[:-1000]
+
+
+def cmd_tick(a) -> None:
+    if a.hook:
+        # Shell hook `on_kanban_dispatch_tick` (default profile, gateway dispatcher). Return at once;
+        # the work runs detached so the dispatcher never waits on it.
+        try:
+            board = (json.loads(sys.stdin.read() or "{}").get("extra") or {}).get("board")
+            st = json.loads(TICK.read_text()) if TICK.exists() else {}
+            if board in load_state() and st.get("mtime", {}).get(board) != board_mtime(board):
+                log = open(ROOT / "state" / "tick.log", "a")
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "tick", board], stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        except Exception as err:  # noqa: BLE001 - a hook must never break dispatch
+            print(f"devflow tick hook: {err}", file=sys.stderr)
+        return
+    if not a.board:
+        die("usage: devflow tick BOARD  (or --hook)")
+    lock = open(ROOT / "state" / "tick.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # a tick is already running; the next dispatcher tick retries
+    st = json.loads(TICK.read_text()) if TICK.exists() else {}
+    mtime = board_mtime(a.board)
+    try:
+        tick_board(a.board, st)
+    except SystemExit:
+        pass
+    except Exception as err:  # noqa: BLE001 - logged; the next tick retries
+        print(f"{time.strftime('%FT%T')} {a.board}: {err!r}", flush=True)
+    else:
+        st.setdefault("mtime", {})[a.board] = mtime
+    TICK.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+
+
+def evidence_parts(paths: list[Path]) -> tuple[list[dict], list[str]]:
+    parts, used, budget = [], [], 60_000
+    images = [p for p in paths if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")][:12]
+    for p in sorted(x for x in paths if x.suffix.lower() in (".txt", ".log", ".json", ".md", ".html")):
+        text = p.read_text(errors="replace")[:6000]
+        if budget - len(text) < 0:
+            break
+        budget -= len(text)
+        parts.append({"type": "input_text", "text": f"--- evidence file {p.name} ---\n{text}"})
+        used.append(p.name)
+    for p in images:
+        if p.stat().st_size > 4_000_000:
+            continue
+        mime = "image/png" if p.suffix.lower() == ".png" else ("image/webp" if p.suffix.lower() == ".webp" else "image/jpeg")
+        parts.append({"type": "input_text", "text": f"--- screenshot {p.name} ---"})
+        parts.append({"type": "input_image", "image_url": f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()})
+        used.append(p.name)
+    return parts, used
+
+
+def cmd_check_acceptance(a) -> None:
+    import tempfile
+    e = entry(a.board)
+    cards = plan_cards(a.board, a.epic)
+    acs = criteria(cards[a.epic]["body"])
+    if not acs:
+        die(f"{a.epic} has no AC-n acceptance criteria")
+    handoffs = [{"id": t, "title": c["title"], "status": c["status"], "result": (c.get("result") or "")[:3000]}
+                for t, c in cards.items() if t != a.epic]
+    with tempfile.TemporaryDirectory() as tmp:
+        files = [Path(p) for p in a.evidence]
+        for i, rid in enumerate(a.run):
+            rid = rid.rstrip("/").split("/")[-1]
+            d = Path(tmp) / f"run{i}"
+            p = run(["gh", "run", "download", rid, "-R", e["repo"], "-D", str(d)], gh="builder", check=False)
+            if p.returncode != 0:
+                print(f"warning: run {rid}: {(p.stderr or p.stdout).strip()[-200:]}", file=sys.stderr)
+            files += [f for f in d.rglob("*") if f.is_file()]
+        parts, used = evidence_parts([f for f in files if f.exists()])
+        content = [{"type": "input_text", "text": "Card handoffs (claims; trust only what concrete evidence shows):"},
+                   {"type": "input_json", "data": {"handoffs": handoffs}}, *parts]
+        questions = [{"type": "predicate", "name": ac, "instructions":
+                      f"Does concrete evidence here (test output, HTTP responses, screenshots, logs from the delivered "
+                      f"or deployed system) show this acceptance criterion is met? A claim without supporting evidence "
+                      f"counts as not met. Criterion {ac}: {text}"} for ac, text in acs]
+        try:
+            answers = decide(content, questions)
+        except DecisionsError as err:
+            die(f"Decisions API 無法使用：{err}")
+    rows = [{"ac": ac, "criterion": text, "probability": round(float(answers.get(ac, {}).get("probability", 0.0)), 2)}
+            for ac, text in acs]
+    for r in rows:
+        r["verdict"] = "PASS" if r["probability"] >= DECISIONS["pass"] else "FAIL"
+    if a.json:
+        print(json.dumps({"epic": a.epic, "evidence": used, "criteria": rows}, ensure_ascii=False, indent=2))
+        return
+    print(f"evidence: {', '.join(used) or '(handoffs only)'}")
+    for r in rows:
+        print(f"{r['verdict']:<5} {r['probability']:.2f} {r['ac']} {r['criterion']}")
+
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="devflow", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    repo = sub.add_parser("repo").add_subparsers(dest="sub", required=True)
+    p = repo.add_parser("add", help="board + clone + access for OWNER/REPO")
+    p.add_argument("repo"); p.add_argument("--create", action="store_true"); p.add_argument("--public", action="store_true")
+    p.add_argument("--slug"); p.add_argument("--no-runner", action="store_true", help="skip self-hosted runner request")
+    p.set_defaults(fn=cmd_repo_add)
+    repo.add_parser("list", aliases=["ls"]).set_defaults(fn=cmd_repo_list)
+    p = repo.add_parser("path"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_path)
+    p = repo.add_parser("sync"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_sync)
+    p = repo.add_parser("protect", help="require devflow-ci on the default branch (enables PR completion_contract)")
+    p.add_argument("slug"); p.set_defaults(fn=cmd_repo_protect)
+    p = sub.add_parser("contract", help="copy missing devflow contract files into DIR")
+    p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")
+    p.add_argument("--ui", action="store_true", help="also add the Playwright UI journey scaffold (.devflow/ui)")
+    p.set_defaults(fn=cmd_contract)
+    check = sub.add_parser("check").add_subparsers(dest="sub", required=True)
+    p = check.add_parser("plan", help="rules + Decisions risk check of an EPIC plan (read-only unless --advise)")
+    p.add_argument("board"); p.add_argument("epic")
+    p.add_argument("--advise", action="store_true", help="open an [ADV] card (Opus) when there are findings")
+    p.set_defaults(fn=cmd_check_plan)
+    p = check.add_parser("acceptance", help="judge each EPIC AC-n against evidence (Decisions API)")
+    p.add_argument("board"); p.add_argument("epic")
+    p.add_argument("--run", action="append", default=[], help="GitHub Actions run id/URL whose artifacts are evidence")
+    p.add_argument("--evidence", action="append", default=[], help="evidence file (screenshot, log, response)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_check_acceptance)
+    runner = sub.add_parser("runner").add_subparsers(dest="sub", required=True)
+    p = runner.add_parser("request"); p.add_argument("repo"); p.set_defaults(fn=cmd_runner_request)
+    p = runner.add_parser("status"); p.add_argument("repo"); p.set_defaults(fn=cmd_runner_status)
+    p = sub.add_parser("resume", help="re-run a blocked/held card (Hermes chat only)")
+    p.add_argument("slug"); p.add_argument("task"); p.add_argument("--note", help="comment added before resuming")
+    p.set_defaults(fn=cmd_resume)
+    p = sub.add_parser("tick", help="board automation: plan checks, [ADV], orchestrator board_ops")
+    p.add_argument("board", nargs="?"); p.add_argument("--hook", action="store_true",
+                                                       help="Hermes on_kanban_dispatch_tick payload on stdin")
+    p.set_defaults(fn=cmd_tick)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
