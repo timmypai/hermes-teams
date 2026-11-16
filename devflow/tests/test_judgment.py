@@ -74,7 +74,8 @@ class Fake:
                 self.pr.update(state="MERGED", mergeCommit={"oid": "m" * 40})
         elif cmd[0] == self.df.HERMES and "create" in cmd:
             tid = f"t_{len(self.cards):08x}"
-            self.cards[tid] = {"status": "todo", "title": cmd[cmd.index("create") + 1], "verdict": None}
+            self.cards[tid] = {"status": "todo", "title": cmd[cmd.index("create") + 1], "verdict": None,
+                               "body": cmd[cmd.index("--body") + 1]}
             out = f"Created {tid}\n"
         elif cmd[0] == self.df.HERMES and "link" in cmd:
             self.links.append((cmd[-2], cmd[-1]))
@@ -83,7 +84,8 @@ class Fake:
     def kanban(self, board, *args):
         if args[0] == "show":
             c = self.cards[args[1]]
-            runs = [{"status": "done", "metadata": {"verdict": c["verdict"]} if c["verdict"] else {}}] if c["status"] == "done" else []
+            runs = c.get("runs") or ([{"status": "done", "metadata": {"verdict": c["verdict"]} if c["verdict"] else {}}]
+                                     if c["status"] == "done" else [])
             return json.dumps({"task": {"status": c["status"], "body": c.get("body", "")}, "runs": runs,
                                "children": c.get("children", [])})
         raise AssertionError(args)
@@ -106,7 +108,7 @@ class JudgmentCase(unittest.TestCase):
             setattr(self.df, name, getattr(self.f, name))
         self.df.pr_files = lambda repo, n: self.f.files
 
-    def ship(self, env_task: str | None = "t_ship") -> tuple[int, str]:
+    def call(self, fn, env_task: str | None = "t_ship") -> tuple[int, str]:
         if env_task:
             os.environ["HERMES_KANBAN_TASK"] = env_task
         else:
@@ -115,10 +117,17 @@ class JudgmentCase(unittest.TestCase):
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
-                self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+                fn(SimpleNamespace(board="b", pr=7))
             return 0, buf.getvalue()
         except SystemExit as e:
             return int(e.code), buf.getvalue()
+
+    def ship(self, env_task: str | None = "t_ship") -> tuple[int, str]:
+        return self.call(self.df.cmd_ship_merge, env_task)
+
+    def adv(self, status: str, verdict: str | None, fingerprint: str | None = None) -> None:
+        self.f.cards["t_adv"] = {"status": status, "verdict": verdict,
+                                 "body": f"fingerprint: {fingerprint or self.record()['fingerprint']}"}
 
     def record(self) -> dict:
         return json.loads((self.root / "state" / "pr-judgments.json").read_text())[f"{REPO}#7"]
@@ -140,7 +149,7 @@ class Judge(JudgmentCase):
 
     def test_questions_are_asked_only_when_they_apply(self) -> None:
         asked = []
-        self.df.decide = lambda content, qs: asked.extend(q["name"] for q in qs) or {}
+        self.df.decide = lambda content, qs: asked.extend(q["name"] for q in qs) or {q["name"]: {"probability": 0} for q in qs}
         self.f.pr.update(title="fix: x", body="Lesson: L-0001")
         self.df.judge(self.f.pr, self.f.files)
         self.assertEqual(asked, [])
@@ -162,6 +171,18 @@ class Judge(JudgmentCase):
         self.assertEqual(self.f.decide_calls, 2)
         self.assertIsNone(rec["advisor"])
 
+    def test_unanswered_question_fails_closed(self) -> None:
+        self.df.decide = lambda content, qs: {}
+        with self.assertRaises(self.df.DecisionsError):
+            self.df.judgment("b", REPO, 7)
+
+    def test_write_for_a_replaced_fingerprint_is_dropped(self) -> None:
+        old = self.df.judgment("b", REPO, 7)["fingerprint"]
+        self.f.pr["body"] = "edited"
+        self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", fp=old, advisor="t_for_old")
+        self.assertIsNone(self.record()["advisor"])
+
 
 class ShipMerge(JudgmentCase):
     def test_api_failure_refuses_without_status_or_merge(self) -> None:
@@ -176,37 +197,52 @@ class ShipMerge(JudgmentCase):
         self.assertEqual(self.f.statuses, ["success"])
         self.assertIn("a" * 40, self.f.merges[0][self.f.merges[0].index("--match-head-commit") + 1])
 
-    def test_finding_without_advisor_waits_and_records_the_ship_card(self) -> None:
+    def test_finding_without_advisor_posts_pending_and_parks_the_card(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
         code, _ = self.ship()
         self.assertEqual(code, 3)
-        self.assertEqual((self.f.statuses, self.f.merges), ([], []))
-        self.assertEqual(self.record()["ship_card"], "t_ship")
+        self.assertEqual((self.f.statuses, self.f.merges), (["pending"], []))
+        self.assertEqual(self.record()["parked"], "t_ship")
 
     def test_advisor_verdict_decides(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
         self.df.judgment("b", REPO, 7)
         self.df.update_judgment(f"{REPO}#7", advisor="t_adv")
         for status, verdict, want in (("running", None, 3), ("done", "revise", 4), ("done", None, 4)):
-            self.f.cards["t_adv"] = {"status": status, "verdict": verdict}
+            self.adv(status, verdict)
             self.assertEqual(self.ship()[0], want, (status, verdict))
             self.assertEqual(self.f.merges, [])
-        self.f.cards["t_adv"] = {"status": "done", "verdict": "ok"}
+        self.adv("done", "ok")
         self.assertEqual(self.ship()[0], 0)
         self.assertEqual(len(self.f.merges), 1)
+        self.assertEqual(self.f.statuses, ["pending", "failure", "success"])
 
-    def test_body_edited_after_judgment_withdraws_status_and_refuses(self) -> None:
+    def test_advisor_of_another_fingerprint_does_not_count(self) -> None:
+        self.f.answers = {"unlabeled_fix": 0.8}
+        self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", advisor="t_adv")
+        self.adv("done", "ok", fingerprint="0" * 12)
+        self.assertEqual(self.ship()[0], 3)
+        self.assertIsNone(self.record()["advisor"])
+
+    def test_archived_advisor_is_dropped(self) -> None:
+        self.f.answers = {"unlabeled_fix": 0.8}
+        self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", advisor="t_adv")
+        self.adv("archived", None)
+        self.assertEqual(self.ship()[0], 3)
+        self.assertIsNone(self.record()["advisor"])
+
+    def test_body_edited_after_judgment_refuses_and_judges_the_new_body(self) -> None:
         self.f.edits_after_meta = [{"body": "Lesson: L-0001\nNo-proof: edited after judging"}]
         code, _ = self.ship()
         self.assertEqual(code, 1)
-        self.assertEqual(self.f.statuses, ["success", "failure"])
         self.assertEqual(self.f.merges, [])
+        self.assertEqual(self.f.decide_calls, 2)
 
-    def test_refused_merge_withdraws_status(self) -> None:
+    def test_refused_merge_exits_1(self) -> None:
         self.f.merge_rc = 1
-        code, _ = self.ship()
-        self.assertEqual(code, 1)
-        self.assertEqual(self.f.statuses, ["success", "failure"])
+        self.assertEqual(self.ship()[0], 1)
 
     def test_already_merged_is_reported_without_judging(self) -> None:
         self.f.pr.update(state="MERGED", mergeCommit={"oid": "m" * 40})
@@ -216,34 +252,54 @@ class ShipMerge(JudgmentCase):
 
 
 class Tick(JudgmentCase):
-    def tasks(self, review_status: str, ship_status: str) -> list[dict]:
-        return [{"id": "t_dev", "title": "[DEV] x", "assignee": "reviewer", "status": review_status,
-                 "completion_contract": f"https://github.com/{REPO}/pull/7"},
-                {"id": "t_ship", "title": "[SHIP] x", "assignee": "devops", "status": ship_status,
-                 "completion_contract": None}]
+    """A card in review still has the OWNER/REPO contract; the PR comes from the handoff metadata."""
 
-    def test_review_finding_opens_advisor_before_ship_can_run(self) -> None:
+    def tasks(self, review_status: str) -> list[dict]:
+        self.f.cards.setdefault("t_dev", {"verdict": None, "body": "EPIC: t_00000abc",
+                                          "runs": [{"status": "review", "metadata": {"published_pr": self.f.pr["url"]}}]})
+        self.f.cards["t_dev"]["status"] = review_status
+        return [{"id": "t_dev", "title": "[DEV] x", "assignee": "reviewer", "status": review_status,
+                 "completion_contract": REPO}]
+
+    def test_clean_review_card_gets_success_once(self) -> None:
+        self.df.tick_prs("b", REPO, self.tasks("review"))
+        self.df.tick_prs("b", REPO, self.tasks("review"))
+        self.assertEqual(self.f.statuses, ["success"])
+
+    def test_review_finding_posts_pending_and_opens_one_advisor(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.9}
-        self.f.cards["t_dev"] = {"status": "running", "verdict": None, "children": ["t_ship"], "body": "EPIC: t_00000abc"}
-        self.df.tick_prs("b", REPO, self.tasks("running", "todo"))
+        self.df.tick_prs("b", REPO, self.tasks("review"))
+        self.df.tick_prs("b", REPO, self.tasks("review"))
         adv = self.record()["advisor"]
-        self.assertTrue(self.f.cards[adv]["title"].startswith("[ADV] PR 判斷"))
-        self.assertEqual(self.f.links, [(adv, "t_ship")])
-        self.df.tick_prs("b", REPO, self.tasks("running", "todo"))
-        self.assertEqual(len(self.f.links), 1)
+        self.assertEqual([c.get("title") for c in self.f.cards.values() if "title" in c], [f"[ADV] PR 判斷 {REPO}#7"])
+        self.assertIn("EPIC: t_00000abc", self.f.cards[adv]["body"])
+        self.assertEqual(self.f.statuses, ["pending"])
+
+    def test_parked_reviewer_resumes_after_advisor_ok_and_status_passes(self) -> None:
+        self.f.answers = {"unlabeled_fix": 0.9}
+        self.assertEqual(self.call(self.df.cmd_check_pr, "t_dev")[0], 3)
+        self.df.tick_prs("b", REPO, self.tasks("blocked"))
+        adv = self.record()["advisor"]
+        self.assertEqual(self.f.resumed, [])
+        self.f.cards[adv].update(status="done", verdict="ok")
+        self.df.tick_prs("b", REPO, self.tasks("blocked"))
+        self.assertEqual(self.f.resumed, ["t_dev"])
+        self.assertEqual(self.f.statuses, ["pending", "success"])
+        self.assertEqual(self.call(self.df.cmd_check_pr, "t_dev")[0], 0)
 
     def test_parked_ship_gets_an_advisor_and_resumes_after_its_verdict(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
-        self.assertEqual(self.ship()[0], 3)  # review raced past the tick
+        self.assertEqual(self.ship()[0], 3)  # body changed after review: findings reach the merge entry
         self.f.cards["t_ship"] = {"status": "blocked", "verdict": None, "body": "EPIC: t_00000abc"}
         tasks = [{"id": "t_ship", "title": "[SHIP] x", "assignee": "devops", "status": "blocked", "completion_contract": None}]
         self.df.tick_prs("b", REPO, tasks)
         adv = self.record()["advisor"]
-        self.assertEqual((self.f.links, self.f.resumed), ([(adv, "t_ship")], []))
+        self.assertEqual(self.f.resumed, [])
         self.f.cards[adv].update(status="done", verdict="ok")
         self.df.tick_prs("b", REPO, tasks)
         self.assertEqual(self.f.resumed, ["t_ship"])
         self.assertEqual(self.ship()[0], 0)
+
 
 
 if __name__ == "__main__":
