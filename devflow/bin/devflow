@@ -438,6 +438,7 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
     shown: dict[str, dict] = {}
     seen: set[str] = set()
     direct: set[str] = set()
+    pr_adv: set[str] = set()
     todo = [epic]
     while todo:
         tid = todo.pop()
@@ -446,6 +447,9 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
         seen.add(tid)
         d = json.loads(kanban(board, "show", tid, "--json"))
         t = d["task"]
+        if t["title"].startswith(PR_ADVISOR_TITLE):
+            pr_adv.add(tid)  # a PR judgment is not part of the plan; workers link it as a parent
+            continue
         if t["status"] == "archived":
             continue
         if tid == epic:
@@ -456,6 +460,9 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
         todo.extend(d["parents"])
         if tid != epic:
             todo.extend(d["children"])
+    for c in shown.values():
+        c["parents"] = [p for p in c["parents"] if p not in pr_adv]
+        c["children"] = [p for p in c["children"] if p not in pr_adv]
     return shown
 
 
@@ -808,6 +815,7 @@ def cmd_check_acceptance(a) -> None:
 
 JUDGMENTS = ROOT / "state" / "pr-judgments.json"
 JUDGMENT_CHECK = "devflow-judgment"
+PR_ADVISOR_TITLE = "[ADV] PR 判斷 "
 GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)")
 FIX_TITLE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)   # same as the template check.py
 EXEMPTION = re.compile(r"^\s*No-(lesson|proof):\s*\S", re.M)
@@ -943,7 +951,7 @@ def ensure_pr_advisor(board: str, rec: dict, epic: str | None) -> dict:
             "## 自動檢查發現\n" + "\n".join(f"- {f}" for f in rec["findings"]) +
             "\n\n## 結論\n`devflow-judgment` 檢查（PR 卡完成與合併都要求它）只在本卡 metadata `verdict` 為 `ok` 時通過。"
             "疑慮成立 → `verdict: revise`，並照 [ADV] 的做法建 [ADJ]（附具體修正）。")
-    out = run([HERMES, "kanban", "--board", board, "create", f"[ADV] PR 判斷 {key}",
+    out = run([HERMES, "kanban", "--board", board, "create", f"{PR_ADVISOR_TITLE}{key}",
                "--assignee", CARDS["ADV"]["assignee"], "--workspace", "scratch", "--body", body,
                "--idempotency-key", f"adv-pr-{key}-{rec['fingerprint']}", "--created-by", "devflow-judgment",
                "--model", ADVISOR["model"], "--provider", ADVISOR["provider"]]).stdout
@@ -964,7 +972,13 @@ def publish(rec: dict, verdict: str | None) -> dict:
             "pending": "findings wait for the [ADV] advisor"}[state]
     run(["gh", "api", "-X", "POST", f"repos/{rec['repo']}/statuses/{rec['head_sha']}", "-f", f"state={state}",
          "-f", f"context={JUDGMENT_CHECK}", "-f", f"description={desc}"], gh="builder")
-    return update_judgment(f"{rec['repo']}#{rec['pr']}", fp=rec["fingerprint"], posted=[rec["head_sha"], state])
+    key = f"{rec['repo']}#{rec['pr']}"
+    cur = update_judgment(key, fp=rec["fingerprint"], posted=[rec["head_sha"], state])
+    if cur and cur.get("fingerprint") != rec["fingerprint"]:
+        # A newer fingerprint was judged and published while this post was in flight, so this post
+        # may have landed last on a shared head: make the newer record post again.
+        update_judgment(key, fp=cur["fingerprint"], posted=None)
+    return cur
 
 
 def gate(board: str, repo: str, number: int, pr: dict | None = None) -> tuple[dict, str | None]:

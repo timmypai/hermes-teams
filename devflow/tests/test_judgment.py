@@ -183,6 +183,16 @@ class Judge(JudgmentCase):
         self.df.update_judgment(f"{REPO}#7", fp=old, advisor="t_for_old")
         self.assertIsNone(self.record()["advisor"])
 
+    def test_status_posted_after_a_newer_judgment_makes_that_one_post_again(self) -> None:
+        rec = self.df.judgment("b", REPO, 7)
+        post = self.df.run
+        def newer_judged_during_post(cmd, **kw):
+            self.df.update_judgment(f"{REPO}#7", fingerprint="f" * 12, posted=[rec["head_sha"], "pending"])
+            return post(cmd, **kw)
+        self.df.run = newer_judged_during_post
+        self.df.publish(rec, "ok")
+        self.assertIsNone(self.record()["posted"])
+
 
 class ShipMerge(JudgmentCase):
     def test_api_failure_refuses_without_status_or_merge(self) -> None:
