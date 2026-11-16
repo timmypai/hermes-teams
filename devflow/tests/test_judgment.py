@@ -197,12 +197,11 @@ class ShipMerge(JudgmentCase):
         self.assertEqual(self.f.statuses, ["success"])
         self.assertIn("a" * 40, self.f.merges[0][self.f.merges[0].index("--match-head-commit") + 1])
 
-    def test_finding_without_advisor_posts_pending_and_parks_the_card(self) -> None:
+    def test_finding_without_advisor_posts_pending_and_asks_to_retry(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
-        code, _ = self.ship()
-        self.assertEqual(code, 3)
+        code, out = self.ship()
+        self.assertEqual((code, json.loads(out)["wait"]), (3, "retry"))
         self.assertEqual((self.f.statuses, self.f.merges), (["pending"], []))
-        self.assertEqual(self.record()["parked"], "t_ship")
 
     def test_advisor_verdict_decides(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
@@ -266,42 +265,35 @@ class Tick(JudgmentCase):
         self.df.tick_prs("b", REPO, self.tasks("review"))
         self.assertEqual(self.f.statuses, ["success"])
 
-    def test_review_finding_posts_pending_and_links_one_advisor_as_parent(self) -> None:
+    def test_review_finding_posts_pending_and_opens_one_advisor_without_board_links(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.9}
-        self.df.tick_prs("b", REPO, self.tasks("review"))
-        self.df.tick_prs("b", REPO, self.tasks("review"))
+        self.df.tick_prs("b", REPO, self.tasks("running"))
+        self.df.tick_prs("b", REPO, self.tasks("running"))
         adv = self.record()["advisor"]
         self.assertEqual([c.get("title") for c in self.f.cards.values() if "title" in c], [f"[ADV] PR 判斷 {REPO}#7"])
         self.assertIn("EPIC: t_00000abc", self.f.cards[adv]["body"])
-        self.assertEqual((self.f.statuses, self.f.links), (["pending"], [(adv, "t_dev")]))
+        self.assertEqual((self.f.statuses, self.f.links, self.f.resumed), (["pending"], [], []))
 
-    def test_reviewer_waits_on_dependency_once_linked_and_passes_after_ok(self) -> None:
+    def test_reviewer_retries_until_the_advisor_exists_then_waits_on_it(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.9}
-        self.df.tick_prs("b", REPO, self.tasks("review"))
         code, out = self.call(self.df.cmd_check_pr, "t_dev")
-        self.assertEqual((code, json.loads(out)["wait"]), (3, "dependency"))
-        self.assertIsNone(self.record().get("parked"))
-        self.f.cards[self.record()["advisor"]].update(status="done", verdict="ok")
+        self.assertEqual((code, json.loads(out)["wait"]), (3, "retry"))
+        self.df.tick_prs("b", REPO, [])  # the pending judgment alone gets its [ADV]
+        adv = self.record()["advisor"]
+        code, out = self.call(self.df.cmd_check_pr, "t_dev")
+        self.assertEqual((code, json.loads(out)["wait"], json.loads(out)["advisor"]), (3, "dependency", adv))
+        self.f.cards[adv].update(status="done", verdict="ok")
         self.assertEqual(self.call(self.df.cmd_check_pr, "t_dev")[0], 0)
         self.assertEqual(self.f.statuses, ["pending", "success"])
 
-    def test_card_blocked_before_the_link_is_linked_and_resumed_once(self) -> None:
-        self.f.answers = {"unlabeled_fix": 0.8}
-        code, out = self.ship()  # body changed after review: findings reach the merge entry
-        self.assertEqual((code, json.loads(out)["wait"]), (3, "block"))
-        self.f.cards["t_ship"] = {"status": "blocked", "verdict": None, "body": "EPIC: t_00000abc"}
-        tasks = [{"id": "t_ship", "title": "[SHIP] x", "assignee": "devops", "status": "blocked", "completion_contract": None}]
-        self.df.tick_prs("b", REPO, tasks)
-        self.df.tick_prs("b", REPO, tasks)
-        self.assertEqual((self.f.links, self.f.resumed), ([(self.record()["advisor"], "t_ship")], ["t_ship"]))
-
-    def test_final_verdict_does_not_park(self) -> None:
-        self.f.answers = {"unlabeled_fix": 0.8}
-        self.df.judgment("b", REPO, 7)
-        self.df.update_judgment(f"{REPO}#7", advisor="t_adv")
-        self.adv("done", "revise")
-        self.assertEqual(self.ship()[0], 4)
-        self.assertIsNone(self.record().get("parked"))
+    def test_judgment_stored_for_another_fingerprint_is_not_used(self) -> None:
+        def judge_while_another_writer_wins(pr, files):
+            self.df.update_judgment(f"{REPO}#7", fingerprint="f" * 12, findings=[], head_sha="a" * 40)
+            return {"gate_files": [], "risks": {}, "findings": []}
+        self.df.judge = judge_while_another_writer_wins
+        with self.assertRaises(self.df.DecisionsError):
+            self.df.gate("b", REPO, 7)
+        self.assertEqual(self.f.statuses, [])
 
 
 

@@ -57,7 +57,7 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定 AC、全程 tra
    - `devflow-ci` 紅或有衝突 → 見 §5。`devflow-judgment` 不是 success 不算 CI 紅：直接做第 3 步。
 3. `devflow ship merge <slug> N`（不要直接 `gh pr merge`）。它重新判斷 PR 目前的 head + 標題 + 說明（review 後說明被改也擋得到），寫入 `devflow-judgment`，然後 squash merge 那個 head。結束碼：
    - `0`：已合併，輸出 `merged_sha`。
-   - `3`：有疑慮，等 `[ADV]` advisor 結論。看輸出的 `wait`：`dependency` → `kanban_block(kind="dependency", reason="devflow ship merge：等 advisor 判斷 PR #N")`（`[ADV]` 已是本卡 parent，完成後本卡自動回來）；`block` → `kanban_block(reason="devflow ship merge：等 advisor 判斷 PR #N")`，tick 會把 `[ADV]` 設為本卡 parent 再重跑本卡。重跑時從這一步開始。
+   - `3`：有疑慮，等 `[ADV]` advisor 結論。看輸出的 `wait`：`dependency` → `kanban_link(parent_id="<輸出的 advisor>", child_id="<本卡>")`，再 `kanban_block(kind="dependency", reason="devflow ship merge：等 advisor 判斷 PR #N")`，advisor 完成後本卡自動回來，從這一步重跑（不要用沒有 kind 的 block：連續兩次會被送去 triage）；`retry` → tick 還沒建 `[ADV]`：`kanban_heartbeat`，等 1 分鐘重跑，最多 10 次，仍是 `retry` 才 `kanban_block(kind="needs_input", reason=...)`。
    - `4`：advisor 回 `revise`（或沒寫 verdict）→ 照第 1 步「未出貨」完成本卡。
    - `1`：其他錯誤（Decisions API 失敗、PR 在判斷後被修改、merge 被拒）→ 看訊息；API 失敗等 1 分鐘重跑，最多 3 次，仍失敗就 `kanban_block(kind="needs_input", reason=...)`；PR 被修改就直接重跑。
 4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：先 `devflow runner status <repo>` 確認 runner online（不在就 `devflow runner request`），再追部署：
