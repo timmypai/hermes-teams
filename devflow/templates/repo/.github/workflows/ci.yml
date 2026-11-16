@@ -1,6 +1,8 @@
 name: ci
 on:
   pull_request:
+    # edited: PR 說明的 Lesson:／No-lesson: 改了要重新判定
+    types: [opened, synchronize, reopened, edited]
   push:
     branches-ignore: [main, master]
   workflow_dispatch:
@@ -21,15 +23,25 @@ jobs:
         run: docker build -t ci-check .
 
   # devflow 規則（.devflow/rules/，每條附錯誤範例自測）與教訓紀錄（.devflow/lessons/）。必過：列在 devflow-ci 的 needs。
+  # PR 另外檢查：fix／revert PR 要帶教訓，新教訓要在修正前的程式上證明有效（check.py --pr）。
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: rules and lessons
         run: bash .devflow/check.sh
+      - name: lesson gate
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 .devflow/check.py --pr "$BASE_SHA"
 
   # Acceptance journeys against a running copy of the service (same compose file as deploy).
   verify:

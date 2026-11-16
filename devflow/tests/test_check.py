@@ -1,6 +1,7 @@
 """devflow repo checker (.devflow/check.py): run it the way CI does, in a throwaway git repo."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,9 @@ ref = "no-sleep-fix"
 """
 
 
-class CheckRepo(unittest.TestCase):
+class RepoCase(unittest.TestCase):
+    """A throwaway git repo holding the template checker and rules."""
+
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="devflow-check-"))
         self.addCleanup(shutil.rmtree, self.dir)
@@ -41,6 +44,9 @@ class CheckRepo(unittest.TestCase):
         p = subprocess.run([sys.executable, ".devflow/check.py", *args], cwd=self.dir,
                            capture_output=True, text=True)
         return p.returncode, p.stdout + p.stderr
+
+
+class CheckRepo(RepoCase):
 
     def test_clean_repo_passes(self) -> None:
         self.write("app/ok.py", "def add(a, b):\n    return a + b\n")
@@ -123,6 +129,206 @@ class CheckRepo(unittest.TestCase):
         code, out = self.check()
         self.assertEqual(code, 2, out)
         self.assertIn("CONFIG", out)
+
+RULE_NO_EVAL = """\
+id = "no-eval"
+message = "do not eval input"
+include = ["**/*.py"]
+patterns = ['\\beval\\(']
+[[fixture]]
+path = "a.py"
+text = "eval(x)"
+expect = "fail"
+[[fixture]]
+path = "a.py"
+text = "ast.literal_eval(x)"
+expect = "pass"
+"""
+
+
+def lesson(lid: str, kind: str, ref: str) -> str:
+    return LESSON_RULE.replace("L-0001", lid).replace('kind = "rule"', f'kind = "{kind}"') \
+        .replace('ref = "no-sleep-fix"', f'ref = "{ref}"')
+
+
+# Stand-in for a stack's test runner honouring the .devflow/test.sh contract used by the lesson gate:
+# DEVFLOW_TEST_ONLY limits the run to one file, DEVFLOW_JUNIT receives per-test results.
+JUNIT_RUNNER = """\
+import os, sys, unittest
+from xml.etree.ElementTree import Element, SubElement, ElementTree
+
+class Result(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.cases = []
+    def addSuccess(self, t): self.cases.append((t, None))
+    def addFailure(self, t, e): super().addFailure(t, e); self.cases.append((t, "failure"))
+    def addError(self, t, e): super().addError(t, e); self.cases.append((t, "error"))
+    def addSkip(self, t, r): super().addSkip(t, r); self.cases.append((t, "skipped"))
+
+sys.path.insert(0, os.getcwd())
+only = os.environ.get("DEVFLOW_TEST_ONLY")
+loader = unittest.TestLoader()
+suite = loader.loadTestsFromName(only[:-3].replace("/", ".")) if only else loader.discover("tests")
+result = Result()
+suite.run(result)
+if os.environ.get("DEVFLOW_JUNIT"):
+    root = Element("testsuite")
+    for t, kind in result.cases:
+        case = SubElement(root, "testcase", name=getattr(t, "_testMethodName", str(t)))
+        if kind:
+            SubElement(case, kind)
+    ElementTree(root).write(os.environ["DEVFLOW_JUNIT"])
+sys.exit(0 if result.wasSuccessful() else 1)
+"""
+
+ADD_TEST = ("import unittest\nfrom app.calc import add\n\n"
+            "class T(unittest.TestCase):\n    def test_adds(self):\n        self.assertEqual(add(2, 3), 5)\n")
+
+
+class PrRepo(RepoCase):
+    """A base commit, then check.py --pr BASE on a head commit, as the CI step does."""
+
+    def start(self, test_sh: str) -> None:
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=self.dir, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.dir, check=True)
+        self.write(".devflow/test.sh", test_sh)
+        self.write("tests/__init__.py", "")
+        self.write("app/__init__.py", "")
+        self.write("app/calc.py", "def add(a, b):\n    return a - b\n\ndef parse(x):\n    return eval(x)\n")
+        self.base = self.commit("base")
+
+    def commit(self, msg: str) -> str:
+        subprocess.run(["git", "add", "-A"], cwd=self.dir, check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=self.dir, check=True)
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.dir, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def gate(self, title: str, body: str = "") -> tuple[int, str]:
+        self.commit("head")
+        p = subprocess.run([sys.executable, ".devflow/check.py", "--pr", self.base], cwd=self.dir,
+                           capture_output=True, text=True, env={**os.environ, "PR_TITLE": title, "PR_BODY": body})
+        return p.returncode, p.stdout + p.stderr
+
+    def fix_add_with_test(self, test_src: str = ADD_TEST) -> None:
+        self.write("tests/test_calc.py", test_src)
+        self.write(".devflow/lessons/L-0003.toml", lesson("L-0003", "test", "tests/test_calc.py::test_adds"))
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n\ndef parse(x):\n    return eval(x)\n")
+
+
+class PrGate(PrRepo):
+    def setUp(self) -> None:
+        super().setUp()
+        self.write(".devflow/junit_run.py", JUNIT_RUNNER)
+        self.start("set -e\npython3 .devflow/junit_run.py\n")
+
+    def test_fix_pr_needs_a_lesson_or_a_reason(self) -> None:
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n")
+        code, out = self.gate("fix: add returns the sum")
+        self.assertEqual(code, 1, out)
+        self.assertIn("fix/revert PR: add `Lesson: L-NNNN`", out)
+        code, out = self.gate("fix: add returns the sum", "No-lesson: typo in a one-off helper, no pattern")
+        self.assertEqual(code, 0, out)
+
+    def test_feature_pr_needs_no_lesson(self) -> None:
+        self.write("app/extra.py", "X = 1\n")
+        self.assertEqual(self.gate("feat: add extra")[0], 0)
+
+    def test_rule_lesson_must_fire_on_the_pre_fix_code(self) -> None:
+        self.write(".devflow/rules/no-eval.toml", RULE_NO_EVAL)
+        self.write(".devflow/lessons/L-0002.toml", lesson("L-0002", "rule", "no-eval"))
+        self.write("app/calc.py", "import ast\n\ndef parse(x):\n    return ast.literal_eval(x)\n")
+        code, out = self.gate("fix: parse without eval", "Lesson: L-0002")
+        self.assertEqual(code, 0, out)
+
+    def test_rule_lesson_that_misses_the_pre_fix_code_fails(self) -> None:
+        self.write(".devflow/rules/no-exec.toml", RULE_NO_EVAL.replace("no-eval", "no-exec")
+                   .replace("\\beval", "\\bexec").replace('"eval(x)"', '"exec(x)"'))
+        self.write(".devflow/lessons/L-0002.toml", lesson("L-0002", "rule", "no-exec"))
+        self.write("app/calc.py", "import ast\n\ndef parse(x):\n    return ast.literal_eval(x)\n")
+        code, out = self.gate("fix: parse without eval", "Lesson: L-0002")
+        self.assertEqual(code, 1, out)
+        self.assertIn("rule no-exec does not fire on the pre-fix version", out)
+        self.assertEqual(self.gate("fix: parse without eval",
+                                   "Lesson: L-0002\nNo-proof: rule guards a sibling module, see #12")[0], 0)
+
+    def test_test_lesson_must_fail_on_the_pre_fix_code(self) -> None:
+        self.fix_add_with_test()
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 0, out)
+
+    def test_test_lesson_that_passes_on_the_pre_fix_code_fails(self) -> None:
+        self.fix_add_with_test(ADD_TEST.replace("self.assertEqual(add(2, 3), 5)", "self.assertTrue(True)"))
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("on the pre-fix code (BASE): passed", out)
+
+    def test_unrelated_base_failure_is_not_proof(self) -> None:
+        self.write("tests/test_other.py", "import unittest\n\nclass U(unittest.TestCase):\n"
+                   "    def test_flaky(self):\n        self.fail('unrelated')\n")
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n\ndef parse(x):\n    return eval(x)\n")
+        self.base = self.commit("base: add already right, another test broken")
+        self.fix_add_with_test()
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("on the pre-fix code (BASE): passed", out)
+
+    def test_import_error_on_base_is_not_proof(self) -> None:
+        self.fix_add_with_test(ADD_TEST.replace("import add", "import add, mul"))
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("not run (import or collection error?)", out)
+
+    def test_test_must_pass_after_the_fix(self) -> None:
+        self.fix_add_with_test()
+        self.write("app/calc.py", "def add(a, b):\n    return a * b\n")
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("on this PR: failure; it must pass after the fix", out)
+
+    def test_runner_without_junit_cannot_prove(self) -> None:
+        self.write(".devflow/test.sh", "set -e\npython3 -m unittest discover -s tests -v\n")
+        self.fix_add_with_test()
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("wrote no JUnit results", out)
+
+
+    def test_recurring_lesson_must_be_strengthened(self) -> None:
+        self.write(".devflow/lessons/L-0004.toml", lesson("L-0004", "skill-only", "x")
+                   .replace('ref = "x"', 'ref = "x"\nreason = "needs judgement"'))
+        self.base = self.commit("lesson exists")
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n")
+        code, out = self.gate("fix: add again", "Lesson: L-0004")
+        self.assertEqual(code, 1, out)
+        self.assertIn("L-0004 already existed and this PR leaves it unchanged", out)
+        self.fix_add_with_test()
+        self.write(".devflow/lessons/L-0004.toml", lesson("L-0004", "test", "tests/test_calc.py::test_adds"))
+        code, out = self.gate("fix: add again", "Lesson: L-0004")
+        self.assertEqual(code, 0, out)
+
+
+class TemplatePytest(PrRepo):
+    """The template .devflow/test.sh (pytest branch) with real pytest JUnit output. Needs network for pip."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write("requirements.txt", "")
+        self.write(".gitignore", ".venv-test/\n")
+        self.start((TEMPLATE / "test.sh").read_text())
+
+    def test_assertion_failure_on_base_proves(self) -> None:
+        self.fix_add_with_test()
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 0, out)
+
+    def test_import_error_on_base_does_not_prove(self) -> None:
+        self.fix_add_with_test(ADD_TEST.replace("import add", "import add, mul"))
+        self.write("app/calc.py", "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n")
+        code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
+        self.assertEqual(code, 1, out)
+        self.assertIn("not run (import or collection error?)", out)
 
 
 if __name__ == "__main__":

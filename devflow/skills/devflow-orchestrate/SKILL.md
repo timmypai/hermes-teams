@@ -40,7 +40,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    | 既有 repo、沒有 `.devflow/` 或 workflow，且需要部署 | `[OPS] 接入 devflow CI/CD` → `[SHIP]` |
    | 已接入 | 直接進功能卡 |
    devflow repo 契約 = `/opt/data/devflow/templates/repo/`（`.devflow/test.sh`、`check.sh`、`check.py`、`rules/`、`verify.sh`、`up.sh`、`playwright.sh`、`deploy.sh`、`capture.sh`、`redact.py`、`quality.sh`、`config.env`、`deploy/compose.yml`、`.github/workflows/ci.yml`、`deploy.yml`、`repro.yml`、`quality.yml`）。已接入但缺 `verify.sh`、或 `ci.yml` 沒有 `verify`／`check` job（`devflow contract <slug> <主 checkout>` 會列出差異）→ 第一段加 `[OPS] 升級 devflow 契約`（body 寫明：合併 `ci.yml` 的 `check` job 並列入 `devflow-ci` 的 needs、`check.sh --write-baseline` 收舊違規）；缺 `capture.sh` / `repro.yml` / `quality.yml`（`devflow contract` 會直接補上缺的檔）→ 同一張或另一張 `[OPS] 升級 devflow 契約` 補齊，不擋功能卡並行。
-   `[ADJ]` 找到根因、且同類錯誤可能再犯時，修正卡的 `## 驗收` 要寫「新增教訓 `.devflow/lessons/L-NNNN.toml`，優先以規則或測試擋住」。`check` job 會驗證教訓的格式與 ref 確實存在；「這個修正 PR 有沒有新增教訓」目前由 reviewer 依卡片驗收核對，還不是自動檢查。
+   `[ADJ]` 找到根因、且同類錯誤可能再犯時，修正卡的 `## 驗收` 要寫「`fix:` PR，新增教訓 `.devflow/lessons/L-NNNN.toml`（PR 說明 `Lesson: L-NNNN`），優先以規則或測試擋住」。CI `check` job 會擋沒有 `Lesson:`／`No-lesson:` 的 fix PR、證明新教訓在修正前的程式上會失敗，並要求同一根因再出現時更新原本的教訓。
 3. 先寫吞吐檢查（`pstack` feature playbook）：哪些步驟必須先做、哪些可並行、哪裡會同時寫同一份檔案（先拆開，真的要共用才串行）、最小可行的切法。然後切卡（`pstack:principle-sequence-verifiable-units`）：
    - `[RES]` 只在有實際未知時建；`[ARCH]` 只在有跨模組或難回頭決策時建。
    - `[DEV]` 一卡一 PR，能獨立合併；每張 `[DEV]`/`[OPS]` 後面接一張 `[SHIP]`（parent = 該卡）。

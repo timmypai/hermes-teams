@@ -37,17 +37,21 @@ metadata:
   - `rule`：錯誤在**單一行**就看得出來（禁用的呼叫、匯入、註解、設定值）。新增 `.devflow/rules/<id>.toml`，附 `expect = "fail"`（這次的錯誤那一行）與 `"pass"` 範例。規則逐行比對，不能跨行，不懂語意；範例先跑 `bash .devflow/check.sh` 確認自測通過。
   - `test`／`journey`（`ref = "路徑::測試名"`）：要看行為或跨行結構才知道錯（權限、資料流、錯誤處理、時序）。寫回歸測試或 AC journey，例如「沒有權限的使用者呼叫 X 會得到 403」。這類錯誤不要寫成正規表示式規則。
   - `skill-only`：上面都做不到才用，`reason` 寫為何無法自動檢查。
-  `check` 會驗證 ref 指到的東西真的存在。
+  `check` 會驗證 ref 指到的東西真的存在。PR 上 CI 還會證明**新增的**教訓抓得到這次的錯：`rule` 必須在 PR 改動檔案的修正前版本（base）上報錯；`test` 會連同你的 `.devflow/test.sh` 放到 base 上只跑那個測試檔，那條測試在 base 必須是**斷言失敗**、在 PR 上必須通過（依 JUnit 結果判定；匯入錯誤、例外、skip 都不算證明）。所以回歸測試要從修正前就存在的入口測行為（既有函式、HTTP 端點、CLI），才能在 base 上載入並跑到斷言；修正本身必須新增 API 而無法這樣測時，PR 說明寫 `No-proof: <原因>`。`.devflow/test.sh` 要支援 `DEVFLOW_TEST_ONLY`（只跑這個檔）與 `DEVFLOW_JUNIT`（寫 JUnit XML）；範本的 pytest 分支已支援，其他技術棧照註解補上。`journey` 不做自動證明。
 
 ## 5. PR
 ```bash
 git add -A && git commit -m "<type>: <摘要> (<task-id>)"
 git push -u origin HEAD
-gh pr view --json url,number || gh pr create --base <default> --title "<摘要>" --body "<做了什麼/怎麼驗證>
+gh pr view --json url,number || gh pr create --base <default> --title "<type>: <摘要>" --body "<做了什麼/怎麼驗證>
 
+<只有 fix／revert PR：Lesson: L-NNNN 或 No-lesson: 理由>
 Kanban: <task-id>"
 gh pr checks --watch          # 等 CI；紅燈 → 修 → push → 再等
 ```
+- PR 標題用 `<type>: <摘要>`。修 bug、修退件、修部署失敗用 `fix:`（撤回用 `revert:`）；CI `check` job 的 lesson gate 要求這類 PR 的說明有一行 `Lesson: L-NNNN`（這個 PR 新增或更新的教訓），或 `No-lesson: <為什麼這個錯誤不會再犯>`（至少 10 字，reviewer 會判斷）。不是 fix 的 PR 不用寫。
+- 引用的教訓在 base 就已存在 = 同一根因又出現，表示原本的擋法沒擋住：在同一個 PR 更新那筆教訓（例如 `skill-only` 改成 `rule`／`test`，`event` 補上這次的連結），否則 lesson gate 失敗。
+- 教訓的錯誤是在更早的 PR 修掉的（這個 PR 的 base 已經沒有錯誤程式）時，說明加 `No-proof: <原因與修正 PR>`，跳過證明；reviewer 會判斷。改了 PR 說明會自動重跑 CI。
 - 等 CI 期間偶爾 `kanban_heartbeat`。repo 還沒有 CI workflow 時跳過等待，在 handoff 註明。
 - `ci.yml` 一定保留彙總 job `devflow-ci`（default branch 的 required check，也是 Hermes PR contract 的判定依據）；新增的 job 要加進它的 `needs`。ub-mode 指標在獨立的 `quality.yml`，不要把它加進 `devflow-ci`。
 - CI 綠後看 `quality`（ub-mode 的 Make it Right）：`gh run download <run> -n devflow-quality-<sha> -D /tmp/q-<task>`，讀 `crap.txt`（你改到的函式 CRAP ≥ 10 → 拆或補測試）、`dry.txt`（≥ 0.8 的重複 → 合併）、`mutate.txt`（uncovered 補測試、survivor 補斷言、死碼刪掉）。只處理這次改到的程式；舊程式的數字寫進 `followups`。數字不是門檻，quality workflow 失敗也不擋送審。repo 還沒有 `quality.yml` 就跳過，在 `followups` 寫「升級 devflow 契約（quality）」。
