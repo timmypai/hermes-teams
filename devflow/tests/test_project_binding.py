@@ -98,6 +98,21 @@ class Binding(unittest.TestCase):
         self.assertEqual("p_old", self.df.bind_project(SLUG)["id"])
         self.assertEqual(["bind-board", "set-board-project"], self.writes)
 
+    def test_project_already_pointed_at_by_another_board_is_not_shared(self):
+        # Half binding elsewhere: board B has project_id=P while P.board_slug is still empty.
+        self.project("p_old", primary=str(self.clone), folders=[self.clone])
+        other = self.board.parent / "other"
+        other.mkdir()
+        (other / "board.json").write_text(json.dumps({"slug": "other", "project_id": "p_old"}))
+        self.assertIsNone(self.stops())
+
+    def test_archived_board_pointing_at_project_does_not_block(self):
+        self.project("p_old", primary=str(self.clone), folders=[self.clone])
+        old = self.board.parent / "old"
+        old.mkdir()
+        (old / "board.json").write_text(json.dumps({"slug": "old", "project_id": "p_old", "archived": True}))
+        self.assertEqual("p_old", self.df.bind_project(SLUG)["id"])
+
     def test_project_bound_to_another_board_is_not_stolen(self):
         self.project("p_old", board="other", primary=str(self.clone), folders=[self.clone])
         self.assertIsNone(self.stops())

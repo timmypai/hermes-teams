@@ -229,6 +229,18 @@ def board_project_id(slug: str) -> str | None:
     return (json.loads(meta.read_text()).get("project_id") or None) if meta.exists() else None
 
 
+def boards_bound_to(project_id: str, *, skip: str) -> list[str]:
+    """Active boards (archived tombstones and _archived/ excluded) whose board.json points at the project."""
+    found = []
+    for meta in sorted(BOARDS.glob("*/board.json")):
+        if meta.parent.name in (skip, "_archived"):
+            continue
+        b = json.loads(meta.read_text())
+        if not b.get("archived") and b.get("project_id") == project_id:
+            found.append(meta.parent.name)
+    return found
+
+
 def create_project(slug: str, repo: str, path: str) -> None:
     run([HERMES, "project", "create", slug, path, "--slug", slug, "--description", f"GitHub: {repo}",
          "--board", slug])
@@ -267,6 +279,8 @@ def binding_plan(slug: str) -> tuple[dict | None, list[str], list[str]]:
         problems.append(f"專案 {p['slug']} 已綁看板 {p['board_slug']!r}")
     if board_pid not in (None, p["id"]):
         problems.append(f"看板 project_id={board_pid} 與專案 {p['id']} 不符")
+    if others := boards_bound_to(p["id"], skip=slug):
+        problems.append(f"專案 {p['slug']} 已被其他看板指向：{', '.join(others)}")
     if problems:
         return p, [], problems
     actions = [a for a, missing in (("bind-board", p["board_slug"] != slug), ("set-board-project", board_pid != p["id"]))
