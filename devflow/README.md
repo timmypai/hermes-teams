@@ -49,17 +49,24 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 **ub-mode**（[unclebob/ub-mode](https://github.com/unclebob/ub-mode) @ `3da62bf`，MIT，原文放在 `skills/ub-mode/`）：
 - 主要開發在 Codex，所以 install 把它複製到 developer 的 `$CODEX_HOME/skills/ub-mode`（Codex 原生 skill，`skills/list` 可見），並只移走具名項目（`roles.json` `obsolete_skills.codex`）：舊契約的 `seven-pstack-*`、`team-operations`，以及規則已由 ub-mode 負責的 Codex 複本 `test-driven-development`（「一律先寫測試」與 ub-mode「寫不出誠實測試就不寫」衝突）、`pstack/skills/{tdd,principle-fix-root-causes,principle-test-behavior-not-implementation}`。補充而不衝突的 `systematic-debugging`、`principle-prove-it-works` 與其他既有 Codex 技能保留。`codex/AGENTS.md` 要求每次改程式都套用 ub-mode，並覆寫與 devflow 衝突的條目：只 push 卡片分支走 PR（原文是 push 到 main line）、worktree 由 Hermes 管、Keep a Log 寫進 handoff metadata `log`。
 - reviewer 用同一份 skill 審 Make it Right。developer Hermes profile 的 pstack 分配移除了 ub-mode 已涵蓋的 principle（laziness、subtract、boundary、idempotent、type-system、fix-root-causes、test-behavior、tdd），避免兩套規則。
-- ub-mode 的 Crapper / Dryer / Mutator 是第三方程式，只在 PR CI 的 `quality` job（GitHub-hosted、唯讀 token、pinned commit）執行，不在 Hermes 容器執行。結果是 artifact `devflow-quality-<sha>` 與 run summary，供 developer 修正、reviewer 參考；不在 `devflow-ci` 的 `needs` 內，不擋合併。
+- ub-mode 的 Crapper / Dryer / Mutator 是第三方程式，只在獨立的 `quality.yml` workflow（GitHub-hosted、唯讀 token、pinned commit、`continue-on-error`）執行，不在 Hermes 容器執行。它是 repo 契約的預設檔，`devflow contract` 會補進既有 repo；不是 required check，也不在 `devflow-ci` 內，**不擋合併**。結果是 artifact `devflow-quality-<sha>` 與 run summary，供 developer 修正、reviewer 參考。
 
 ## CI/CD
 
 | 階段 | 執行位置 | 內容 |
 |---|---|---|
-| PR CI | GitHub-hosted `ubuntu-latest` | `test`：`.devflow/test.sh` + `docker build`；`verify`：`.devflow/up.sh` 起服務 → `.devflow/verify.sh`（AC journeys，UI 用 Playwright 官方映像）→ artifact `devflow-evidence-pr-<sha>`，失敗時 `.devflow/capture.sh` → `devflow-diagnostics-pr-<sha>`；`quality`：`.devflow/quality.sh`（ub-mode 指標，不擋）→ artifact `devflow-quality-<sha>`；彙總 job `devflow-ci` 是 default branch 的 required check |
+| PR CI | GitHub-hosted `ubuntu-latest` | `ci.yml`：`test`（`.devflow/test.sh` + `docker build`）、`check`（`.devflow/check.sh`：規則自測 + 教訓紀錄 + 規則掃描）、`verify`（`.devflow/up.sh` 起服務 → `.devflow/verify.sh`，AC journeys，UI 用 Playwright 官方映像 → artifact `devflow-evidence-pr-<sha>`，失敗時 `.devflow/capture.sh` → `devflow-diagnostics-pr-<sha>`）；彙總 job `devflow-ci`（needs `test`、`check`、`verify`）是 default branch 的 required check。`quality.yml`（獨立 workflow，不擋）：`.devflow/quality.sh`（ub-mode 指標）→ artifact `devflow-quality-<sha>` |
 | Deploy | Oracle VM 主機 `devflow` 使用者（rootless Docker）上的 self-hosted runner `[self-hosted, devflow]` | `.devflow/deploy.sh`：compose build → up → health → `verify.sh`；up / health / verify 失敗先採證再回滾，build 失敗不動執行中版本；artifact `devflow-evidence-deploy-<sha>`、`devflow-diagnostics-deploy-<sha>` |
 | Repro（除錯） | GitHub-hosted `ubuntu-latest`，`workflow_dispatch` | `repro.yml`：任一分支起服務、只跑指定 AC（`DEVFLOW_ONLY`）、全程 trace、採證 → artifact `devflow-repro-<run>`。developer 用它在 Hermes 外重現整合層問題，不碰正式主機、沒有部署秘密 |
 
 **診斷與除錯**：`capture.sh` 只讀（容器清單、`State` 的退出碼/OOM/健康/重啟次數、限時 log、健康探測、主機磁碟/記憶體），不輸出 `Config.Env`；`redact.py` 以 `deploy/.env` 的值與常見憑證樣式遮罩，遮罩失敗就刪 log。遮罩是盡力而為，應用程式仍不應記錄秘密。診斷 artifact 與 AC 證據分開，保留 7 天。
+
+**規則與教訓（用檢查取代 prompt）**：同樣的錯誤不再寫進 skill 提醒，而是變成 `check` job 的檢查。
+- 規則 `.devflow/rules/<id>.toml`：路徑範圍 + 正規表示式，**每條必須附 `expect = "fail"` 與 `"pass"` 範例**；`check` 先用範例自測，規則抓不到自己的錯誤範例就 CI 失敗。範本內建 `no-sleep-fix`（固定等待掩蓋時序問題）、`no-suppress`（壓 lint／型別警告）、`no-skip-test`（跳過或聚焦測試）；各 repo 自行加模組邊界等規則。
+- 豁免：該行或上一行 `devflow: allow <rule-id> L-NNNN`，L-NNNN 必須是存在的教訓。既有 repo 接入時 `check.sh --write-baseline` 記錄舊違規（以規則＋路徑＋該行內容比對），之後只擋新增。
+- 教訓 `.devflow/lessons/L-NNNN.toml`：事件、根因、分類、由什麼擋（`rule`／`test`／`journey`／`template`／`cli`／`skill-only`）；`check` 驗證 ref 指到的規則或檔案確實存在，`skill-only` 必須寫理由。
+- 限制：`check` 程式與規則都在 repo 內，PR 能修改它們；目前靠 reviewer 擋放寬規則，CODEOWNERS 與從 default branch 取檢查程式屬於治理階段（需另行核准）。修正 PR 是否帶教訓、同一根因重複出現的阻擋，屬於下一階段的自動檢查。
+- devflow 本身的檢查：repo 根目錄 `.github/workflows/devflow-kit.yml`（範本腳本 shellcheck、範本 workflow actionlint、`devflow/tests/` 檢查器單元測試、`devflow/tests/deploy_scenarios.sh` 以一次性 Docker 跑範本 `deploy.sh` 的四情境：成功上線、build 失敗不動執行中版本、health 失敗與 verify 失敗都採證後回滾到 `:live`）。
 
 **信任邊界**：workflow YAML 的條件（`if`、`environment`、`concurrency`）只防誤用，不是安全邊界。有任一 devflow repo push 權限的帳號，都能在分支上寫 workflow 跑在 `[self-hosted, devflow]` runner，等同主機 `devflow` 使用者與其 rootless Docker 的權限；所有 repo 共用這個使用者與 Docker daemon。要收斂需另做主機隔離（每個 repo 獨立使用者與 Docker，或組織層級 runner group 限定 workflow）。
 
@@ -70,7 +77,8 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 ## 身分與權限
 - GitHub：builder = devops/gh 帳號（hermes、orchestrator、researcher、architect、developer、devops）；reviewer = reviewer/gh 帳號。`devflow repo add` 會讓兩個帳號都有 push 權限。
 - developer 的 Codex：workspace-write 沙箱 + 網路；`.git` 在沙箱內唯讀，git/gh 以 Codex 原生升權執行，developer profile `approvals.mode: off` 自動核准（使用者 2026-11-15 選定）。
-- developer 模型必須在 Codex app-server 的 `model/list` 內（ChatGPT 帳號登入的 Codex 不支援 `gpt-6.1-sol`）；`roles.json` 固定為 `gpt-6-astra`，換模型先用 developer 的 Codex 確認。
+- Codex 主模型預設為 `gpt-6.1-sol`，推理強度 `high`；developer 的 Hermes profile 與 Codex app-server 設定須保持一致。更換模型時確認目前帳號與 runtime 支援。
+- `bin/codex-developer` 依 PATH 使用 `codex`（可用 `DEVFLOW_CODEX_BIN` 明確覆寫），不固定到系統舊版。模型設定、驗證身分與 skills 使用同一個 `CODEX_HOME`（預設 `/opt/data/profiles/developer/codex`；可用 `DEVFLOW_CODEX_HOME` 覆寫），更新 binary 不會搬移或清除 skills。若要新增 developer 的 Codex skills，須安裝到這個 home 的 `skills/`，不是其他帳號的 `~/.codex/skills/`。
 - Opus 5.5 走 `github-copilot` plugin（provider `copilot`，憑證在 Hermes 原生 credential pool）。reviewer profile 預設 Opus、`fallback_providers` 退回 `openai-codex`；`[ADV]` 卡由 `devflow check plan` 以卡片 model/provider 覆寫指定 Opus。
 - Decisions API（`roles.json` 的 `decisions`）用 Hermes 既有 OpenAI key（GPT-Live 同一把）；`check plan` 的 `flag`、`check acceptance` 的 `pass` 為機率門檻。
 
@@ -80,7 +88,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | PR `completion_contract` 以卡片 assignee 的 GitHub 身分讀 required checks（classic branch protection 只有 admin 讀得到；ruleset 任何協作者都讀得到） | 沒有 required checks、或 reviewer（非 admin）完成時看不到 classic protection，卡永遠完成不了 | `devflow repo protect` 建 ruleset `devflow`（default branch 必須 `devflow-ci`，admin 可 bypass），成功才標 `contract=yes`；`[DEV]`/`[OPS]` 依此設 contract，否則 local-only，由 reviewer / devops 用 `gh` 核對 |
 | dispatcher 派出的 worker 寫入看板只能透過 `kanban_*` 工具；`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）與 `kanban list`（會重算 ready）在 worker 內被 Hermes 擋下 | orchestrator 在 `[EPIC]`/`[ADJ]` 不能改寫、封存、解除依賴或重跑別張卡；worker 內的 hook 也被擋 | orchestrator 留 `devflow-ops` 留言；default profile 的 `on_kanban_dispatch_tick` hook（在 gateway dispatcher 內，不受 worker 限制）由 `devflow tick` 執行。devflow 讀看板只用 `kanban show` |
 | 留言含 PR 網址的卡，dispatcher 24 小時內不重派（除非有交接事件）；unblock 不重設失敗計數 | 開過 PR 後 block / crash 的卡 unblock 了也不會跑 | `resume`（block → 取消指派 → 指派回原 Bot → unblock）：Hermes 聊天用 `devflow resume`，orchestrator 用 `devflow-ops` |
-| Codex app-server 用 ChatGPT 帳號，只接受 `model/list` 內的模型 | developer 用 `gpt-6.1-sol` 時每次 run 立即失敗 | developer `model.default` 固定 `gpt-6-astra` |
+| Codex app-server 的模型可用性依帳號與 runtime 而異 | 不支援的模型會令 developer run 失敗 | developer 預設 `gpt-6.1-sol`、推理強度 `high`；變更後核對 runtime 可用性 |
 
 ## 新 repo / 既有 repo
 跟 Hermes 說「幫 OWNER/REPO 做 X」或「開一個新專案 NAME 做 Y」。Hermes 會 `devflow repo add`（新專案加 `--create`）並建 EPIC；orchestrator 判斷需不需要接入 CI/CD（`[OPS]`）或骨架（`[ARCH]`→`[DEV]`）。

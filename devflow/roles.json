@@ -132,7 +132,8 @@
       "gh": "builder",
       "git_name": "hermes-developer",
       "config": {
-        "model.default": "gpt-6-astra",
+        "model.default": "gpt-6.1-sol",
+        "agent.reasoning_effort": "high",
         "model.openai_runtime": "codex_app_server",
         "model.codex_bin": "/opt/data/devflow/bin/codex-developer",
         "approvals.mode": "off"

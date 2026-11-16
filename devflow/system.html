@@ -286,7 +286,7 @@
           <text class="human" x="992" y="392">兩項通過才更新 live 標記</text><text class="human" x="992" y="416">未通過 → 先採證再回滾，run 失敗</text>
           <text class="human" x="992" y="492">部署證據，交回最終驗收</text><text class="tech" x="992" y="516">devflow-evidence-deploy-&lt;sha&gt;</text>
 
-          <text class="human" x="160" y="592">旁路證據：quality job 產生 CRAP／重複／mutation 報告，但不在 devflow-ci 的 needs 內，不是合併硬閘門。</text>
+          <text class="human" x="160" y="592">旁路證據：獨立的 quality workflow 產生 CRAP／重複／mutation 報告，不是 required check，不擋合併。</text>
           <text class="human" x="160" y="620">候選版本先 up 再驗證；這不是 blue-green、canary 或零停機部署承諾。</text>
           <line class="rule" x1="40" y1="660" x2="1240" y2="660"/>
           <line class="route" x1="40" y1="688" x2="80" y2="688"/><text class="human" x="92" y="692">受控交付方向</text>
@@ -369,6 +369,7 @@ EPIC completion metadata
           <tr><td>合併／卡片完成</td><td><code>repo protect</code> 建立 <code>devflow</code> ruleset，以 <code>devflow-ci</code> 為 required check；PR completion contract 核對 exact head。</td><td>需要成功接入並設置 contract；admin 可 bypass。獨立 reviewer 是角色流程要求，不代表所有 repo 都有平台強制的 required approval。</td></tr>
           <tr><td>計畫與 AC 判讀</td><td>規則加 Decisions API 檢查；變動才重新檢查，重複疑慮不重複建 ADV。逐條驗收由 orchestrator 對證據負責。</td><td>檢查工具出錯只記錄、不擋流程；模型判讀不是數學保證。程式碼中的失敗回傳與 GitHub required checks 才是相應的執行閘門。</td></tr>
           <tr><td>驗收涵蓋範圍</td><td>repo 專屬 <code>verify.sh</code> 必須由 developer 補入每條 AC journey；PR 與部署後共用，UI 用 Playwright。</td><td>範本預設只有 health。沒有 Dockerfile 的 PR 會略過 up／verify；沒有 AC journeys 就沒有完整使用者行為證據，CI 綠也不能補足。</td></tr>
+          <tr><td>規則與教訓</td><td>CI <code>check</code> job（在 <code>devflow-ci</code> 的 needs）：每條規則先用自帶的錯誤範例自測，再掃描程式；豁免必須引用存在的教訓，教訓的 ref 必須指到真實的規則或檔案。</td><td>規則是行為模式比對，不是語意分析。檢查程式在 repo 內，PR 可修改；目前靠 reviewer 擋放寬規則，CODEOWNERS／從 default branch 取檢查程式待治理階段。修正 PR 是否帶教訓尚未自動檢查。</td></tr>
           <tr><td>執行身分／網路</td><td>builder 與 reviewer 使用不同 GitHub 帳號；部署在主機 <code>devflow</code> 使用者的 rootless Docker，服務綁 <code>127.0.0.1</code>。</td><td>不是完整的權限隔離證明：兩帳號都有 push 權限，developer 的 git／gh 原生升權自動核准。任何有 push 權限的帳號都能在分支上寫 workflow 跑在 self-hosted runner，等同主機 <code>devflow</code> 使用者與共用 Docker 的權限；workflow 內的條件只防誤用。對外 proxy、TLS、DNS 不在範本契約內。</td></tr>
           <tr><td>回滾與資料</td><td>成功部署標記 <code>:live</code>，up、health 或 verify 失敗時先採證，再用它恢復應用映像。</td><td>沒有上一版就無法回滾。回滾只重驗 health，不還原資料庫、volume、schema 或環境設定。診斷 log 的遮罩是盡力而為，artifact 保留 7 天。</td></tr>
           <tr><td>供應鏈／發布</td><td>PR 與 VM 使用相同 compose 契約；CI quality 工具在 GitHub-hosted runner，以唯讀 token 與固定 commit 執行。</td><td>VM 會重新 build，尚非 build-once／promote-by-digest；也未定義映像簽章、來源證明、漸進發布或停機時間保證。</td></tr>
@@ -386,7 +387,7 @@ EPIC completion metadata
     </details>
     <details>
       <summary>模型與技能為什麼沒有放進主圖？</summary>
-      <p>角色責任與交付契約比模型名稱穩定。目前 <code>roles.json</code> 指定 developer 使用 Codex app-server 的 <code>gpt-6-astra</code>；reviewer／Advisor 使用 <code>claude-opus-5.5</code>，reviewer 有 Codex fallback。實際可用性取決於 provider 與登入帳號，這裡沒有連線驗證。技能分配請以角色表為準，模型切換不改變 AC 與證據責任。</p>
+      <p>角色責任與交付契約比模型名稱穩定。目前 <code>roles.json</code> 指定 developer 使用 Codex app-server 的 <code>gpt-6.1-sol</code>（推理強度 high）；reviewer／Advisor 使用 <code>claude-opus-5.5</code>，reviewer 有 Codex fallback。實際可用性取決於 provider、登入帳號與 Codex 版本。技能分配請以角色表為準，模型切換不改變 AC 與證據責任。</p>
     </details>
   </section>
 
@@ -399,6 +400,7 @@ EPIC completion metadata
       <a href="skills/devflow-orchestrate/SKILL.md">Orchestrator 契約</a>
       <a href="skills/devflow-review/SKILL.md">Reviewer 契約</a>
       <a href="templates/repo/.github/workflows/ci.yml">PR CI 範本</a>
+      <a href="templates/repo/.github/workflows/quality.yml">Quality workflow（不擋）</a>
       <a href="templates/repo/.github/workflows/deploy.yml">Deploy workflow</a>
       <a href="templates/repo/.devflow/deploy.sh">deploy.sh</a>
       <a href="templates/repo/.devflow/verify.sh">verify.sh</a>

@@ -1,0 +1,53 @@
+id = "no-skip-test"
+message = "不要跳過或聚焦測試：修好測試或刪掉已無意義的測試。暫時無法修（外部依賴故障）時，在這行或上一行加 `devflow: allow no-skip-test L-NNNN` 並寫教訓。"
+include = ["**/*.py", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.ts", "**/*.tsx", "**/*.go", "**/*.rs"]
+patterns = [
+  '@unittest\.(skip|skipIf|skipUnless|expectedFailure)\b',
+  '\bself\.skipTest\(',
+  '@pytest\.mark\.(skip|skipif|xfail)\b',
+  '\bpytest\.(skip|xfail)\(',
+  '\b(it|test|describe)\.(skip|only|fixme)\(',
+  '\b(xit|xdescribe|fit|fdescribe)\(',
+  '\bt\.Skip(Now|f)?\(',
+  '#\[ignore\]',
+]
+
+[[fixture]]
+path = "tests/test_api.py"
+text = "@unittest.skip('flaky')"
+expect = "fail"
+
+[[fixture]]
+path = "tests/test_api.py"
+text = "@pytest.mark.skip(reason='later')"
+expect = "fail"
+
+[[fixture]]
+path = ".devflow/ui/ac.spec.ts"
+text = "test.only('AC-1 shows total', async ({ page }) => {"
+expect = "fail"
+
+[[fixture]]
+path = "src/cart.test.ts"
+text = "it.skip('rounds', () => {"
+expect = "fail"
+
+[[fixture]]
+path = "store/db_test.go"
+text = "\tt.Skip(\"needs docker\")"
+expect = "fail"
+
+[[fixture]]
+path = "src/lib.rs"
+text = "#[ignore]"
+expect = "fail"
+
+[[fixture]]
+path = "tests/test_api.py"
+text = "    self.skipTest('no network')  # devflow: allow no-skip-test L-0003"
+expect = "pass"
+
+[[fixture]]
+path = ".devflow/ui/ac.spec.ts"
+text = "test('AC-1 shows total', async ({ page }) => {"
+expect = "pass"

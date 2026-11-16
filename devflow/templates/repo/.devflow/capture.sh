@@ -6,7 +6,7 @@
 #   since：docker logs --since 的值（RFC3339 時間或 30m 這類相對時間）；省略 = 容器全部 log
 # 不輸出 docker inspect 的 Config.Env（含部署秘密），只取 State / 映像 / 重啟次數。
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 0
 project=${1:-} label=${2:-} since=${3:-}
 if [[ ! $project =~ ^[a-z0-9][a-z0-9_.-]*$ || ! $label =~ ^[A-Za-z0-9._-]+$ || ! $since =~ ^[0-9A-Za-z:.+-]*$ ]]; then
   echo "capture: usage: capture.sh <compose project> <label> [since]" >&2

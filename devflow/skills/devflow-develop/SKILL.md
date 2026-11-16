@@ -31,8 +31,9 @@ metadata:
 - `verify.sh` 會在 PR CI（`.devflow/up.sh` 起服務）和部署後（Oracle VM）各跑一次，證據上傳成 artifact，最後由 orchestrator 逐條判定。不要寫只在本機能過的 journey。
 
 ## 4. 驗證
-- 跑 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）。Hermes 容器內沒有 Docker：映像建置、`verify.sh` 與部署驗證交給 CI。
-- 失敗就修根因，不刪測試、不 skip。
+- 跑 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）與 `bash .devflow/check.sh`（規則與教訓，CI 的必過 `check` job）。Hermes 容器內沒有 Docker：映像建置、`verify.sh` 與部署驗證交給 CI。
+- 失敗就修根因，不刪測試、不 skip、不加壓警告註解（這些都由 `check` 擋）。規則確實誤判時，才在該行或上一行加 `devflow: allow <rule-id> L-NNNN`，並在同一個 PR 新增那筆教訓。
+- 修 bug、修退件或處理部署失敗時，若同類錯誤可能再發生，新增教訓 `.devflow/lessons/L-NNNN.toml`（`id`、`title`、`event`＝PR／run／卡片連結、`root_cause`、`category`、`[enforcement] kind/ref`）。`kind` 依序優先：`rule`（新增 `.devflow/rules/<id>.toml`，附能重現這個錯誤的 `expect = "fail"` 範例）→ `test`／`journey`（`ref = "路徑::測試名"`）→ 都做不到才 `skill-only`（`reason` 寫為何無法自動檢查）。`check` 會驗證 ref 指到的東西真的存在。
 
 ## 5. PR
 ```bash
@@ -44,8 +45,8 @@ Kanban: <task-id>"
 gh pr checks --watch          # 等 CI；紅燈 → 修 → push → 再等
 ```
 - 等 CI 期間偶爾 `kanban_heartbeat`。repo 還沒有 CI workflow 時跳過等待，在 handoff 註明。
-- `ci.yml` 一定保留彙總 job `devflow-ci`（default branch 的 required check，也是 Hermes PR contract 的判定依據）；新增的 job 要加進它的 `needs`。`quality` job 例外：它只產生證據，不擋合併。
-- CI 綠後看 `quality`（ub-mode 的 Make it Right）：`gh run download <run> -n devflow-quality-<sha> -D /tmp/q-<task>`，讀 `crap.txt`（你改到的函式 CRAP ≥ 10 → 拆或補測試）、`dry.txt`（≥ 0.8 的重複 → 合併）、`mutate.txt`（uncovered 補測試、survivor 補斷言、死碼刪掉）。只處理這次改到的程式；舊程式的數字寫進 `followups`。repo 的 `ci.yml` 還沒有 `quality` job 就跳過。
+- `ci.yml` 一定保留彙總 job `devflow-ci`（default branch 的 required check，也是 Hermes PR contract 的判定依據）；新增的 job 要加進它的 `needs`。ub-mode 指標在獨立的 `quality.yml`，不要把它加進 `devflow-ci`。
+- CI 綠後看 `quality`（ub-mode 的 Make it Right）：`gh run download <run> -n devflow-quality-<sha> -D /tmp/q-<task>`，讀 `crap.txt`（你改到的函式 CRAP ≥ 10 → 拆或補測試）、`dry.txt`（≥ 0.8 的重複 → 合併）、`mutate.txt`（uncovered 補測試、survivor 補斷言、死碼刪掉）。只處理這次改到的程式；舊程式的數字寫進 `followups`。數字不是門檻，quality workflow 失敗也不擋送審。repo 還沒有 `quality.yml` 就跳過，在 `followups` 寫「升級 devflow 契約（quality）」。
 - `crap.txt` 全部 `Cov% 0.0` 或 `mutate.txt` 全是 UNCOVERED，通常是工具找不到這個 repo 的測試：加可執行的 `.devflow/coverage.sh`，用 repo 自己的測試指令產生 LCOV 到 `target/coverage/<語言>/lcov.info`（Go 是 `coverage.out`），`quality.sh` 會改讀它。
 - CI 的 `verify` job 失敗：`gh run view <id> --log-failed` 看哪條 AC 的 journey 失敗；`gh run download <id>` 取證據（截圖可直接看）與 `devflow-diagnostics-pr-<sha>`（容器狀態、退出碼、log）。修到綠。
 - CI 失敗修到綠；若是 runner/基礎設施問題（非程式碼），在 handoff 註明並照樣送 review，由 devops 處理。

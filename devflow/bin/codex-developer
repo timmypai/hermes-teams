@@ -10,7 +10,8 @@ export GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/devflow-dev-cache}"
 export npm_config_cache="$XDG_CACHE_HOME/npm" PIP_CACHE_DIR="$XDG_CACHE_HOME/pip" \
        UV_CACHE_DIR="$XDG_CACHE_HOME/uv" GOCACHE="$XDG_CACHE_HOME/go-build" GOPATH="$XDG_CACHE_HOME/go"
-CODEX="${DEVFLOW_CODEX_BIN:-/usr/local/bin/codex}"
+# Follow PATH so user-installed Codex updates are used; allow an explicit binary override.
+CODEX="${DEVFLOW_CODEX_BIN:-codex}"
 if [ "${1:-}" = "app-server" ]; then
   exec "$CODEX" "$@" -c sandbox_workspace_write.network_access=true
 fi

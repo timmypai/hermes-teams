@@ -39,13 +39,14 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定 AC、全程 tra
 | `.devflow/deploy.sh` | 部署 + 健康檢查 + verify + 失敗採證 + 回滾（通常不需改） |
 | `.devflow/capture.sh`、`.devflow/redact.py` | 唯讀採證：容器清單、`State`（退出碼、OOM、健康、重啟次數）、限時 log、健康探測、主機磁碟/記憶體；以 `deploy/.env` 的值與常見樣式遮罩秘密，遮罩失敗就刪 log |
 | `deploy/compose.yml` | 服務定義；`image: ${DEVFLOW_IMAGE}` + `build` |
-| `.github/workflows/ci.yml`、`deploy.yml`、`repro.yml` | CI / CD（都上傳證據 artifact）/ 除錯重現 |
+| `.devflow/check.sh`、`check.py`、`rules/*.toml`、`lessons/` | 必過的規則與教訓檢查（CI `check` job，在 `devflow-ci` 的 needs）：每條規則先用自己的錯誤範例自測，再掃描追蹤中的檔案；豁免必須引用存在的教訓 |
+| `.github/workflows/ci.yml`、`deploy.yml`、`repro.yml`、`quality.yml` | CI（`test`／`check`／`verify` → `devflow-ci`）/ CD（都上傳證據 artifact）/ 除錯重現 / ub-mode 指標（不擋） |
 
 在 worktree 套用：`devflow contract <slug> .`（只補缺的檔，不覆蓋；會填好 app 名稱與分配的埠；列出與目前範本不同的檔案，舊 repo 升級時對照範本手動合併，保留專案改動）。專案自己要有 `Dockerfile`。不需要部署的 repo 設 `DEVFLOW_DEPLOY=false`。repo 還沒有可腳本化的驗證方式時，用 `pstack:create-verification-skill` 的方法盤點，產物寫成 `.devflow/verify.sh`／`.devflow/ui/`。
 
 ## 3. 接入 repo（`[OPS]` 卡，或 Hermes 直接要求）
 1. `devflow repo add OWNER/REPO`（若尚未）：建 board、clone、設定 squash/自動刪分支、讓 builder 與 reviewer 都有 push 權限、分配埠、自動申請 self-hosted runner。
-2. 在 worktree：`devflow contract <slug> .`，依專案調整 `test.sh`、`Dockerfile`、`compose.yml`（容器埠、volume）。改部署相關腳本時，重跑一次或中途失敗後再跑都要得到同樣狀態（`pstack:principle-make-operations-idempotent`）。
+2. 在 worktree：`devflow contract <slug> .`，依專案調整 `test.sh`、`Dockerfile`、`compose.yml`（容器埠、volume）。既有 repo 第一次接入規則檢查：`bash .devflow/check.sh --write-baseline` 把現有違規記成舊債（之後只擋新增），commit `.devflow/rules/baseline.json`；不要用 baseline 收新寫的程式。專案自己的模組邊界規則照 `.devflow/rules/*.toml` 的格式加（附 `expect = "fail"` 與 `"pass"` 範例）。改部署相關腳本時，重跑一次或中途失敗後再跑都要得到同樣狀態（`pstack:principle-make-operations-idempotent`）。
 3. `devflow runner status OWNER/REPO` 應看到 github runner `online`；沒有就 `devflow runner request OWNER/REPO`（約 1 分鐘）。
 4. 走 PR（同 `devflow-develop` §5–6，`reviewer="reviewer"`）。
 

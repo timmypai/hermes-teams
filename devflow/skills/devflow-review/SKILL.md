@@ -21,14 +21,15 @@ metadata:
 ## 2. 驗
 - 跑 `.devflow/test.sh`（或 repo 慣用測試）。
 - 獨立探測（不提交）：依卡片的 AC 原文、不看 diff 決定要測什麼，自己寫一次性腳本或指令驗證關鍵行為與邊界；放在 worktree 外（`/tmp/review-<task>`），跑完刪掉，`git status` 必須乾淨。結果寫進結論 metadata 的 `probes`。
-- 看 CI 結果；CI 紅燈 = 退件（除非 handoff 已說明是 runner 問題且你確認與程式碼無關）。
+- 看 CI 結果；`ci.yml`（`devflow-ci`）紅燈 = 退件（除非 handoff 已說明是 runner 問題且你確認與程式碼無關）。`quality.yml` 失敗或數字差不算 CI 紅燈。
 - 看證據：`gh run download <CI run> -D /tmp/review-<task>/evidence`，每條 AC 對到 `verify.sh` 的 journey 輸出或 Playwright 截圖（用 vision 看圖，確認畫面真的顯示 AC 要的結果）。
 - 檢查（`code-review` 的 Standards + Spec 兩軸）：
   1. 每條 AC 都有對應實作、journey 與證據。缺 journey 或證據不足 → 退件，寫明要補哪條 AC 的 journey、要斷言什麼；由 developer 改 PR，你審新的 head。你不改 PR。
   2. 正確性與邊界條件；錯誤處理；讀者負擔（`pstack:principle-minimize-reader-load`）：一個概念散在多處、要跳很多檔案才看得懂、命名誤導 → 指出具體位置，影響正確理解才退件。
   3. 安全：秘密進 repo、注入、權限、`deploy/compose.yml` 對外綁定（應只綁 `127.0.0.1`）。
   4. 回歸與影響範圍（`pstack:blast-radius`）；測試是否測行為而非實作。
-  5. `ub-mode`（developer 在 Codex 用的同一份規則）的 Make it Right：根因修正而非遮蔽、測試測行為（「每個函式回傳空值測試還會過嗎？」）、重複與死碼。CI `quality` artifact（`devflow-quality-<sha>`：`crap.txt` / `dry.txt` / `mutate.txt`）是證據：改動的程式有存活 mutant 對應到 AC 行為、或 CRAP 很高又沒測試，才退件並指出哪個函式；數字本身不是門檻，舊程式的數字不擋。
+  5. `ub-mode`（developer 在 Codex 用的同一份規則）的 Make it Right：根因修正而非遮蔽、測試測行為（「每個函式回傳空值測試還會過嗎？」）、重複與死碼。這些由你讀程式判斷。CI `quality` artifact（`devflow-quality-<sha>`：`crap.txt` / `dry.txt` / `mutate.txt`）目前**只供參考、不卡**：不因 CRAP、重複分數或存活 mutant 退件；值得處理的寫進結論 metadata 的 `followups`（或 approve 留言），由 orchestrator 決定是否另開卡。
+  6. 規則與教訓（`check` job 已驗證格式、自測與 ref 存在；你判斷內容）：新增或修改的規則，它的 `expect = "fail"` 範例要真的代表這次的錯誤；PR 刪除或放寬既有規則、`baseline.json` 增加條目、新增 `devflow: allow` 豁免，卡片沒有明確授權就退件，寫明要還原哪一處。
 - 不為風格偏好退件。
 
 ## 3. 結論
