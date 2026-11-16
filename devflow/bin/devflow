@@ -608,25 +608,49 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
+# Hermes `_resume_status_from_events`: unblock lands in `review` when the newest of these events
+# carries a review status (the block was raised by a review-lane run).
+RESUME_EVENTS = {"blocked", "block_loop_detected", "dependency_wait", "gave_up", "unblocked",
+                 "changes_requested", "review_reopened", "status", "reclaimed", "stale", "timed_out",
+                 "crashed", "spawn_failed", "rate_limited"}
+
+
 def resume(board: str, task_id: str, note: str | None = None) -> str:
     """Re-run a blocked/held card. Hermes holds back a card for 24h once a comment carries a PR URL
     unless an assignee handoff follows, and unblock keeps the crash streak; an unassign/reassign is
-    that handoff and resets the streak, done while blocked so the dispatcher stays off the card."""
-    task = json.loads(kanban(board, "show", task_id, "--json"))["task"]
-    status, assignee = task["status"], task["assignee"]
+    that handoff and resets the streak, done while blocked so the dispatcher stays off the card.
+
+    A block raised in the review lane unblocks into `review`, and the review lane runs the assignee
+    with the reviewer-only `sdlc-review` skill: an implementer (rework after an [ADJ]) then dies with
+    `kanban_skills_unavailable` on every run. For that case the card is unblocked unassigned (the
+    review lane skips unassigned cards) and `reopen-review` moves it to the implementer's lane."""
+    d = json.loads(kanban(board, "show", task_id, "--json"))
+    status, assignee = d["task"]["status"], d["task"]["assignee"]
     if status not in ("blocked", "scheduled", "ready"):
         die(f"{task_id} is {status}; only blocked/scheduled/ready cards can be resumed")
     if not assignee:
         die(f"{task_id} has no assignee")
+    events = d["events"]
+    last = next((e["payload"] or {} for e in reversed(events) if e["kind"] in RESUME_EVENTS), {})
+    to_review = status == "blocked" and "review" in (last.get(k) for k in ("resume_status", "retry_status", "source_status"))
+    handoff = next((e["payload"] or {} for e in reversed(events) if e["kind"] == "review_requested"), {})
+    rework = to_review and handoff.get("implementer") == assignee
     if note:
         kanban(board, "comment", task_id, note)
         time.sleep(1.1)  # the guard needs the handoff strictly after the newest comment
     if status == "ready":
         kanban(board, "block", task_id, "devflow resume")
     kanban(board, "assign", task_id, "none")
-    kanban(board, "assign", task_id, assignee)
+    if not rework:
+        kanban(board, "assign", task_id, assignee)
+        kanban(board, "unblock", task_id)
+        return f"resumed {task_id} ({assignee})"
     kanban(board, "unblock", task_id)
-    return f"resumed {task_id} ({assignee})"
+    if json.loads(kanban(board, "show", task_id, "--json"))["task"]["status"] == "review":
+        kanban(board, "reopen-review", task_id)  # -> ready/todo, assignee = the implementer
+    if json.loads(kanban(board, "show", task_id, "--json"))["task"]["assignee"] != assignee:
+        kanban(board, "assign", task_id, assignee)
+    return f"resumed {task_id} ({assignee}, review -> implementer)"
 
 
 def apply_op(board: str, op: dict) -> str:
