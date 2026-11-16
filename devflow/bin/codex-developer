@@ -1,0 +1,17 @@
+#!/bin/sh
+# devflow developer Codex launcher (model.codex_bin of the developer profile).
+# - Own CODEX_HOME (developer's Codex auth + Hermes MCP registration).
+# - app-server: keep Hermes' workspace-write sandbox, only turn network on
+#   (git fetch/push, gh, package installs). Writes to .git need Codex's native
+#   escalation request; the developer profile's approvals.mode=off approves it.
+export CODEX_HOME="${DEVFLOW_CODEX_HOME:-/opt/data/profiles/developer/codex}"
+export GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0
+# Sandboxed commands cannot write $HOME; keep tool caches in /tmp.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/devflow-dev-cache}"
+export npm_config_cache="$XDG_CACHE_HOME/npm" PIP_CACHE_DIR="$XDG_CACHE_HOME/pip" \
+       UV_CACHE_DIR="$XDG_CACHE_HOME/uv" GOCACHE="$XDG_CACHE_HOME/go-build" GOPATH="$XDG_CACHE_HOME/go"
+CODEX="${DEVFLOW_CODEX_BIN:-/usr/local/bin/codex}"
+if [ "${1:-}" = "app-server" ]; then
+  exec "$CODEX" "$@" -c sandbox_workspace_write.network_access=true
+fi
+exec "$CODEX" "$@"

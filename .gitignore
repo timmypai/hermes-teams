@@ -15,3 +15,8 @@ reports/
 dist/
 build/
 *.egg-info/
+/backups/
+/devflow/state/
+/devflow/runner/
+/devflow/vendor/
+/devflow/roles/

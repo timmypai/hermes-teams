@@ -1,0 +1,102 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: test
+        run: bash .devflow/test.sh
+      - name: docker build
+        if: hashFiles('Dockerfile') != ''
+        run: docker build -t ci-check .
+
+  # Acceptance journeys against a running copy of the service (same compose file as deploy).
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: up
+        if: hashFiles('Dockerfile') != ''
+        run: bash .devflow/up.sh
+      - name: verify
+        if: hashFiles('Dockerfile') != ''
+        run: bash .devflow/verify.sh
+      - name: evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-evidence-pr-${{ github.sha }}
+          path: .devflow/evidence
+          if-no-files-found: ignore
+      # 失敗時採證（容器狀態、退出原因、log；已遮罩），與 AC 證據分開存、只留 7 天。
+      - name: diagnostics
+        if: failure() && hashFiles('Dockerfile') != ''
+        run: |
+          . .devflow/config.env
+          bash .devflow/capture.sh "ci-${DEVFLOW_APP}" ci
+      - name: upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devflow-diagnostics-pr-${{ github.sha }}
+          path: .devflow/diagnostics
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ub-mode metrics (crapper / dryer / mutator, pinned). Third-party tools run only here, on a
+  # GitHub-hosted runner with a read-only token, never in the Hermes container.
+  # Evidence only: deliberately NOT in devflow-ci `needs`, so it never blocks a merge.
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: unclebob tools
+        run: |
+          for t in crapper:c757ec79a6c15dc815238bbd9c2f4601eb54d3cc \
+                   dryer:66ff6d21a42c04afcad89c78a80066176d1294b0 \
+                   mutator:830ec7e9c39664d753f8699015bc796df67727b9; do
+            d="$RUNNER_TEMP/ub/${t%%:*}"
+            git init -q "$d"
+            git -C "$d" fetch -q --depth 1 "https://github.com/unclebob/${t%%:*}" "${t#*:}"
+            git -C "$d" checkout -q FETCH_HEAD
+            "$d/${t%%:*}" --help >/dev/null   # first run creates the tool's .venv
+          done
+      - name: quality
+        env:
+          UB_TOOLS: ${{ runner.temp }}/ub
+          QUALITY_BASE: origin/${{ github.base_ref || github.event.repository.default_branch }}
+        run: bash .devflow/quality.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: devflow-quality-${{ github.sha }}
+          path: .metrics
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  # Required check on the default branch (devflow repo protect) and the Hermes PR
+  # completion_contract gate. Keep this job name; list every other job except `quality` in `needs`.
+  devflow-ci:
+    if: always()
+    needs: [test, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: all jobs passed
+        run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false
