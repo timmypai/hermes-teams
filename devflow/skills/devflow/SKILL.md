@@ -75,7 +75,9 @@ metadata:
 | 指令 | 用途 |
 |---|---|
 | `devflow repo list` | 已接入的 repo / board |
-| `devflow repo add OWNER/REPO [--create] [--public] [--no-runner]` | 建 board + clone + 設定 builder/reviewer 權限 + 分配埠 + 申請 runner（`--create` 先建 GitHub repo） |
+| `devflow repo add OWNER/REPO [--create] [--public] [--no-runner]` | 建 board + clone + 設定 builder/reviewer 權限 + 分配埠 + 綁定 Hermes 專案 + 申請 runner（`--create` 先建 GitHub repo） |
+| `devflow repo bind SLUG` | 只做專案綁定（冪等）：沿用主路徑 = clone 的專案或新建，寫入看板 `project_id` 與專案 `board_slug`；有衝突就停止不改 |
+| `devflow repo doctor [SLUG]` | 唯讀檢查專案 ↔ 看板 ↔ repo 綁定；不一致時 exit 1 |
 | `devflow repo sync SLUG` | 主 checkout fetch + 快轉到 origin 預設分支 |
 | `devflow repo path SLUG` | 印出主 checkout 路徑 |
 | `devflow contract SLUG [DIR] [--ui]` | 把 devflow repo 契約檔（CI/CD、deploy、test、verify；`--ui` 加 Playwright）補進 DIR，不覆蓋既有檔，列出與範本不同的檔 |

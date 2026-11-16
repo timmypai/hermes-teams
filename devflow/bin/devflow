@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ GH_DIRS = ROLES["gh"]
 PORT_BASE = 18100
 CODEX_CONFIG = DATA / "profiles" / "developer" / "codex" / "config.toml"
 HERMES = shutil.which("hermes") or "/opt/hermes/bin/hermes"
+HERMES_PY = os.environ.get("DEVFLOW_HERMES_PY", "/opt/hermes/.venv/bin/python")
 
 
 def die(msg: str) -> None:
@@ -46,7 +48,7 @@ def run(cmd: list[str], *, gh: str | None = None, check: bool = True, cwd: str |
     env = dict(os.environ)
     if gh:
         env["GH_CONFIG_DIR"] = GH_DIRS[gh]
-    if cmd[0] == HERMES:
+    if cmd[0] in (HERMES, HERMES_PY):
         # Board admin always targets the shared root kanban, never a worker's pinned board.
         env = {k: v for k, v in env.items() if not k.startswith("HERMES_KANBAN")}
         env["HERMES_HOME"] = str(DATA)
@@ -183,6 +185,7 @@ def cmd_repo_add(a) -> None:
                        "default_branch": default_branch, "private": info.get("isPrivate"),
                        "added_at": existing.get("added_at") if existing else int(time.time())}
         save_state(state)
+    project = bind_project(slug)
     contract = protect_repo(slug)
     if a.no_runner:
         runner = "skipped (--no-runner)"
@@ -190,7 +193,126 @@ def cmd_repo_add(a) -> None:
         runner = "already registered"
     else:
         runner = request_runner(repo)
-    print(json.dumps({**entry(slug), **contract, "notes": notes, "runner": runner}, ensure_ascii=False, indent=2))
+    print(json.dumps({**entry(slug), **contract, "project": project, "notes": notes, "runner": runner},
+                     ensure_ascii=False, indent=2))
+
+
+# One project <-> one board <-> one repo. Hermes keeps the link twice: board.json `project_id` (what the
+# Kanban API, Mobile and voice read) and projects.db `board_slug`. Binding touches only those two.
+
+def repo_key(url: str) -> str | None:
+    m = re.search(r"github\.com[:/]+([^/]+/[^/]+?)(?:\.git)?/?$", url.strip())
+    return m.group(1).lower() if m else None
+
+
+def folder_repo(path: str) -> str | None:
+    p = run(["git", "-C", path, "remote", "get-url", "origin"], check=False)
+    return repo_key(p.stdout) if p.returncode == 0 else None
+
+
+def root_projects() -> list[dict]:
+    """Active projects of the root profile (the one Mobile and the dashboard use), read-only."""
+    db = DATA / "projects.db"
+    if not db.exists():
+        return []
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+        c.row_factory = sqlite3.Row
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, slug, name, board_slug, primary_path FROM projects WHERE COALESCE(archived, 0) = 0")]
+        for r in rows:
+            r["folders"] = [f[0] for f in c.execute("SELECT path FROM project_folders WHERE project_id = ?", (r["id"],))]
+    return rows
+
+
+def board_project_id(slug: str) -> str | None:
+    meta = BOARDS / slug / "board.json"
+    return (json.loads(meta.read_text()).get("project_id") or None) if meta.exists() else None
+
+
+def create_project(slug: str, repo: str, path: str) -> None:
+    run([HERMES, "project", "create", slug, path, "--slug", slug, "--description", f"GitHub: {repo}",
+         "--board", slug])
+
+
+def bind_board(project_slug: str, slug: str) -> None:
+    run([HERMES, "project", "bind-board", project_slug, slug])
+
+
+def set_board_project(slug: str, project_id: str) -> None:
+    # No CLI writes board.json project_id; use Hermes' own writer (what PATCH /boards uses).
+    run([HERMES_PY, "-c", "import sys; from hermes_cli import kanban_db as kb; "
+         "kb.write_board_metadata(sys.argv[1], project_id=sys.argv[2])", slug, project_id])
+
+
+def binding_plan(slug: str) -> tuple[dict | None, list[str], list[str]]:
+    """(project, actions to take, problems). Problems mean: change nothing, a person decides."""
+    e = entry(slug)
+    path, repo = str(Path(e["path"])), e["repo"].lower()
+    board_pid = board_project_id(slug)
+    projects = root_projects()
+    matches = [p for p in projects
+               if p["board_slug"] == slug or p["id"] == board_pid
+               or path in p["folders"] or any(folder_repo(f) == repo for f in p["folders"])]
+    if len(matches) > 1:
+        return None, [], ["多個專案對應此 repo/看板：" + ", ".join(f"{p['slug']}({p['id']})" for p in matches)]
+    if not matches:
+        if board_pid:
+            return None, [], [f"看板 project_id={board_pid} 不是有效的現役專案"]
+        return None, ["create"], []
+    p = matches[0]
+    problems = []
+    if p["primary_path"] != path:
+        problems.append(f"專案 {p['slug']} 的主路徑 {p['primary_path']!r} 不是 devflow clone {path!r}")
+    if p["board_slug"] not in (None, "", slug):
+        problems.append(f"專案 {p['slug']} 已綁看板 {p['board_slug']!r}")
+    if board_pid not in (None, p["id"]):
+        problems.append(f"看板 project_id={board_pid} 與專案 {p['id']} 不符")
+    if problems:
+        return p, [], problems
+    actions = [a for a, missing in (("bind-board", p["board_slug"] != slug), ("set-board-project", board_pid != p["id"]))
+               if missing]
+    return p, actions, []
+
+
+def bind_project(slug: str) -> dict:
+    """Match or create the root-profile project for a devflow board and write both links. Idempotent.
+    Never moves an existing project's primary path or steals a binding; those stop with a reason."""
+    e = entry(slug)
+    project, actions, problems = binding_plan(slug)
+    if problems:
+        die("專案綁定停止（未做任何變更）：" + "；".join(problems))
+    if "create" in actions:
+        create_project(slug, e["repo"], str(Path(e["path"])))
+        project, actions, problems = binding_plan(slug)
+        if problems or project is None:
+            die("建立專案後仍無法綁定：" + "；".join(problems or ["找不到新專案"]))
+        actions = ["create", *actions]
+    if "bind-board" in actions:
+        bind_board(project["slug"], slug)
+    if "set-board-project" in actions:
+        set_board_project(slug, project["id"])
+    _, left, problems = binding_plan(slug)
+    if left or problems:
+        die(f"綁定寫入後驗證失敗：未完成 {left}，問題 {problems}")
+    return {"id": project["id"], "slug": project["slug"], "actions": actions}
+
+
+def cmd_repo_bind(a) -> None:
+    print(json.dumps({"slug": entry(a.slug)["slug"], "project": bind_project(entry(a.slug)["slug"])},
+                     ensure_ascii=False))
+
+
+def cmd_repo_doctor(a) -> None:
+    """Read-only: report each board's project binding; exit 1 when anything needs a write or a person."""
+    bad = False
+    for slug in [entry(a.slug)["slug"]] if a.slug else list(load_state()):
+        project, actions, problems = binding_plan(slug)
+        state = "ok" if not actions and not problems else ("stop" if problems else "needs-bind")
+        bad |= state != "ok"
+        print(json.dumps({"slug": slug, "state": state, "project": project and project["id"],
+                          "actions": actions, "problems": problems}, ensure_ascii=False))
+    if bad:
+        sys.exit(1)
 
 
 CI_GATE = "devflow-ci"
@@ -1146,6 +1268,10 @@ def main() -> None:
     p = repo.add_parser("sync"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_sync)
     p = repo.add_parser("protect", help="require devflow-ci on the default branch (enables PR completion_contract)")
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_protect)
+    p = repo.add_parser("bind", help="match or create the board's project and write both links (idempotent)")
+    p.add_argument("slug"); p.set_defaults(fn=cmd_repo_bind)
+    p = repo.add_parser("doctor", help="read-only: check project <-> board <-> repo bindings")
+    p.add_argument("slug", nargs="?"); p.set_defaults(fn=cmd_repo_doctor)
     p = sub.add_parser("contract", help="copy missing devflow contract files into DIR")
     p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")
     p.add_argument("--ui", action="store_true", help="also add the Playwright UI journey scaffold (.devflow/ui)")

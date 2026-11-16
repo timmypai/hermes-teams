@@ -75,6 +75,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - repo 契約：`templates/repo/`（`devflow contract <slug> . [--ui]` 補進 repo，列出與範本不同的檔供既有 repo 升級）。契約合併後 devops 跑 `devflow repo protect <slug>`，之後 PR 卡由 Hermes 原生 contract 強制 exact-head CI 全綠才能完成。
 - Runner：`devflow repo add` 自動申請（`--no-runner` 跳過）；手動補 `devflow runner request OWNER/REPO`。請求放在 `/opt/data/devflow/runner/requests/`，主機 `devflow-runner-requests.path` 觸發 `runner-host.sh` 註冊並啟動 `devflow-runner@<owner>__<repo>`（user systemd），狀態看 `devflow runner status OWNER/REPO`。
 - 服務只綁 `127.0.0.1:<port>`（`devflow repo add` 分配，從 18100 起）。
+- 專案綁定：一個 Hermes 專案（根 profile）↔ 一個看板 ↔ 一個 repo。`devflow repo add` 呼叫 `repo bind`：找主路徑就是 clone 的專案沿用，沒有就新建，再寫看板 `board.json` 的 `project_id`（Kanban API、Mobile、語音讀這個）與專案的 `board_slug`。同 remote 的專案在別的路徑、專案已綁別的看板、多個候選、看板指向已封存專案時一律停止、不做變更，由人處理。`devflow repo doctor` 唯讀檢查。
 
 ## 身分與權限
 - GitHub：builder = devops/gh 帳號（hermes、orchestrator、researcher、architect、developer、devops）；reviewer = reviewer/gh 帳號。`devflow repo add` 會讓兩個帳號都有 push 權限。
