@@ -32,12 +32,14 @@ args=()
 if [[ -n $grep ]]; then args+=(--grep "^$grep" --pass-with-no-tests); fi
 [[ -z ${DEVFLOW_TRACE:-} ]] || args+=(--trace on)
 # 容器以 root 跑：結束前把 /evidence 與 npm 可能新建的 package-lock.json 交還主機使用者（不論測試成敗），
-# self-hosted runner 下次才清得掉。
+# self-hosted runner 下次才清得掉。交還給「掛載點在容器內看到的擁有者」（主機上建的目錄）：rootful Docker
+# 下是主機 uid；rootless Docker 下容器 root 已對應主機使用者，看到的是 0。不能傳主機的 $(id -u) 進去，
+# rootless 下容器 uid 1008 會對應到 subuid 範圍的另一個主機 uid，runner 反而寫不了自己的證據目錄。
 docker run --rm --ipc=host --network "${DEVFLOW_NET:?}" \
   -e BASE_URL="${DEVFLOW_INNER_URL:?}" -e CI=1 -e DEVFLOW_EVENTS=/evidence/scenario-events.jsonl \
-  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   -v "$PWD/.devflow/ui:/ui" -v /ui/node_modules -v "$E:/evidence" -w /ui \
   "mcr.microsoft.com/playwright:v${v}-noble" \
   bash -c 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi >/dev/null && npx playwright test "$@"
-    rc=$?; chown -R "$HOST_UID:$HOST_GID" /evidence; [ ! -f package-lock.json ] || chown "$HOST_UID:$HOST_GID" package-lock.json; exit $rc' \
+    rc=$?; owner=$(stat -c %u:%g /evidence); chown -R "$owner" /evidence
+    [ ! -f package-lock.json ] || chown "$(stat -c %u:%g /ui)" package-lock.json; exit $rc' \
   playwright "${args[@]}"
