@@ -33,7 +33,11 @@ metadata:
 ## 4. 驗證
 - 跑 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）與 `bash .devflow/check.sh`（規則與教訓，CI 的必過 `check` job）。Hermes 容器內沒有 Docker：映像建置、`verify.sh` 與部署驗證交給 CI。
 - 失敗就修根因，不刪測試、不 skip、不加壓警告註解（這些都由 `check` 擋）。規則確實誤判時，才在該行或上一行加 `devflow: allow <rule-id> L-NNNN`，並在同一個 PR 新增那筆教訓。
-- 修 bug、修退件或處理部署失敗時，若同類錯誤可能再發生，新增教訓 `.devflow/lessons/L-NNNN.toml`（`id`、`title`、`event`＝PR／run／卡片連結、`root_cause`、`category`、`[enforcement] kind/ref`）。`kind` 依序優先：`rule`（新增 `.devflow/rules/<id>.toml`，附能重現這個錯誤的 `expect = "fail"` 範例）→ `test`／`journey`（`ref = "路徑::測試名"`）→ 都做不到才 `skill-only`（`reason` 寫為何無法自動檢查）。`check` 會驗證 ref 指到的東西真的存在。
+- 修 bug、修退件或處理部署失敗時，若同類錯誤可能再發生，新增教訓 `.devflow/lessons/L-NNNN.toml`（`id`、`title`、`event`＝PR／run／卡片連結、`root_cause`、`category` 為 `code-pattern`／`architecture`／`verification`／`process`／`kit` 之一、`[enforcement] kind/ref`）。選最能擋住**這個錯誤的語意**的方式：
+  - `rule`：錯誤在**單一行**就看得出來（禁用的呼叫、匯入、註解、設定值）。新增 `.devflow/rules/<id>.toml`，附 `expect = "fail"`（這次的錯誤那一行）與 `"pass"` 範例。規則逐行比對，不能跨行，不懂語意；範例先跑 `bash .devflow/check.sh` 確認自測通過。
+  - `test`／`journey`（`ref = "路徑::測試名"`）：要看行為或跨行結構才知道錯（權限、資料流、錯誤處理、時序）。寫回歸測試或 AC journey，例如「沒有權限的使用者呼叫 X 會得到 403」。這類錯誤不要寫成正規表示式規則。
+  - `skill-only`：上面都做不到才用，`reason` 寫為何無法自動檢查。
+  `check` 會驗證 ref 指到的東西真的存在。
 
 ## 5. PR
 ```bash
