@@ -30,6 +30,7 @@ metadata:
   4. 回歸與影響範圍（`pstack:blast-radius`）；測試是否測行為而非實作。
   5. `ub-mode`（developer 在 Codex 用的同一份規則）的 Make it Right：根因修正而非遮蔽、測試測行為（「每個函式回傳空值測試還會過嗎？」）、重複與死碼。這些由你讀程式判斷。CI `quality` artifact（`devflow-quality-<sha>`：`crap.txt` / `dry.txt` / `mutate.txt`）目前**只供參考、不卡**：不因 CRAP、重複分數或存活 mutant 退件；值得處理的寫進結論 metadata 的 `followups`（或 approve 留言），由 orchestrator 決定是否另開卡。
   6. 規則與教訓（`check` job 已驗證格式、自測、ref 存在，並在 PR 上證明新教訓抓得到修正前的程式；你判斷內容）：新增或修改的規則，它的 `expect = "fail"` 範例要真的代表這次的錯誤；PR 刪除或放寬既有規則、`baseline.json` 增加條目、新增 `devflow: allow` 豁免，卡片沒有明確授權就退件，寫明要還原哪一處。PR 說明的 `No-lesson:`／`No-proof:` 理由不成立（同類錯誤顯然會再犯、錯誤其實就在這個 PR 修）→ 退件；修 bug 卻不用 `fix:` 標題來避開 lesson gate → 退件。
+  7. 自動判斷：`devflow check pr <slug> <pr>`（在 Hermes 主機跑，PR 改不到；結果依 head + 說明快取）。`findings` 列出 PR 改到的 gate 檔案（`check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、刪除教訓）與 Decisions 標出的疑慮（`unlabeled_fix` 修 bug 沒標 `fix:`、`weak_exemption` `No-lesson`/`No-proof` 理由不成立、`lesson_mismatch` 教訓沒對準這次的錯）。每一項在結論裡寫成立或不成立與理由；成立就退件。這些疑慮另外會開 `[ADV]` 卡給 advisor，advisor 回 `ok` 前 devops 不會合併，所以你的 approve 不會讓它跳過。
 - 不為風格偏好退件。
 
 ## 3. 結論

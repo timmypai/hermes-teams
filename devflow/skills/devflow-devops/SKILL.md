@@ -55,7 +55,11 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定 AC、全程 tra
 2. `gh pr view N --json state,mergeable,headRefOid,statusCheckRollup,mergeCommit`
    - 已 merged → 跳到 4。
    - CI 紅或有衝突 → 見 §5。
-3. `gh pr merge N --squash`；取得 `mergeCommit.oid`。
+3. `devflow ship merge <slug> N`（不要直接 `gh pr merge`：default branch 要求 `devflow-judgment` 檢查，只有這個指令會在判斷通過後寫入）。它重新判斷 PR 目前的 head + 說明，然後 squash merge 那個 head。結束碼：
+   - `0`：已合併，輸出 `merged_sha`。
+   - `3`：有疑慮，等 `[ADV]` advisor 結論 → `kanban_block(reason="devflow ship merge：等 advisor 判斷 PR #N")`。tick 會建或連結 `[ADV]`，advisor 完成後自動重跑本卡；重跑時從這一步開始。
+   - `4`：advisor 回 `revise`（或沒寫 verdict）→ 照第 1 步「未出貨」完成本卡。
+   - `1`：其他錯誤（Decisions API 失敗、PR 在判斷後被修改、merge 被拒）→ 看訊息；API 失敗等 1 分鐘重跑，最多 3 次，仍失敗就 `kanban_block(kind="needs_input", reason=...)`；PR 被修改就直接重跑。
 4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：先 `devflow runner status <repo>` 確認 runner online（不在就 `devflow runner request`），再追部署：
    ```bash
    gh run list --workflow deploy.yml --commit <sha> --json databaseId,status,conclusion,url   # 剛 merge 可能要等幾秒才出現

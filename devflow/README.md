@@ -66,7 +66,8 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - 豁免：該行或上一行 `devflow: allow <rule-id> L-NNNN`，L-NNNN 必須是存在的教訓。既有 repo 接入時 `check.sh --write-baseline` 記錄舊違規（以規則＋路徑＋該行內容比對），之後只擋新增。
 - 教訓 `.devflow/lessons/L-NNNN.toml`：事件、根因、分類、由什麼擋（`rule`／`test`／`journey`／`template`／`cli`／`skill-only`）；`check` 驗證 ref 指到的規則或檔案確實存在，`skill-only` 必須寫理由。
 - PR 的 lesson gate（`check.py --pr`，`check` job 的一步）：標題 `fix:`／`revert:` 的 PR，說明必須有 `Lesson: L-NNNN` 或 `No-lesson: <理由>`；引用 base 已存在的教訓（同一根因再出現）時，必須在這個 PR 更新那筆教訓；這個 PR 新增的教訓要證明抓得到修正前的程式：`rule` 必須在改動檔案的 base 版本上報錯；`test`（`ref = "路徑::測試名"`）連同 PR 的 `.devflow/test.sh` 放到 base 上，只跑那個測試檔（`DEVFLOW_TEST_ONLY`），從 JUnit 結果（`DEVFLOW_JUNIT`）判定：那條測試在 base 必須是斷言失敗（`<failure>`；error、skip、因匯入或收集錯誤沒跑到都不算），在 PR 上必須通過。範本 `test.sh` 的 pytest 分支已支援；其他技術棧要自己加 JUnit 輸出，否則無法證明。`journey` 不做自動證明；`No-proof: <理由>` 跳過證明，由 reviewer 判斷。PR 說明修改會重跑 CI（`pull_request` 加了 `edited`）。
-- 限制：`check` 程式與規則都在 repo 內，PR 能修改它們；目前靠 reviewer 擋放寬規則與不成立的 `No-lesson`／`No-proof`，以及把修 bug 標成非 `fix:` 來避開 gate。要做成權限關卡（只有人能核准放寬），核准者必須是 agent 拿不到 token 的帳號：目前 builder agent 用的是 repo owner 帳號（admin，`devflow` ruleset 允許 admin bypass），reviewer agent 用另一個帳號且平常就會 approve，所以兩者都不能當核准者，需先把 agent 帳號與人的帳號分開。
+- PR 判斷（Hermes 主機上的 `devflow`，PR 改不到）：`check` 程式、規則與 `ci.yml` 都在 repo 內，CI 跑的是 PR 自己的版本，而且 gate 判斷不了語意。所以另外判斷：PR 改到 gate 檔案（`.devflow/check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、刪除教訓）一律列為疑慮；Decisions API 問三題：`unlabeled_fix`（修 bug 沒標 `fix:`）、`weak_exemption`（`No-lesson`/`No-proof` 理由不成立）、`lesson_mismatch`（教訓沒對準這次的錯，含不會自動證明的 `journey`），機率 ≥ `flag` 算疑慮。判定綁在 PR head + 標題 + 說明上（`state/pr-judgments.json`）。有疑慮就開 `[ADV]`（Opus）並設為 `[SHIP]` 的 parent。擋合併靠合併入口而不是非同步的 tick：`devflow ship merge` 當場判斷，API 失敗、沒有 advisor `ok`、判斷後 PR 被改都拒絕；通過才寫入 `devflow-judgment` commit status，再用 `--match-head-commit` 合併。`devflow repo protect` 把 `devflow-judgment` 設為必過檢查並移除 admin bypass，所以直接 `gh pr merge` 會被 GitHub 拒絕。dispatcher tick 對 review 欄的 PR 提早判斷，讓 advisor 通常在出貨前就看完。模型只負責把 PR 送去 advisor，不負責放行。
+- 限制：寫入 `devflow-judgment` 用的是 builder token，agent 也拿得到，所以擋得住忘記檢查與搶在判斷前合併，擋不住刻意偽造。要做成權限關卡（只有人能核准放寬），核准者必須是 agent 拿不到 token 的帳號：目前 builder agent 用的是 repo owner 帳號，reviewer agent 用另一個帳號且平常就會 approve，所以兩者都不能當核准者，需先把 agent 帳號與人的帳號分開。
 - devflow 本身的檢查：repo 根目錄 `.github/workflows/devflow-kit.yml`（範本腳本 shellcheck、範本 workflow actionlint、`devflow/tests/` 檢查器單元測試、`devflow/tests/deploy_scenarios.sh` 以一次性 Docker 跑範本 `deploy.sh` 的四情境：成功上線、build 失敗不動執行中版本、health 失敗與 verify 失敗都採證後回滾到 `:live`）。
 
 **信任邊界**：workflow YAML 的條件（`if`、`environment`、`concurrency`）只防誤用，不是安全邊界。有任一 devflow repo push 權限的帳號，都能在分支上寫 workflow 跑在 `[self-hosted, devflow]` runner，等同主機 `devflow` 使用者與其 rootless Docker 的權限；所有 repo 共用這個使用者與 Docker daemon。要收斂需另做主機隔離（每個 repo 獨立使用者與 Docker，或組織層級 runner group 限定 workflow）。
@@ -100,7 +101,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | `roles.json` | 角色、技能分配、設定 |
 | `souls/` | 各 Bot SOUL（install 時寫入 `<profile>/SOUL.md` 的 devflow 區塊） |
 | `skills/` | devflow 團隊技能 |
-| `bin/devflow` | repo / board / contract / runner / check plan / check acceptance / tick CLI |
+| `bin/devflow` | repo / board / contract / runner / check plan / check acceptance / check pr / ship merge / tick CLI |
 | `bin/codex-developer` | developer 的 Codex 啟動器 |
 | `codex/AGENTS.md` | developer Codex 全域指示 |
 | `gitconfig` | 所有 Bot 共用的 git 設定（`GIT_CONFIG_GLOBAL`，經 `gh auth git-credential` 取憑證） |

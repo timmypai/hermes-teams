@@ -240,6 +240,7 @@ class PrGate(PrRepo):
         self.write("app/calc.py", "import ast\n\ndef parse(x):\n    return ast.literal_eval(x)\n")
         code, out = self.gate("fix: parse without eval", "Lesson: L-0002")
         self.assertEqual(code, 0, out)
+        self.assertIn("PROOF .devflow/lessons/L-0002.toml: rule no-eval fires on the pre-fix (BASE) version of app/calc.py", out)
 
     def test_rule_lesson_that_misses_the_pre_fix_code_fails(self) -> None:
         self.write(".devflow/rules/no-exec.toml", RULE_NO_EVAL.replace("no-eval", "no-exec")
@@ -256,6 +257,8 @@ class PrGate(PrRepo):
         self.fix_add_with_test()
         code, out = self.gate("fix: add returns the sum", "Lesson: L-0003")
         self.assertEqual(code, 0, out)
+        self.assertIn("PROOF .devflow/lessons/L-0003.toml: test tests/test_calc.py::test_adds: "
+                      "BASE failure x1; this PR passed x1", out)
 
     def test_test_lesson_that_passes_on_the_pre_fix_code_fails(self) -> None:
         self.fix_add_with_test(ADD_TEST.replace("self.assertEqual(add(2, 3), 5)", "self.assertTrue(True)"))
