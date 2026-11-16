@@ -204,7 +204,7 @@
           <g>
             <rect class="paper" x="648" y="272" width="176" height="96" rx="6"/><rect class="node" x="648" y="272" width="176" height="96" rx="6"/>
             <rect class="tag" x="660" y="284" width="40" height="16" rx="2"/><text class="tag-text" x="680" y="295" text-anchor="middle">[DEV]</text>
-            <text class="name" x="664" y="321">Developer</text><text class="tech" x="664" y="341">Codex app-server / worktree</text><text class="human" x="664" y="358">實作、測試、AC journeys</text>
+            <text class="name" x="664" y="321">Developer</text><text class="tech" x="664" y="341">Codex app-server / worktree</text><text class="human" x="664" y="358">先寫情境、實作、測試</text>
           </g>
           <g>
             <rect class="paper" x="1016" y="272" width="192" height="96" rx="6"/><rect class="node" x="1016" y="272" width="192" height="96" rx="6"/>
@@ -235,7 +235,7 @@
   </section>
 
   <section id="delivery" aria-labelledby="delivery-heading">
-    <div class="section-head"><span class="section-no">02</span><h2 id="delivery-heading">交付路徑：同一套 journeys，部署前後各驗一次</h2></div>
+    <div class="section-head"><span class="section-no">02</span><h2 id="delivery-heading">交付路徑：同一套情境，PR 紅綠、整合全跑、部署 smoke</h2></div>
     <p class="section-intro">以下是具備 Dockerfile、啟用部署且已接入 devflow 契約的服務路徑。PR 驗證環境與 VM 正式執行環境分開；不是把 CI 建出的同一份映像直接晉升。</p>
     <figure>
       <div class="diagram-container" tabindex="0" role="region" aria-label="CI/CD 階段圖，可左右捲動">
@@ -267,9 +267,9 @@
           <path class="rule" d="M160 252 H400 M160 352 H400 M160 452 H400 M432 252 H672 M432 352 H672 M432 452 H672 M704 252 H944 M704 352 H944 M704 452 H944 M976 252 H1216 M976 352 H1216 M976 452 H1216"/>
           <!-- Stable semantic slots: actor/location, input, control, primary output. -->
           <text class="name" x="176" y="192">GitHub-hosted runner</text><text class="tech" x="176" y="216">ubuntu-latest</text>
-          <text class="human" x="176" y="292">PR 變更與 AC journeys</text><text class="tech" x="176" y="316">test.sh / up.sh / verify.sh</text>
-          <text class="human" x="176" y="392">test 與 verify 平行執行</text><text class="tech" x="176" y="416">devflow-ci needs: [test, verify]</text>
-          <text class="human" x="176" y="492">PR 驗收證據</text><text class="tech" x="176" y="516">devflow-evidence-pr-&lt;sha&gt;</text>
+          <text class="human" x="176" y="292">PR 變更與 Given/When/Then 情境</text><text class="tech" x="176" y="316">verify.sh / verify-base.sh</text>
+          <text class="human" x="176" y="392">test、check、verify、verify-base 平行</text><text class="tech" x="176" y="416">devflow-ci needs 全部</text>
+          <text class="human" x="176" y="492">PR 驗收證據（head + base）</text><text class="tech" x="176" y="516">devflow-evidence-pr|base-&lt;sha&gt;-&lt;attempt&gt;</text>
 
           <text class="name" x="448" y="192">DevOps / GitHub</text><text class="tech" x="448" y="216">[SHIP] / builder identity</text>
           <text class="human" x="448" y="292">已審查 PR 與目前 head</text><text class="tech" x="448" y="316">approval + required checks</text>
@@ -281,10 +281,10 @@
           <text class="human" x="720" y="392">rootless Docker；主機重新建置</text><text class="tech" x="720" y="416">compose build --pull / up -d</text>
           <text class="human" x="720" y="492">已啟動的候選版本</text><text class="tech" x="720" y="516">127.0.0.1:&lt;allocated-port&gt;</text>
 
-          <text class="name" x="992" y="192">同一 VM / deploy.sh</text><text class="tech" x="992" y="216">health + verify.sh</text>
-          <text class="human" x="992" y="292">候選服務與相同 AC journeys</text><text class="tech" x="992" y="316">DEVFLOW_BASE_URL / Playwright</text>
+          <text class="name" x="992" y="192">同一 VM / deploy.sh</text><text class="tech" x="992" y="216">health + smoke 情境</text>
+          <text class="human" x="992" y="292">候選服務只跑唯讀 [smoke]</text><text class="tech" x="992" y="316">DEVFLOW_SMOKE=1 / Playwright</text>
           <text class="human" x="992" y="392">兩項通過才更新 live 標記</text><text class="human" x="992" y="416">未通過 → 先採證再回滾，run 失敗</text>
-          <text class="human" x="992" y="492">部署證據，交回最終驗收</text><text class="tech" x="992" y="516">devflow-evidence-deploy-&lt;sha&gt;</text>
+          <text class="human" x="992" y="492">部署證據；整合 run 再全跑</text><text class="tech" x="992" y="516">devflow-evidence-deploy-&lt;sha&gt;-&lt;attempt&gt;</text>
 
           <text class="human" x="160" y="592">旁路證據：獨立的 quality workflow 產生 CRAP／重複／mutation 報告，不是 required check，不擋合併。</text>
           <text class="human" x="160" y="620">候選版本先 up 再驗證；這不是 blue-green、canary 或零停機部署承諾。</text>
@@ -316,7 +316,7 @@
       </article>
       <article class="contract">
         <h3>證據追溯鍵</h3>
-        <p class="note">至少能從一條 AC 找到負責卡、PR head、CI／部署 run，以及 journey 輸出或 UI 截圖。下面是跨階段關聯欄位，不是所有角色共用的單一 JSON schema。</p>
+        <p class="note">每個情境 <code>&lt;EPIC&gt;/AC-n.Sm</code> 都能找到負責卡、PR head、CI run（head + base 紅綠）、整合 run、部署 run，以及步驟輸出或 UI 截圖。下面是跨階段關聯欄位，不是所有角色共用的單一 JSON schema。</p>
         <pre aria-label="交接欄位關聯">EPIC.body
   AC-1..n                 可觀察結果
 
@@ -333,7 +333,7 @@ EPIC completion metadata
   prs · deploy_runs
   acceptance[]
     ac · verdict · probability · evidence</pre>
-        <p class="note"><code>.devflow/evidence/AC-n.txt</code> 保存 journey 輸出；UI journeys 保存截圖。<code>head_sha</code> 指 PR 版本，部署 run 的 SHA 可能是合併提交，不能假設兩者相等。</p>
+        <p class="note"><code>.devflow/evidence/acceptance.json</code> 保存每個情境的 Given/When/Then 結果與身分（repo、head_sha、run、attempt）；<code>logs/</code> 是步驟輸出，<code>shots/</code> 是 UI 截圖。<code>head_sha</code> 指 PR 版本，部署 run 的 SHA 是合併提交，兩者不相等；<code>check acceptance</code> 用 GitHub API 分別核對。</p>
       </article>
     </div>
   </section>
@@ -346,9 +346,9 @@ EPIC completion metadata
         <thead><tr><th scope="col">觀察到的失敗</th><th scope="col">回路與責任人</th><th scope="col">再次前進的條件</th></tr></thead>
         <tbody>
           <tr><td>需求或計畫有疑慮</td><td>計畫變動觸發 <code>check plan</code>；新疑慮交 Hermes 的 <code>[ADV]</code>。需要修正時，orchestrator 用 <code>[ADJ]</code> 調整卡片與依賴。</td><td>重新建立可觀察的 AC 覆蓋。只有含不可回復操作的 ADV 會阻擋 SHIP；一般建議不擋。</td></tr>
-          <tr><td>PR CI 失敗／審查退件</td><td>Developer 修正同一卡／PR，補足行為實作與 journeys；Reviewer 依最新 head 重審，不能拿舊 SHA 的證據放行。</td><td>目前 head 的必要檢查通過，退件理由已解決；reviewer 的探測與驗收證據充分。</td></tr>
+          <tr><td>PR CI 失敗／審查退件</td><td>Developer 修正同一卡／PR，補足行為實作與情境；Reviewer 用 <code>check acceptance --review</code> 依最新 head 重審，不能拿舊 SHA 的證據放行。</td><td>目前 head 的必要檢查通過（含 base 紅綠），退件理由已解決；reviewer 的探測與驗收證據充分。</td></tr>
           <tr><td>候選服務 up／health／verify 失敗</td><td><code>deploy.sh</code> 先以 <code>capture.sh</code> 保存候選容器的狀態、退出原因與本次部署後的 log（已遮罩），再以上一個 <code>:live</code> 映像 <code>--no-build</code> 恢復並重跑 health；本次部署仍以非零結束。build 失敗則不動執行中版本。</td><td>DevOps 讀 <code>devflow-diagnostics-deploy-&lt;sha&gt;</code> 分類問題；程式問題由 developer 用 GitHub-hosted <code>repro.yml</code> 重現後修正並重新部署，不能以回滾健康代替 AC 驗收。</td></tr>
-          <tr><td>部署完成，但 AC 不完整</td><td>Orchestrator 用 <code>check acceptance</code> 下載 run artifacts、逐條判讀。缺實作或缺 journey 就補 DEV／OPS 卡，重新掛到 EPIC。</td><td>所有 AC 有 PASS 與可追溯證據。若自動判讀偏嚴，orchestrator 可附具體證據與理由判 PASS。</td></tr>
+          <tr><td>部署完成，但 AC 不完整</td><td>Orchestrator 用 <code>check acceptance --pr …</code>：向 GitHub 核對各 run 身分、情境結果與整合 run，再逐條判讀。缺實作、缺情境或缺整合 run 就補 DEV／SHIP 卡，重新掛到 EPIC。</td><td>所有 AC 有 PASS 與可追溯證據。只有 Decisions 偏嚴時，orchestrator 可附具體證據與理由判 PASS；確定性檢查的 FAIL 不能改判。</td></tr>
           <tr><td>worker crash／卡片無法續跑</td><td>Hermes 轉 ADJ；orchestrator 修根因，以 <code>devflow-ops resume</code> 續跑；無法修改的卡片契約則建替代卡並移接依賴。</td><td>修復的設定或行為已實測。重複根因應落到 repo 的驗證／CI；kit 層問題列 followups，交使用者決定。</td></tr>
           <tr><td>方向、成本或破壞性資料操作未決</td><td>標記 <code>needs_input</code>，由 Hermes 問使用者；不是由代理人自行猜測授權。</td><td>使用者決定後才續跑受影響路徑；既有未受阻工作可繼續。</td></tr>
         </tbody>
@@ -368,7 +368,7 @@ EPIC completion metadata
         <tbody>
           <tr><td>合併／卡片完成</td><td><code>repo protect</code> 建立 <code>devflow</code> ruleset，以 <code>devflow-ci</code> 與 <code>devflow-judgment</code> 為 required check，不允許 bypass；PR completion contract 核對 exact head。<code>devflow-judgment</code> 由 tick 與 reviewer 的 <code>check pr</code> 寫入：沒有疑慮或 advisor <code>ok</code> 才是 success，所以疑慮未解決前 PR 卡完成不了。devops 只用 <code>devflow ship merge</code> 合併：再判斷一次 PR 目前的 head + 標題 + 說明，API 失敗、沒有 advisor <code>ok</code>、判斷後 PR 被改都拒絕，通過才以 <code>--match-head-commit</code> 合併。</td><td>需要成功接入並設置 contract；已接入的 repo 要重跑 <code>repo protect</code>。<code>devflow-judgment</code> 用 builder token 寫入，agent 拿得到，所以擋得住漏做檢查，擋不住刻意偽造。只改說明不改 head，tick 重判前舊的 success 還在，直接 <code>gh pr merge</code> 擋不到。獨立 reviewer 是角色流程要求，不代表所有 repo 都有平台強制的 required approval。</td></tr>
           <tr><td>計畫與 AC 判讀</td><td>規則加 Decisions API 檢查；變動才重新檢查，重複疑慮不重複建 ADV。逐條驗收由 orchestrator 對證據負責。</td><td>檢查工具出錯只記錄、不擋流程；模型判讀不是數學保證。程式碼中的失敗回傳與 GitHub required checks 才是相應的執行閘門。</td></tr>
-          <tr><td>驗收涵蓋範圍</td><td>repo 專屬 <code>verify.sh</code> 必須由 developer 補入每條 AC journey；PR 與部署後共用，UI 用 Playwright。</td><td>範本預設只有 health。沒有 Dockerfile 的 PR 會略過 up／verify；沒有 AC journeys 就沒有完整使用者行為證據，CI 綠也不能補足。</td></tr>
+          <tr><td>驗收涵蓋範圍</td><td>EPIC 每條 AC 的情境由 developer 寫成可執行情境（UI/API 用 Playwright，CLI/函式庫用 <code>verify.sh</code> 的 <code>scenario</code>）；PR 全跑並在 base 紅燈、整合 run 全跑、部署後跑 smoke。</td><td>PR 自己的 <code>ci.yml</code>／<code>acceptance.py</code> 可被改寫：身分核對擋得住舊版本與別的 EPIC，擋不住刻意偽造。</td></tr>
           <tr><td>規則與教訓</td><td>CI <code>check</code> job（在 <code>devflow-ci</code> 的 needs）：每條規則先用自帶的錯誤範例自測，再掃描程式；豁免必須引用存在的教訓，教訓的 ref 必須指到真實的規則或檔案。PR 上：<code>fix:</code>／<code>revert:</code> PR 必須帶 <code>Lesson:</code> 或 <code>No-lesson:</code>；同一根因再出現要更新原教訓；新教訓的規則或測試必須在修正前的程式上失敗，log 印出每筆證明。Hermes 主機另外判斷 PR：改到 gate 檔案一律送 advisor；Decisions 判斷修 bug 沒標 <code>fix:</code>、<code>No-lesson</code>／<code>No-proof</code> 理由不成立、教訓沒對準這次的錯，標出就送 advisor 並擋合併。</td><td>規則是逐行模式比對，不是語意分析；<code>journey</code> 教訓不做自動證明，只由 Decisions 與 advisor 判斷。CI 跑的是 PR 自己的檢查程式，所以放寬檢查要靠主機的 gate 檔案偵測與 advisor 擋。模型判斷只負責送 advisor，不負責放行。agent 帳號與人的帳號未分開前，無法做成只有人能核准的權限關卡。</td></tr>
           <tr><td>執行身分／網路</td><td>builder 與 reviewer 使用不同 GitHub 帳號；部署在主機 <code>devflow</code> 使用者的 rootless Docker，服務綁 <code>127.0.0.1</code>。</td><td>不是完整的權限隔離證明：兩帳號都有 push 權限，developer 的 git／gh 原生升權自動核准。任何有 push 權限的帳號都能在分支上寫 workflow 跑在 self-hosted runner，等同主機 <code>devflow</code> 使用者與共用 Docker 的權限；workflow 內的條件只防誤用。對外 proxy、TLS、DNS 不在範本契約內。</td></tr>
           <tr><td>回滾與資料</td><td>成功部署標記 <code>:live</code>，up、health 或 verify 失敗時先採證，再用它恢復應用映像。</td><td>沒有上一版就無法回滾。回滾只重驗 health，不還原資料庫、volume、schema 或環境設定。診斷 log 的遮罩是盡力而為，artifact 保留 7 天。</td></tr>
@@ -380,7 +380,7 @@ EPIC completion metadata
       <summary>工程師接入一個 repo 時，要確認什麼？</summary>
       <ul>
         <li>建立 repo／board、接入契約與 runner；新專案先有可啟動骨架，既有 repo 先比對 <code>devflow contract</code> 列出的差異。</li>
-        <li>替換範本的 test、啟動與 health 設定；為每條 AC 編寫真實 journeys。不要只保留預設 health 就宣稱行為驗收完成。</li>
+        <li>替換範本的 test、啟動與 health 設定；為每個情境編寫真實的 Given/When/Then。不要只保留預設 health 就宣稱行為驗收完成。</li>
         <li>確認 required checks、completion contract、兩個 GitHub 身分與部署環境設定；不需要部署的專案明確選擇不走服務部署路徑。</li>
         <li>先走一個真實小變更，檢查 PR／部署兩份 artifact，再確認失敗時的回復與人工處理方式。這份 HTML 不會執行任何接入或部署命令。</li>
       </ul>

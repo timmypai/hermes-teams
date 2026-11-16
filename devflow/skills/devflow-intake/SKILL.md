@@ -21,7 +21,7 @@ metadata:
    - 未接入的既有 repo → `devflow repo add OWNER/REPO`（自動建 board、clone、設定權限、申請部署 runner；確定不部署加 `--no-runner`）。
    - 全新專案 → `devflow repo add OWNER/NAME --create`（預設 private；使用者說公開才加 `--public`）。GitHub owner 沒講就用 builder 帳號（`gh api user --jq .login`）。
 2. **釐清三件事**：要達成什麼、怎樣算完成、有沒有不能碰的東西。一次最多問 2 題，只問答案會改變做法的；其他用合理預設並寫進卡片「提示」。使用者說「grill me」才用 `grilling`。
-3. **寫成驗收條件**：把「怎樣算完成」寫成編號的 `AC-1`、`AC-2`…，每條都是使用者看得到、可以實際操作檢查的結果（「在 X 做 Y，看到 Z」「GET /a 回 200 與 …」），不寫做法。有畫面的需求，寫出在畫面上要看到什麼。這些 AC 是整個流程的驗收依據：每張卡標明自己負責哪些 AC，CI 與部署後的 `verify.sh` 一條 AC 一個 journey，最後逐條判定 PASS/FAIL。
+3. **寫成驗收條件**：把「怎樣算完成」寫成編號的 `AC-1`、`AC-2`…，每條都是使用者看得到、可以實際操作檢查的結果（「在 X 做 Y，看到 Z」「GET /a 回 200 與 …」），不寫做法。有畫面的需求，寫出在畫面上要看到什麼。編號後緊接類型標記：`[ui]`（瀏覽器畫面）、`[api]`（HTTP API）、`[cli]`（命令列／批次）、`[lib]`（函式庫呼叫）、`[manual]`（真的無法自動執行，例如文件內容或外部帳號設定；盡量少用，會送 advisor 確認）。例：`- AC-1 [ui] 在待辦頁新增「買牛奶」後清單出現這一筆，重新整理仍在`。這些 AC 是整個流程的驗收依據：orchestrator 會把每條展開成 Given/When/Then 情境，CI、整合驗收與部署後逐一執行，最後逐條判定 PASS/FAIL。
 4. **語音確認一次**：用一句話念出 AC 重點（「我整理成三點：…，這樣對嗎？」）。使用者修正就改；沒意見、說「照預設」或已授權不用問 → 直接建卡。不要為了確認反覆追問。
 5. **防重複**：`kanban_list(board=slug)` 看有沒有未完成的 `[EPIC]` 在做同一件事；有就 `kanban_comment` 補充，不另建。
 6. **建卡**：
@@ -30,7 +30,7 @@ metadata:
      board=slug, assignee="orchestrator", workspace_kind="dir",
      title="[EPIC] <一句話目標>",
      idempotency_key="epic:<slug>:<目標關鍵字>",
-     body="## 目標\n...\n## 驗收\n- AC-1 ...\n- AC-2 ...\n## 提示\n- 需要部署：是/否\n- 有畫面（UI）：是/否\n- 限制/偏好：...\n- 使用者原話：...\n- 來源：Hermes <日期>")
+     body="## 目標\n...\n## 驗收\n- AC-1 [ui] ...\n- AC-2 [api] ...\n## 提示\n- 需要部署：是/否\n- 限制/偏好：...\n- 使用者原話：...\n- 來源：Hermes <日期>")
    ```
    建立後這個對話會自動收到 EPIC 與所有子卡的通知。
 7. **回覆**：一句話：「已建立 t_xxxx，orchestrator 接手了，需要你決定的事我會問你。」

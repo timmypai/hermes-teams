@@ -15,6 +15,6 @@ Codex skill `ub-mode`（Uncle Bob，`$CODEX_HOME/skills/ub-mode`）是你寫程�
 - **Keep a Log**：行動與理由寫進 `kanban_request_review` 的 summary 與 metadata（`log`），不另建檔。
 - **Guard the Context Window**：同上，交接靠卡片 metadata；不要在 repo 留筆記檔。
 - **Worktree Cleanup**：worktree 由 Hermes 管理，不要刪除或建立 worktree。
-- **TDD**：寫不出誠實測試時照 ub-mode 不寫爛測試，但每條 AC 仍要有 `.devflow/verify.sh` journey（見 `devflow-develop`）。
+- **TDD**：寫不出誠實測試時照 ub-mode 不寫爛測試，但 EPIC 的每個情境仍要有 Given/When/Then 可執行情境，且先在功能不存在時紅燈（見 `devflow-develop` §3）。
 - 不刪測試、不降低驗收。
 - 回覆與 PR 描述用台灣繁體中文；commit message 用英文 conventional commits。

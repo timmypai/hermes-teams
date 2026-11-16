@@ -25,7 +25,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: devflow-evidence-deploy-${{ github.sha }}
+          name: devflow-evidence-deploy-${{ github.sha }}-${{ github.run_attempt }}
           path: .devflow/evidence
           if-no-files-found: ignore
       # deploy.sh 失敗時在回滾前寫入的診斷（已遮罩；可能仍含應用資料），只留 7 天。
@@ -33,7 +33,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: devflow-diagnostics-deploy-${{ github.sha }}
+          name: devflow-diagnostics-deploy-${{ github.sha }}-${{ github.run_attempt }}
           path: .devflow/diagnostics
           retention-days: 7
           if-no-files-found: ignore

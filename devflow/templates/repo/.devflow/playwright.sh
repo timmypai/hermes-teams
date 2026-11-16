@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
-# 在 Playwright 官方映像內跑 .devflow/ui 的 UI journeys（主機不必裝 Node 或瀏覽器）。
-# 映像版本 = .devflow/ui/package.json 釘死的 @playwright/test 版本。截圖與報告寫到 $DEVFLOW_EVIDENCE。
-# DEVFLOW_ONLY（verify.sh 已驗證格式，如 "AC-2 AC-5"）只跑標題含這些 AC 的 test；DEVFLOW_TRACE 非空 = 全程 trace。
+# 在 Playwright 官方映像內跑 .devflow/ui 的 ui / api 情境（主機不必裝 Node 或瀏覽器）。
+# 映像版本 = .devflow/ui/package.json 釘死的 @playwright/test 版本。事件、截圖與 JSON 報告寫到 $DEVFLOW_EVIDENCE
+# （容器內 /evidence；事件檔與 verify.sh 的 shell 情境共用 scenario-events.jsonl）。
+# DEVFLOW_ONLY（完整 id 或整條 AC）/ DEVFLOW_SMOKE=1 轉成 --grep，篩掉的情境不會出現在報告。
+# 有篩選時 0 個符合不算錯（例如只篩 shell 情境）：該跑的情境有沒有跑，由 acceptance.py gate 依 `Covers:` 檢查；
+# 沒篩選時 0 個 test 仍是錯。DEVFLOW_TRACE 非空 = 全程 trace。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-E=$(realpath -m "${DEVFLOW_EVIDENCE:-.devflow/evidence}"); mkdir -p "$E"
+E=$(realpath -m "${DEVFLOW_EVIDENCE:-.devflow/evidence}")
+mkdir -p "$E/shots" .devflow/ui/node_modules   # node_modules：匿名 volume 的掛載點，主機先建才不是 root 的
+touch "$E/scenario-events.jsonl"
 v=$(grep -oE '"@playwright/test": *"[0-9]+\.[0-9]+\.[0-9]+"' .devflow/ui/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
 : "${v:?pin an exact @playwright/test version (x.y.z) in .devflow/ui/package.json}"
+
+# Playwright 以 test 的完整標題路徑（含檔名，空白連接）比對 --grep；標題是 "<id> <說明>[ @smoke]"。
+only=${DEVFLOW_ONLY:-}
+read -ra entries <<<"${only//,/ }"
+ids=''
+for x in "${entries[@]}"; do
+  if [[ ! $x =~ ^t_[0-9A-Za-z]+/AC-[0-9]+(\.S[0-9]+)?$ ]]; then
+    echo "DEVFLOW_ONLY: '$x' 不是 t_xxx/AC-n 或 t_xxx/AC-n.Sm" >&2; exit 2
+  fi
+  x=${x//./[.]}
+  [[ $x == *"[.]S"* ]] || x+='[.]S[0-9]+'
+  ids+="${ids:+|}$x"
+done
+grep=''
+if [[ -n $ids ]]; then grep+="(?=.*(^| )($ids)( |\$))"; fi
+if [[ ${DEVFLOW_SMOKE:-} == 1 ]]; then grep+='(?=.* @smoke( |$))'; fi
 args=()
-if [[ -n ${DEVFLOW_ONLY:-} ]]; then
-  [[ $DEVFLOW_ONLY =~ ^AC-[0-9]+( AC-[0-9]+)*$ ]] || { echo "DEVFLOW_ONLY: want 'AC-n AC-m'" >&2; exit 2; }
-  args+=(--grep "(^|\\s)(${DEVFLOW_ONLY// /|})\\b" --pass-with-no-tests)
-fi
+if [[ -n $grep ]]; then args+=(--grep "^$grep" --pass-with-no-tests); fi
 [[ -z ${DEVFLOW_TRACE:-} ]] || args+=(--trace on)
+# 容器以 root 跑：結束前把 /evidence 與 npm 可能新建的 package-lock.json 交還主機使用者（不論測試成敗），
+# self-hosted runner 下次才清得掉。
 docker run --rm --ipc=host --network "${DEVFLOW_NET:?}" \
-  -e BASE_URL="${DEVFLOW_INNER_URL:?}" -e CI=1 \
+  -e BASE_URL="${DEVFLOW_INNER_URL:?}" -e CI=1 -e DEVFLOW_EVENTS=/evidence/scenario-events.jsonl \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   -v "$PWD/.devflow/ui:/ui" -v /ui/node_modules -v "$E:/evidence" -w /ui \
   "mcr.microsoft.com/playwright:v${v}-noble" \
-  bash -c 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi >/dev/null && npx playwright test "$@"' \
+  bash -c 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi >/dev/null && npx playwright test "$@"
+    rc=$?; chown -R "$HOST_UID:$HOST_GID" /evidence; [ ! -f package-lock.json ] || chown "$HOST_UID:$HOST_GID" package-lock.json; exit $rc' \
   playwright "${args[@]}"

@@ -24,7 +24,7 @@ expect = "fail"
 
 [[fixture]]
 path = ".devflow/ui/ac.spec.ts"
-text = "test.only('AC-1 shows total', async ({ page }) => {"
+text = "test.only('t_ab12/AC-1.S1 shows total', async ({ page }) => {"
 expect = "fail"
 
 [[fixture]]
@@ -49,5 +49,5 @@ expect = "pass"
 
 [[fixture]]
 path = ".devflow/ui/ac.spec.ts"
-text = "test('AC-1 shows total', async ({ page }) => {"
+text = "scenario('t_ab12/AC-1.S1', 'shows total', {"
 expect = "pass"
