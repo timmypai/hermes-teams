@@ -384,6 +384,84 @@ class CheckAcceptance(Case):
         code, rep = self.check()
         self.assertEqual((code, self.rows(rep)["AC-3"]["verdict"]), (1, "FAIL"))
 
+    def test_unavailable_decisions_is_unjudged_not_a_failure(self) -> None:
+        def down(content, questions):
+            raise self.df.DecisionsError("HTTP 503")
+        self.df.decide = down
+        code, rep = self.check()
+        self.assertEqual(code, 3, rep)
+        self.assertEqual({r["verdict"] for r in rep["criteria"]}, {"UNJUDGED"})
+
+    def test_unjudged_next_to_an_evidence_failure_is_still_a_failure(self) -> None:
+        def down(content, questions):
+            raise self.df.DecisionsError("HTTP 503")
+        self.df.decide = down
+        self.pr.update(state="OPEN", mergeCommit=None)
+        code, rep = self.check()
+        self.assertEqual((code, self.rows(rep)["AC-1"]["verdict"], self.rows(rep)["AC-3"]["verdict"]), (1, "FAIL", "UNJUDGED"))
+
+
+class CheckAc(Case):
+    """D0: draft AC lines before the EPIC exists (no scenarios yet)."""
+
+    DRAFT = "- AC-1 [ui] 在待辦頁輸入「買牛奶」按新增，清單出現「買牛奶」\n- AC-2 [api] GET /api/todos 回 200 與 JSON 陣列\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.asked: list[str] = []
+        self.answers: dict[str, float] = {}
+
+        def decide(content, questions):
+            self.asked = [q["name"] for q in questions]
+            return {q["name"]: {"probability": self.answers.get(q["name"], 0.1)} for q in questions}
+        self.df.decide = decide
+
+    def test_clear_draft_passes_without_scenarios(self) -> None:
+        rep = self.df.check_ac(self.DRAFT, "我要能新增待辦")
+        self.assertEqual((rep["findings"], rep["note"]), ([], ""))
+        self.assertEqual(self.asked, ["vague_1", "vague_2", "uncovered"])
+
+    def test_shape_problems_skip_the_model(self) -> None:
+        rep = self.df.check_ac("- AC-1 很好用\n", "")
+        self.assertTrue(any("沒有類型標記" in f for f in rep["findings"]), rep)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.df.check_ac("要做一個待辦清單", "")["findings"], ["沒有任何 `AC-n` 驗收條件"])
+
+    def test_vague_and_uncovered_become_questions_for_the_user(self) -> None:
+        self.answers = {"vague_2": 0.9, "uncovered": 0.7}
+        found = self.df.check_ac(self.DRAFT, "新增待辦，而且要能匯出 CSV")["findings"]
+        self.assertTrue(any(f.startswith("AC-2 太模糊") for f in found), found)
+        self.assertTrue(any("沒有任何 AC 覆蓋" in f for f in found), found)
+
+    def test_unavailable_decisions_is_a_note_not_a_finding(self) -> None:
+        def down(content, questions):
+            raise self.df.DecisionsError("timed out")
+        self.df.decide = down
+        rep = self.df.check_ac(self.DRAFT, "")
+        self.assertEqual(rep["findings"], [])
+        self.assertIn("timed out", rep["note"])
+
+
+class PlanUnjudged(Case):
+    def test_unavailable_decisions_hands_every_question_to_a_ship_gating_advisor(self) -> None:
+        def down(content, questions):
+            raise self.df.DecisionsError("HTTP 500")
+        self.df.decide = down
+        cards = {EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator",
+                        "workspace_kind": "dir", "parents": [], "children": []}}
+        opened = []
+        self.df.plan_rules = lambda board, epic, cards: []
+        self.df.open_advisor_card = lambda board, epic, cards, findings, risky: opened.append((findings, risky)) or "t_adv"
+        rep = self.df.check_plan("b", EPIC, advise=True, cards=cards)
+        self.assertEqual(len(opened), 1)
+        findings, risky = opened[0]
+        self.assertTrue(risky)
+        self.assertEqual(len(findings), len(self.df.PLAN_QUESTIONS))
+        self.assertIn("HTTP 500", rep["note"])
+        # Same plan, another failure: the stable finding text is already advised, so no second [ADV].
+        self.df.check_plan("b", EPIC, advise=True, cards=cards, advised=frozenset(findings))
+        self.assertEqual(len(opened), 1)
+
 
 class PrExemption(Case):
     def test_base_exemptions_are_judged(self) -> None:

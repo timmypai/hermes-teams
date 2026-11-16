@@ -51,7 +51,7 @@
   "obsolete_skills": {
     "root": ["goal-aligned-advisory", "hermes-talk-project-progress", "repo-evidence-custody",
              "seven-bot-native-workflow-boundaries", "grill-me", "grilling", "seven-pstack-*"],
-    "profiles": ["team-operations", "seven-pstack-*"],
+    "profiles": ["team-operations", "seven-pstack-*", "devflow-contract-upgrade"],
     "codex": ["team-operations", "seven-pstack-*", "test-driven-development", "pstack/skills/tdd",
               "pstack/skills/principle-fix-root-causes", "pstack/skills/principle-test-behavior-not-implementation"]
   },

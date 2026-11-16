@@ -1,12 +1,12 @@
 # devflow｜Hermes 七 Bot 共用開發流程
 
-適用任何新 repo 或既有 repo。只用 Hermes 原生功能（Kanban、dispatcher、profile、skills、Codex app-server runtime、GPT-Live 語音），不改 Hermes 程式。
+適用任何新 repo 或既有 repo。只用 Hermes 原生功能（Kanban、dispatcher、profile、skills、Codex app-server runtime）與 Hermes Talk 語音 plug-in，不改 Hermes 程式。
 
 ## 流程
 
 ```mermaid
 flowchart TD
-  U((使用者)) <-- "GPT-Live 語音/文字<br/>目標 + AC-1..n" --> H[hermes 預設 Bot]
+  U((使用者)) <-- "Hermes Talk 語音/文字<br/>目標 + AC-1..n" --> H[hermes 預設 Bot]
   H -- "[EPIC] 卡" --> O[orchestrator]
   O -- "devflow check plan<br/>(dispatcher tick 自動)" --> C{有疑慮?}
   C -- 是 --> ADV["[ADV] hermes advisor<br/>Opus 5.5"]
@@ -28,13 +28,13 @@ flowchart TD
 - **驗收貫穿全程**：Hermes 把「怎樣算完成」寫成編號 `AC-n` 並標類型（`[ui]`/`[api]`/`[cli]`/`[lib]`/`[manual]`，語音確認一次）→ orchestrator 把每條展開成 Given/When/Then 情境 `<EPIC>/AC-n.Sm` → developer 先寫可執行情境再實作 → 證據鏈見下方「驗收證據鏈」，全 PASS 才完成 EPIC。
 - **計畫檢查**：EPIC 等子卡期間，計畫一有變動（建卡、改卡、`[ADJ]` 調整），dispatcher tick 自動跑 `devflow check plan`：規則（卡型、assignee、workspace、contract、`[SHIP]`、parent 鏈、AC 覆蓋、AC 類型與 Given/When/Then 情境）+ Decisions API 風險分數；有新疑慮才建 `[ADV]` 給 Hermes（Opus 5.5）判斷，同樣的疑慮不重複送。只有「含不可回復操作」時 `[ADV]` 擋 `[SHIP]`，其他情況不擋。
 - **看板自動化**：default profile 的 shell hook `on_kanban_dispatch_tick` 在 gateway 內的 dispatcher 每個 tick 觸發 `devflow tick`（board 沒變動就立即結束；有變動才背景執行，不拖慢派工）。它做兩件事：計畫檢查，以及執行 orchestrator 在自己卡上留的 `devflow-ops`（edit / archive / link / unlink / assign / resume）。
-- 不設次數/時間卡控：沒有 run budget、沒有輪詢 cron；review 退件不限次數；失敗卡由 Hermes 自動轉 `[ADJ]` 給 orchestrator，只有需要使用者決定的事才問人。檢查工具出錯時只記錄，不擋流程。
+- 不設次數/時間卡控：沒有 run budget、沒有輪詢 cron；review 退件不限次數；失敗卡由 Hermes 自動轉 `[ADJ]` 給 orchestrator，只有需要使用者決定的事才問人。Decisions API 無法判斷時不當成「沒有風險」，也不默默等待：見「Decisions API 判斷點」。
 
 ## 七個 Bot
 
 | Bot（profile） | 職責 | 卡片 | 主要技能 |
 |---|---|---|---|
-| hermes（default） | GPT-Live 語音/文字入口、把需求寫成 AC、建 EPIC、回報進度、Advisor（`[ADV]` 卡用 Opus 5.5） | `[ADV]` | devflow-intake；mattpocock grilling/grill-me/to-questionnaire/wait-what/teach/ask-matt；pstack in-your-own-words/bro/ketchup/how/why/sharpen… |
+| hermes（default） | Hermes Talk 語音/文字入口、把需求寫成 AC、建 EPIC、回報進度、Advisor（`[ADV]` 卡用 Opus 5.5） | `[ADV]` | devflow-intake；mattpocock grilling/grill-me/to-questionnaire/wait-what/teach/ask-matt；pstack in-your-own-words/bro/ketchup/how/why/sharpen… |
 | orchestrator | 拆解（吞吐檢查）、AC 覆蓋、串依賴、等待、逐條驗收、處理失敗 | `[EPIC]` `[ADJ]` | devflow-orchestrate；to-tickets/to-spec/wayfinder；pstack figure-it-out/sequence-verifiable-units/outcome-oriented-execution/encode-lessons-in-structure… |
 | researcher | 一手來源、方案比較、PoC | `[RES]` | devflow-research；research/prototype；pstack how/why/explain-the-number… |
 | architect | 架構、模組邊界、資料模型、介面、ADR | `[ARCH]` | devflow-architect；codebase-design/domain-modeling/improve-codebase-architecture；pstack architect/statechart/boundary-discipline… |
@@ -50,6 +50,23 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - 主要開發在 Codex，所以 install 把它複製到 developer 的 `$CODEX_HOME/skills/ub-mode`（Codex 原生 skill，`skills/list` 可見），並只移走具名項目（`roles.json` `obsolete_skills.codex`）：舊契約的 `seven-pstack-*`、`team-operations`，以及規則已由 ub-mode 負責的 Codex 複本 `test-driven-development`（「一律先寫測試」與 ub-mode「寫不出誠實測試就不寫」衝突）、`pstack/skills/{tdd,principle-fix-root-causes,principle-test-behavior-not-implementation}`。補充而不衝突的 `systematic-debugging`、`principle-prove-it-works` 與其他既有 Codex 技能保留。`codex/AGENTS.md` 要求每次改程式都套用 ub-mode，並覆寫與 devflow 衝突的條目：只 push 卡片分支走 PR（原文是 push 到 main line）、worktree 由 Hermes 管、Keep a Log 寫進 handoff metadata `log`。
 - reviewer 用同一份 skill 審 Make it Right。developer Hermes profile 的 pstack 分配移除了 ub-mode 已涵蓋的 principle（laziness、subtract、boundary、idempotent、type-system、fix-root-causes、test-behavior、tdd），避免兩套規則。
 - ub-mode 的 Crapper / Dryer / Mutator 是第三方程式，只在獨立的 `quality.yml` workflow（GitHub-hosted、唯讀 token、pinned commit、`continue-on-error`）執行，不在 Hermes 容器執行。它是 repo 契約的預設檔，`devflow contract` 會補進既有 repo；不是 required check，也不在 `devflow-ci` 內，**不擋合併**。結果是 artifact `devflow-quality-<sha>` 與 run summary，供 developer 修正、reviewer 參考。
+
+## 語音入口（Hermes Talk）
+- `hermes-talk` plug-in 用 OpenAI Realtime 做雙向語音。語音 session 的提示只有 `SOUL.md`（`PERSONA`，上限 4,000 字）、記憶與 skill 目錄摘要，**看不到 skill 內容**；能直接執行的只有少數唯讀工具，其他工作委派給背景 Hermes agent，結果回來時由語音念出。
+- 所以語音端的收需求步驟寫在 `souls/default.md`：釐清、整理成帶類型的 AC、念一次確認，再委派「用 devflow-intake skill 建 EPIC」並附上全部資訊；背景 agent 跑 D0（`devflow check ac`），需要使用者回答時不建卡、把問題回傳給語音。
+- 限制：背景結果只送回發起它的語音 session；Kanban 的進度與完成通知走 gateway 聊天平台，不會進語音。語音中問進度時，由 Hermes 委派背景 agent 讀看板。
+
+## Decisions API 判斷點
+
+| 判斷點 | 何時 | 問什麼 | 疑慮時 | API 無法使用時 |
+|---|---|---|---|---|
+| D0 `devflow check ac` | intake 建 EPIC 前（使用者還在對話中） | 每條 AC 是否太模糊；使用者原話有沒有 AC 沒覆蓋 | 不建卡，問使用者 | 照樣建卡，「提示」註明 D0 未判定 |
+| D1 `devflow check plan` | tick：EPIC 等子卡且計畫有變動 | 改 Hermes、漏 AC、範圍外工作、不可回復操作 | 建 `[ADV]`；不可回復時 `[ADV]` 擋 `[SHIP]` | 四題全部交 `[ADV]` 代答，並擋 `[SHIP]` |
+| D2 `devflow check pr` / `ship merge` | tick：PR 卡在 review；合併前再一次 | `unlabeled_fix`、`weak_exemption`、`lesson_mismatch` | `[ADV]` 判 ok 才給 `devflow-judgment` success | 題目交 `[ADV]` 代答；結果照樣綁 fingerprint |
+| D3 `devflow check acceptance` | orchestrator 最終驗收（確定性檢查全過才問） | 證據是否顯示達成、斷言是否足夠 | 該 AC FAIL，補卡 | `UNJUDGED`（exit 3）：不補卡，`needs_input` 告知使用者 |
+
+- 每次呼叫失敗（網路、429、5xx）先等 5 秒重試一次；4xx 直接算失敗。沒回答的題目一律視為無法判斷。
+- `[ADV]` 用 Opus 5.5（不同家模型），所以「Decisions 無法判斷」改由另一個模型判斷，不是放行，也不是卡住。
 
 ## CI/CD
 
@@ -75,7 +92,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - 豁免：該行或上一行 `devflow: allow <rule-id> L-NNNN`，L-NNNN 必須是存在的教訓。既有 repo 接入時 `check.sh --write-baseline` 記錄舊違規（以規則＋路徑＋該行內容比對），之後只擋新增。
 - 教訓 `.devflow/lessons/L-NNNN.toml`：事件、根因、分類、由什麼擋（`rule`／`test`／`journey`／`template`／`cli`／`skill-only`）；`check` 驗證 ref 指到的規則或檔案確實存在，`skill-only` 必須寫理由。
 - PR 的 lesson gate（`check.py --pr`，`check` job 的一步）：標題 `fix:`／`revert:` 的 PR，說明必須有 `Lesson: L-NNNN` 或 `No-lesson: <理由>`；引用 base 已存在的教訓（同一根因再出現）時，必須在這個 PR 更新那筆教訓；這個 PR 新增的教訓要證明抓得到修正前的程式：`rule` 必須在改動檔案的 base 版本上報錯；`test`（`ref = "路徑::測試名"`）連同 PR 的 `.devflow/test.sh` 放到 base 上，只跑那個測試檔（`DEVFLOW_TEST_ONLY`），從 JUnit 結果（`DEVFLOW_JUNIT`）判定：那條測試在 base 必須是斷言失敗（`<failure>`；error、skip、因匯入或收集錯誤沒跑到都不算），在 PR 上必須通過。範本 `test.sh` 的 pytest 分支已支援；其他技術棧要自己加 JUnit 輸出，否則無法證明。`journey` 不做自動證明；`No-proof: <理由>` 跳過證明，由 reviewer 判斷。PR 說明修改會重跑 CI（`pull_request` 加了 `edited`）。
-- PR 判斷（Hermes 主機上的 `devflow`，PR 改不到）：`check` 程式、規則與 `ci.yml` 都在 repo 內，CI 跑的是 PR 自己的版本，而且 gate 判斷不了語意。所以另外判斷：PR 改到 gate 檔案（`.devflow/check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、刪除教訓）一律列為疑慮；Decisions API 問三題，每題只在前提成立時才問：`unlabeled_fix`（標題不是 `fix:`/`revert:` 時問：diff 是不是修 bug）、`weak_exemption`（有 `No-lesson`/`No-proof` 時問：理由成不成立）、`lesson_mismatch`（fix PR 改了教訓時問：教訓有沒有對準這次的錯），機率 ≥ `flag` 算疑慮；沒回答的題目視為 API 失敗。判定綁在 PR head + 標題 + 說明上（`state/pr-judgments.json`）。結果寫成 commit status `devflow-judgment`：沒有疑慮或 advisor `ok` → success；有疑慮就開 `[ADV]`（Opus），等待中 → pending；advisor `revise` → failure。dispatcher tick 對 review 中的 PR 卡判斷並寫入，reviewer 的 `devflow check pr` 也會寫；PR 卡的 completion contract 要求它成功，所以疑慮沒解決前 PR 卡完成不了。`devflow ship merge` 合併前再判斷一次（說明在 review 後被改也擋得到），API 失敗、沒有 advisor `ok`、判斷後 PR 被改都拒絕，通過才用 `--match-head-commit` 合併。`devflow repo protect` 把 `devflow-judgment` 設為必過檢查並移除 admin bypass，所以直接 `gh pr merge` 也要等判斷通過。模型只負責把 PR 送去 advisor，不負責放行。
+- PR 判斷（Hermes 主機上的 `devflow`，PR 改不到）：`check` 程式、規則與 `ci.yml` 都在 repo 內，CI 跑的是 PR 自己的版本，而且 gate 判斷不了語意。所以另外判斷：PR 改到 gate 檔案（`.devflow/check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、刪除教訓）一律列為疑慮；Decisions API 問三題，每題只在前提成立時才問：`unlabeled_fix`（標題不是 `fix:`/`revert:` 時問：diff 是不是修 bug）、`weak_exemption`（有 `No-lesson`/`No-proof` 時問：理由成不成立）、`lesson_mismatch`（fix PR 改了教訓時問：教訓有沒有對準這次的錯），機率 ≥ `flag` 算疑慮；API 失敗或沒回答時，每一題都轉成給 advisor 代答的疑慮。判定綁在 PR head + 標題 + 說明上（`state/pr-judgments.json`）。結果寫成 commit status `devflow-judgment`：沒有疑慮或 advisor `ok` → success；有疑慮就開 `[ADV]`（Opus），等待中 → pending；advisor `revise` → failure。dispatcher tick 對 review 中的 PR 卡判斷並寫入，reviewer 的 `devflow check pr` 也會寫；PR 卡的 completion contract 要求它成功，所以疑慮沒解決前 PR 卡完成不了。`devflow ship merge` 合併前再判斷一次（說明在 review 後被改也擋得到），沒有 advisor `ok`、判斷後 PR 被改都拒絕，通過才用 `--match-head-commit` 合併。`devflow repo protect` 把 `devflow-judgment` 設為必過檢查並移除 admin bypass，所以直接 `gh pr merge` 也要等判斷通過。模型只負責把 PR 送去 advisor，不負責放行。
 - 限制：寫入 `devflow-judgment` 用的是 builder token，agent 也拿得到，所以擋得住忘記檢查與搶在判斷前合併，擋不住刻意偽造。要做成權限關卡（只有人能核准放寬），核准者必須是 agent 拿不到 token 的帳號：目前 builder agent 用的是 repo owner 帳號，reviewer agent 用另一個帳號且平常就會 approve，所以兩者都不能當核准者，需先把 agent 帳號與人的帳號分開。只改 PR 說明不會改 head，舊的 success 會留著：review 中由下一次 tick 重判，review 完成後只有 `devflow ship merge` 會重判，所以直接 `gh pr merge` 可能用到舊的判定。已設 `contract=yes` 的 repo 要再跑一次 `devflow repo protect <slug>` 才會加上 `devflow-judgment`。教訓 ref 指到同一檔案裡不相干的 journey 時，模型判斷不出來。等 advisor 的方式：tick 只建 `[ADV]`；等待的 worker 自己 `kanban_link` 把它設為本卡 parent，再 `kanban_block(kind="dependency")`（Hermes 不允許從外部 link 執行中的卡；dependency block 不計入連續 block 次數，不會被送去 triage）。`[ADV]` 一直沒完成時，卡會留在 todo。
 - devflow 本身的檢查：repo 根目錄 `.github/workflows/devflow-kit.yml`（範本腳本 shellcheck、範本 workflow actionlint、`devflow/tests/` 檢查器單元測試、`devflow/tests/deploy_scenarios.sh` 以一次性 Docker 跑範本 `deploy.sh` 的四情境：成功上線、build 失敗不動執行中版本、health 失敗與 verify 失敗都採證後回滾到 `:live`）。
 
@@ -92,7 +109,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - Codex 主模型預設為 `gpt-6.1-sol`，推理強度 `high`；developer 的 Hermes profile 與 Codex app-server 設定須保持一致。更換模型時確認目前帳號與 runtime 支援。
 - `bin/codex-developer` 依 PATH 使用 `codex`（可用 `DEVFLOW_CODEX_BIN` 明確覆寫），不固定到系統舊版。模型設定、驗證身分與 skills 使用同一個 `CODEX_HOME`（預設 `/opt/data/profiles/developer/codex`；可用 `DEVFLOW_CODEX_HOME` 覆寫），更新 binary 不會搬移或清除 skills。若要新增 developer 的 Codex skills，須安裝到這個 home 的 `skills/`，不是其他帳號的 `~/.codex/skills/`。
 - Opus 5.5 走 `github-copilot` plugin（provider `copilot`，憑證在 Hermes 原生 credential pool）。reviewer profile 預設 Opus、`fallback_providers` 退回 `openai-codex`；`[ADV]` 卡由 `devflow check plan` 以卡片 model/provider 覆寫指定 Opus。
-- Decisions API（`roles.json` 的 `decisions`）用 Hermes 既有 OpenAI key（GPT-Live 同一把）；`check plan` 的 `flag`、`check acceptance` 的 `pass` 為機率門檻。
+- Decisions API（`roles.json` 的 `decisions`）用 Hermes 既有 OpenAI key；`flag` 是疑慮門檻（D0、D1、D2），`pass` 是驗收門檻（D3）。
 
 ## Hermes 原生限制與對應（不改 Hermes 程式）
 | 原生行為 | 影響 | devflow 對應 |
