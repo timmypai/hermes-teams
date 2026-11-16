@@ -16,15 +16,23 @@ metadata:
 ## 1. 收需求 → 建 EPIC
 觸發：使用者要求開發、修 bug、改架構、接新 repo、部署。單純提問或查進度不是需求。
 
+兩種入口，步驟相同，差在「問使用者」怎麼做：
+- **文字對話**：你直接問、直接等回答。
+- **Hermes Talk 語音委派**：語音 session 已和使用者談過，交給你的任務文字裡有 repo、目標、AC 草稿、使用者原話、是否已語音確認。你在背景執行，**不能直接問使用者**：需要使用者回答時，不建卡，把問題（最多 2 題，一句話一題，附建議選項）當作這次任務的結果回傳；語音 session 會念出來，拿到答案後再委派一次。已寫「已語音確認」就跳過第 5 步。
+
 1. **確認 repo**：`terminal: /opt/data/devflow/bin/devflow repo list`。
    - 已接入 → 用該 slug。
    - 未接入的既有 repo → `devflow repo add OWNER/REPO`（自動建 board、clone、設定權限、申請部署 runner；確定不部署加 `--no-runner`）。
    - 全新專案 → `devflow repo add OWNER/NAME --create`（預設 private；使用者說公開才加 `--public`）。GitHub owner 沒講就用 builder 帳號（`gh api user --jq .login`）。
 2. **釐清三件事**：要達成什麼、怎樣算完成、有沒有不能碰的東西。一次最多問 2 題，只問答案會改變做法的；其他用合理預設並寫進卡片「提示」。使用者說「grill me」才用 `grilling`。
 3. **寫成驗收條件**：把「怎樣算完成」寫成編號的 `AC-1`、`AC-2`…，每條都是使用者看得到、可以實際操作檢查的結果（「在 X 做 Y，看到 Z」「GET /a 回 200 與 …」），不寫做法。有畫面的需求，寫出在畫面上要看到什麼。編號後緊接類型標記：`[ui]`（瀏覽器畫面）、`[api]`（HTTP API）、`[cli]`（命令列／批次）、`[lib]`（函式庫呼叫）、`[manual]`（真的無法自動執行，例如文件內容或外部帳號設定；盡量少用，會送 advisor 確認）。例：`- AC-1 [ui] 在待辦頁新增「買牛奶」後清單出現這一筆，重新整理仍在`。這些 AC 是整個流程的驗收依據：orchestrator 會把每條展開成 Given/When/Then 情境，CI、整合驗收與部署後逐一執行，最後逐條判定 PASS/FAIL。
-4. **語音確認一次**：用一句話念出 AC 重點（「我整理成三點：…，這樣對嗎？」）。使用者修正就改；沒意見、說「照預設」或已授權不用問 → 直接建卡。不要為了確認反覆追問。
-5. **防重複**：`kanban_list(board=slug)` 看有沒有未完成的 `[EPIC]` 在做同一件事；有就 `kanban_comment` 補充，不另建。
-6. **建卡**：
+4. **檢查 AC（D0）**：`terminal: printf '%s\n' '<AC 行>' | /opt/data/devflow/bin/devflow check ac --said '<使用者原話>'`。
+   - `0`：通過。
+   - `1`：`findings` 指出缺類型、太模糊或使用者要的結果沒有 AC。能自己改寫的（補類型、把模糊詞換成看得到的結果）就改了再跑；需要使用者決定的（範圍、門檻、要不要做）就問使用者（語音委派時回傳問題），不建卡。
+   - `2`：格式正確但 Decisions API 無法使用 → 照樣建卡，在「提示」寫「D0 未判定（Decisions API 無法使用）」。
+5. **語音確認一次**：用一句話念出 AC 重點（「我整理成三點：…，這樣對嗎？」）。使用者修正就改；沒意見、說「照預設」或已授權不用問 → 直接建卡。不要為了確認反覆追問。
+6. **防重複**：`kanban_list(board=slug)` 看有沒有未完成的 `[EPIC]` 在做同一件事；有就 `kanban_comment` 補充，不另建。
+7. **建卡**：
    ```
    kanban_create(
      board=slug, assignee="orchestrator", workspace_kind="dir",
@@ -32,12 +40,12 @@ metadata:
      idempotency_key="epic:<slug>:<目標關鍵字>",
      body="## 目標\n...\n## 驗收\n- AC-1 [ui] ...\n- AC-2 [api] ...\n## 提示\n- 需要部署：是/否\n- 限制/偏好：...\n- 使用者原話：...\n- 來源：Hermes <日期>")
    ```
-   建立後這個對話會自動收到 EPIC 與所有子卡的通知。
-7. **回覆**：一句話：「已建立 t_xxxx，orchestrator 接手了，需要你決定的事我會問你。」
+   建立後這個對話會自動收到 EPIC 與所有子卡的通知（語音委派時通知送到 gateway 的聊天平台，不是語音 session）。
+8. **回覆**：一句話：「已建立 t_xxxx，orchestrator 接手了，需要你決定的事我會問你。」
 
 ## 2. 回報進度
 - `kanban_list(board=slug)` → `kanban_show(epic)`；說：完成幾張、正在做什麼、有沒有卡住、下一步。語音只講重點，ID 在使用者要時再說。
-- 收到通知時：complete → 一句話轉述成果（PR / 部署網址）；blocked → 進入第 3 節；EPIC complete → 報告最終結果，逐條念 AC 的 PASS/FAIL（metadata `acceptance`）。orchestrator 要求的看板操作（改卡、封存、重跑）由 dispatcher tick 自動執行，你不用代做。
+- 收到通知時：complete → 一句話轉述成果（PR / 部署網址）；blocked → 進入第 3 節；EPIC complete → 報告最終結果，逐條念 AC 的 PASS/FAIL 與一句判斷依據（metadata `acceptance`：哪個情境、改動前是否紅燈、截圖看到什麼）；`[manual]` 或未判定的 AC 明說「這條需要你看一下」並給證據連結。orchestrator 要求的看板操作（改卡、封存、重跑）由 dispatcher tick 自動執行，你不用代做。
 - 你在聊天中（不是 worker）要重跑卡片時，用 `devflow resume <slug> <task> [--note "..."]`，不要直接 `kanban_unblock`：已開過 PR 的卡，Hermes dispatcher 會擋 24 小時不重派，`resume` 會做原生的交接動作解除，並重設失敗計數。
 
 ## 3. 被卡住的卡片

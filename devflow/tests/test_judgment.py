@@ -171,10 +171,11 @@ class Judge(JudgmentCase):
         self.assertEqual(self.f.decide_calls, 2)
         self.assertIsNone(rec["advisor"])
 
-    def test_unanswered_question_fails_closed(self) -> None:
+    def test_unanswered_question_goes_to_the_advisor(self) -> None:
         self.df.decide = lambda content, qs: {}
-        with self.assertRaises(self.df.DecisionsError):
-            self.df.judgment("b", REPO, 7)
+        rec = self.df.judgment("b", REPO, 7)
+        self.assertIn("unlabeled_fix", rec["unjudged"])
+        self.assertTrue(any("請 advisor 代為回答 unlabeled_fix" in f for f in rec["findings"]))
 
     def test_write_for_a_replaced_fingerprint_is_dropped(self) -> None:
         old = self.df.judgment("b", REPO, 7)["fingerprint"]
@@ -195,11 +196,17 @@ class Judge(JudgmentCase):
 
 
 class ShipMerge(JudgmentCase):
-    def test_api_failure_refuses_without_status_or_merge(self) -> None:
+    def test_api_failure_waits_for_the_advisor_without_merging(self) -> None:
         self.f.decide_error = "HTTP 500"
-        code, _ = self.ship()
-        self.assertEqual(code, 1)
-        self.assertEqual((self.f.statuses, self.f.merges), ([], []))
+        code, out = self.ship()
+        self.assertEqual((code, json.loads(out)["wait"]), (3, "retry"))
+        self.assertEqual((self.f.statuses, self.f.merges), (["pending"], []))
+        self.df.tick_prs("b", REPO, [])  # the tick opens the [ADV] that answers in place of Decisions
+        adv = self.record()["advisor"]
+        self.assertIn("HTTP 500", self.f.cards[adv]["body"])
+        self.f.cards[adv].update(status="done", verdict="ok")
+        self.assertEqual(self.ship()[0], 0)
+        self.assertEqual(len(self.f.merges), 1)
 
     def test_clean_pr_posts_status_then_merges_the_judged_head(self) -> None:
         code, out = self.ship()

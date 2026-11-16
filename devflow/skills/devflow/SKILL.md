@@ -83,7 +83,8 @@ metadata:
 | `devflow contract SLUG [DIR] [--ui]` | 把 devflow repo 契約檔（CI/CD、deploy、test、verify；`--ui` 加 Playwright）補進 DIR，不覆蓋既有檔，列出與範本不同的檔 |
 | `devflow check plan SLUG EPIC [--advise]` | 檢查計畫（唯讀）：卡型/assignee/workspace/contract/SHIP/parent 鏈/AC 覆蓋 + Decisions API 風險；`--advise` 有新疑慮時建 `[ADV]`（dispatcher tick 會自動跑） |
 | `devflow tick SLUG` | 看板自動化（由 `on_kanban_dispatch_tick` hook 觸發）：執行 orchestrator 的 `devflow-ops`、計畫變動時跑 check plan |
-| `devflow check acceptance SLUG EPIC --pr N... [--review] [--evidence FILE] [--json]` | 向 GitHub 核對 PR CI／base／部署／整合 run 的身分與情境結果，再每條 AC 一次 Decisions 判定 PASS/FAIL；`--review` 只檢查開著的 PR（reviewer 用） |
+| `devflow check ac [--said TEXT] < AC 行` | D0：建 EPIC 前檢查 AC 草稿（類型、是否太模糊、使用者原話有沒有漏）；exit 0 通過、1 要問使用者、2 Decisions 無法使用（照樣建卡） |
+| `devflow check acceptance SLUG EPIC --pr N... [--review] [--evidence FILE] [--json]` | 向 GitHub 核對 PR CI／base／部署／整合 run 的身分與情境結果，再每條 AC 一次 Decisions 判定 PASS/FAIL（API 無法使用時 `UNJUDGED`，exit 3）；`--review` 只檢查開著的 PR（reviewer 用） |
 | `devflow runner request OWNER/REPO` | 為 repo 註冊 Oracle VM self-hosted runner（需 repo admin） |
 | `devflow runner status OWNER/REPO` | 查 runner 狀態 |
 | `devflow resume SLUG TASK [--note TEXT]` | 只限 Hermes 聊天：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |
