@@ -401,6 +401,33 @@ class CheckAcceptance(Case):
         self.assertEqual((code, self.rows(rep)["AC-1"]["verdict"], self.rows(rep)["AC-3"]["verdict"]), (1, "FAIL", "UNJUDGED"))
 
 
+class SourceExcerpts(Case):
+    def write(self, name: str, text: str) -> Path:
+        p = self.root / "ev" / "sources" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return self.root / "ev"
+
+    def test_data_driven_spec_sends_assertions_far_below_the_id_table(self) -> None:
+        # ids in a spec table; the shared Then assertion sits 80 lines below (seen in a real run: the
+        # judge got only the table and refused to rate assertions_sufficient)
+        table = "\n".join(f"  {{ id: '{x}' }}," for x in (A1S1, A1S2))
+        root = self.write("ui/ac.spec.ts", f"for (const spec of [\n{table}\n]) {{\n" + "  // step\n" * 80
+                          + "  expect(text).toBe('requests: 1');\n}\n")
+        text = "".join(p["text"] for p in self.df.source_excerpts(root, [A1S1]))
+        self.assertIn("expect(text).toBe('requests: 1')", text)
+
+    def test_file_over_budget_falls_back_to_lines_around_the_id(self) -> None:
+        root = self.write("verify.sh", "filler\n" * 200 + f"scenario {A2S1} x\n" + "tail\n" * 200)
+        text = self.df.source_excerpts(root, [A2S1], budget=1000)[0]["text"]
+        self.assertIn(A2S1, text)
+        self.assertLess(len(text), 1000)
+
+    def test_files_without_the_ids_are_left_out(self) -> None:
+        root = self.write("verify.sh", f"scenario {A2S1} x\n")
+        self.assertEqual(self.df.source_excerpts(root, [A1S1]), [])
+
+
 class CheckAc(Case):
     """D0: draft AC lines before the EPIC exists (no scenarios yet)."""
 

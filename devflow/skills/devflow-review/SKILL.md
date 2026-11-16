@@ -26,7 +26,7 @@ metadata:
 - 再自己看證據：`gh run download <CI run> -D /tmp/review-<task>/evidence`，讀 `acceptance-matrix.md`，對每個情境：
   - 開 `sources/` 裡的情境程式，確認 Then 的斷言真的檢查 AC 要的結果（具體值、筆數、訊息），不是只檢查「頁面打開」「回 200」；Given 結尾有斷言前置狀態。
   - `ui` 情境用 vision 看 `shots/` 截圖，確認畫面真的顯示 AC 要的結果。
-  - `acceptance-base.json`：RED 的失敗段落與錯誤合理（例如找不到「新增」按鈕、清單沒有那一筆）；`Already-met`／`Base-unverifiable` 的理由要你判斷成立，不成立就退件。
+  - `acceptance-base.json`：每個 RED 的失敗要落在 AC 要新增或改變的行為上（例如找不到要新增的「新增」按鈕、清單沒有那一筆），不是環境錯誤、啟動失敗、或選擇器打錯了 base 本來就有的東西。用 base 證據確認：`ui` 情境看 base 的 `shots/` 截圖或 `playwright/*/error-context.md` 的 page snapshot（例如畫面真的沒有那個按鈕）。最終驗收的 Decisions 不判斷這點，只有你這一關；不成立就退件。`Already-met`／`Base-unverifiable` 的理由要你判斷成立，不成立就退件。
 - 檢查（`code-review` 的 Standards + Spec 兩軸）：
   1. 卡片覆蓋的每條 AC，EPIC 的每個情境都有對應實作、`Covers:`、通過的情境與證據；`[smoke]` 情境不寫資料。缺情境、斷言太弱或證據不足 → 退件，寫明哪個情境 id、要斷言什麼；由 developer 改 PR，你審新的 head。你不改 PR。
   2. 正確性與邊界條件；錯誤處理；讀者負擔（`pstack:principle-minimize-reader-load`）：一個概念散在多處、要跳很多檔案才看得懂、命名誤導 → 指出具體位置，影響正確理解才退件。
@@ -61,3 +61,10 @@ gh pr review <pr> --request-changes --body "<同下列清單>"
 kanban_request_changes(reason="1. <檔案:行> <問題> → <要怎麼改>\n2. ...")
 ```
 退件理由要具體到 developer 不用再問就能改。沒有次數上限；同一問題第二次退件時，說明為什麼前一次修正沒解決，並給更直接的做法。
+
+## 4. kit PR（devflow 本身的 repo，沒有卡片）
+由 `review-kit-pr.sh` 在 Hermes chat 叫你，prompt 給 repo、PR 號與暫存目錄。沒有卡片，不用 `kanban_*`；第 1、2 節的卡片、EPIC、`check acceptance`、`check pr` 不適用。
+1. 讀：`gh pr view <pr> -R <repo> --json title,body,headRefOid,files,statusCheckRollup`、`gh pr diff <pr> -R <repo>`。
+2. 驗：在暫存目錄 `git clone` 該 repo、`git checkout <headRefOid>`，跑 `cd devflow/tests && python3 -m unittest`（失敗 = 退件）；PR 有改的行為，自己寫一次性指令驗證（放暫存目錄）。`ci` check 不是 success 也退件。
+3. 查：PR 說明的問題是否真的解決、測試是否測行為；**放寬 gate**（刪檢查、降門檻、跳過情境、擴大豁免、讓 agent 能自己核准自己）沒有在 PR 說明寫出理由與使用者同意 → 退件。其餘同第 2 節「檢查」2–5。
+4. 結論：通過 `gh pr review <pr> -R <repo> --approve --body "LGTM: <理由>"`；否則 `gh pr review <pr> -R <repo> --request-changes --body "1. <檔案:行> <問題> → <要怎麼改>\n2. ..."`。最後一行只輸出 `VERDICT: approved` 或 `VERDICT: changes_requested`。刪掉暫存目錄。
