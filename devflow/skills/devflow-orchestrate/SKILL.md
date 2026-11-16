@@ -50,10 +50,11 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    - 卡片只寫目標與驗收，不寫實作細節；做法交給 architect / developer。
 4. 建卡：
    ```
-   kanban_create(title="[DEV] ...", assignee="developer", workspace_kind="worktree",
-                 parents=[...], body="## 目標\n...\n## 驗收\n- ...\n## 提示\n- 相關檔案...\n- EPIC: t_xxxx",
+   kanban_create(title="[DEV] ...", assignee="developer", workspace_kind="worktree", goal_mode=true,
+                 parents=[...], body="## 目標\n...\n## 本卡完成\nPR 已開、exact-head CI 綠、已交 review；合併與部署由 [SHIP] 負責。\n## 驗收\n- ...\n## 提示\n- 相關檔案...\n- EPIC: t_xxxx",
                  skills=[選用，例如 "tdd"])
    ```
+   `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。goal judge 用 title+body 判斷能否交 review，所以 body 一定要有上面的 `## 本卡完成`，否則會因「還沒部署」擋下 review。goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。
 5. 把每條路徑的最後一張卡（通常是 `[SHIP]`）連成 EPIC 的 parent：`kanban_link(parent_id=<leaf>, child_id=<EPIC>)`。
 6. 自查：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`findings` 裡的規則問題（assignee、workspace、contract、缺 `[SHIP]`、AC 沒人負責、沒接到 EPIC）自己修掉再跑一次；`Decisions …` 開頭的是風險判斷，不用自己處理。

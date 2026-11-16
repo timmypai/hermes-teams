@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 os.umask(0o022)
@@ -460,10 +460,23 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
         todo.extend(d["parents"])
         if tid != epic:
             todo.extend(d["children"])
-    for c in shown.values():
+    goal = goal_modes(board, list(shown))
+    for tid, c in shown.items():
         c["parents"] = [p for p in c["parents"] if p not in pr_adv]
         c["children"] = [p for p in c["children"] if p not in pr_adv]
+        c["goal_mode"] = tid in goal
     return shown
+
+
+def goal_modes(board: str, ids: list[str]) -> set[str]:
+    """Cards running in Hermes goal mode; `kanban show --json` does not carry the flag."""
+    import sqlite3
+    db = BOARDS / board / "kanban.db"
+    if not ids or not db.exists():
+        return set()
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+        marks = ",".join("?" * len(ids))
+        return {r[0] for r in conn.execute(f"SELECT id FROM tasks WHERE goal_mode AND id IN ({marks})", ids)}
 
 
 def repo_deploys(board: str) -> bool:
@@ -508,6 +521,11 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             ships = [x for x in c["children"] if card_type(cards.get(x, {}).get("title", "")) == "SHIP"]
             if repo_deploys(board) and not ships:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
+            # Goal mode: a turn that stops without a kanban terminal call ("waiting for CI") gets a
+            # continuation turn instead of a protocol-violation crash and the 24h active_pr hold.
+            if not c.get("goal_mode"):
+                found.append(f"{tid}: [{kind}] 沒有 goal_mode，developer 停下沒呼叫終結工具時會被記 crash 並扣住；"
+                             "goal_mode 建卡後改不了，作廢此卡並以 goal_mode=true 重建")
         if kind not in ("EPIC", "ADV", "ADJ") and tid not in feeds:
             found.append(f"{tid}: 沒有接到 EPIC 的 parent 鏈，EPIC 驗收不會等它")
     work = "\n".join(f"{c['title']}\n{c['body'] or ''}" for t, c in cards.items() if t != epic)
