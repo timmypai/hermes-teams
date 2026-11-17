@@ -21,8 +21,9 @@ PR ──ci.yml (GitHub-hosted ubuntu-latest)
       ├─ verify-base: .devflow/verify-base.sh（PR base + head 的 .devflow/，只跑 Covers:，必須在 When/Then 紅燈）→ artifact devflow-evidence-base-<head sha>-<attempt>
       └─ devflow-ci: 彙總（required check / Hermes contract）
 main push ──deploy.yml (runs-on: [self-hosted, devflow] = Oracle VM 主機 devflow 使用者, rootless Docker)
+            └─ default branch tip only：不是 default branch 最新 commit 就在寫入秘密前失敗（擋分支 dispatch 與重跑舊 run 降版）
             └─ .devflow/deploy.sh: compose build → up -d → health → verify.sh DEVFLOW_SMOKE=1（只跑唯讀 [smoke] 情境）
-               → up / health / verify 失敗（含缺 verify.sh）：先 capture.sh 採證，再自動回滾到上一版；build 失敗不動執行中版本
+               → up / health / verify 失敗（含缺 verify.sh）：先 capture.sh 採證，再自動回滾到上一個成功的 release（確切映像 ID + 當時的 compose/.env/config.env，原子切換；不看 :live tag；資料不回復）；build 失敗不動執行中版本
                → artifact devflow-evidence-deploy-<sha>-<attempt>、devflow-diagnostics-deploy-<sha>（7 天）
 workflow_dispatch ──ci.yml --ref <default>：整合驗收，在部署的 SHA 跑全部情境（一次性環境）→ artifact devflow-evidence-integration-<sha>-<attempt>
 workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 trace、採證 → artifact devflow-repro-<run>（developer 除錯用）
@@ -60,11 +61,11 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 2. `gh pr view N --json state,mergeable,headRefOid,statusCheckRollup,mergeCommit`
    - 已 merged → 跳到 4。
    - `devflow-ci` 紅或有衝突 → 見 §5。`devflow-judgment` 不是 success 不算 CI 紅：直接做第 3 步。
-3. `devflow ship merge <slug> N`（不要直接 `gh pr merge`）。它重新判斷 PR 目前的 head + 標題 + 說明（review 後說明被改也擋得到），寫入 `devflow-judgment`，然後 squash merge 那個 head。結束碼：
+3. `devflow ship merge <slug> N`（不要直接 `gh pr merge`）。它先確認 reviewer 帳號最新的有效 review 是 APPROVED 且核准的就是目前 head，再重新判斷 PR 目前的 head + 標題 + 說明（review 後說明被改也擋得到），寫入 `devflow-judgment`，然後 squash merge 那個 head。結束碼：
    - `0`：已合併，輸出 `merged_sha`。
    - `3`：有疑慮，等 `[ADV]` advisor 結論（Decisions API 無法判斷時也是這樣：advisor 代替 Decisions 判斷）。看輸出的 `wait`：`dependency` → `kanban_link(parent_id="<輸出的 advisor>", child_id="<本卡>")`，再 `kanban_block(kind="dependency", reason="devflow ship merge：等 advisor 判斷 PR #N")`，advisor 完成後本卡自動回來，從這一步重跑（不要用沒有 kind 的 block：連續兩次會被送去 triage）；`retry` → tick 還沒建 `[ADV]`：`kanban_heartbeat`，等 1 分鐘重跑，最多 10 次，仍是 `retry` 才 `kanban_block(kind="needs_input", reason=...)`。
    - `4`：advisor 回 `revise`（或沒寫 verdict）→ 照第 1 步「未出貨」完成本卡。
-   - `1`：其他錯誤（PR 在判斷後被修改、merge 被拒）→ 看訊息；PR 被修改就直接重跑。
+   - `1`：其他錯誤（PR 在判斷後被修改、merge 被拒）→ 看訊息；PR 被修改就直接重跑。訊息是 reviewer 沒核准目前 head（沒核准、核准後退件或被撤銷、只核准過舊 head）→ 不要自己核准或合併，`kanban_complete(summary="未出貨：reviewer 未核准 PR #N 目前的 head <sha 前 7 碼>", metadata={"shipped": false})`，由 orchestrator 安排重新審查。
 4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：先 `devflow runner status <repo>` 確認 runner online（不在就 `devflow runner request`），再追部署：
    ```bash
    gh run list --workflow deploy.yml --commit <sha> --json databaseId,status,conclusion,url   # 剛 merge 可能要等幾秒才出現
@@ -77,7 +78,7 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
    gh run list -R <OWNER/REPO> --workflow ci.yml --event workflow_dispatch -L 1 --json databaseId,headSha,status,url
    gh run watch <id> -R <OWNER/REPO> --exit-status
    ```
-   `headSha` 必須等於剛部署的 SHA（`gh run list --workflow deploy.yml --status success -L 1 --json headSha`）；不同（期間又有人合併）就等那次部署完成後再觸發一次。整合 run 失敗 = 合併後有情境壞掉：照 §5 第一列建修正卡，body 附整合 run URL 與失敗情境 id。
+   `headSha` 必須等於 default branch 最新 commit，而且那個 commit 最新的部署 run 成功（`gh run list --workflow deploy.yml --commit <headSha> -L 1 --json conclusion`）；不同（期間又有人合併）就等那次部署完成後再觸發一次。最終驗收只認 default branch 最新 commit 的部署：它失敗時，較舊的成功部署不算。整合 run 失敗 = 合併後有情境壞掉：照 §5 第一列建修正卡，body 附整合 run URL 與失敗情境 id。
 6. `devflow repo sync <slug>`；`devflow repo list` 顯示 `contract=no` 時跑 `devflow repo protect <slug>`（default branch 已有 `devflow-ci` 就會設成 required check，之後的 PR 卡改用 contract；GitHub Free 的 private repo 會回報不支援，維持 local-only，不要處理）。
 7. `kanban_complete(summary="已合併並部署 <sha 前 7 碼>，部署後 smoke 與整合驗收通過", metadata={"merged_sha", "deploy_run_id", "deploy_run_url", "integration_run_url", "verify": "<smoke 與整合 run 各情境結果>", "evidence_artifact": "devflow-evidence-deploy-<sha>-<attempt>"})`。summary 裡的數字（耗時、回應時間、容量）要說明怎麼量的、和什麼比（`pstack:principle-explain-the-number`）。
 
@@ -85,7 +86,8 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 | 狀況 | 做法 |
 |---|---|
 | CI 紅（程式碼）、merge 衝突、部署失敗且是程式碼問題 | 建 `[DEV] 修正 PR #N：<原因>`（assignee developer、`workspace_kind="worktree"`、`workspace_path`=原 DEV 卡的 worktree、`completion_contract` 照 `devflow repo list`、body 附錯誤摘要與 run URL、`EPIC: ...`）→ 建新 `[SHIP]`（parent = 修正卡）→ `kanban_link(parent_id=<新 SHIP>, child_id=<EPIC>)` → 本卡 `kanban_complete(summary="未出貨：<原因>；改由 t_x → t_y", created_cards=[...])` |
-| runner offline / 主機 Docker 問題 | `devflow runner request` 重註冊；`devflow runner status`；修好後 `gh run rerun <id>` |
+| runner offline / 主機 Docker 問題 | `devflow runner request` 重註冊；`devflow runner status`；修好後部署最新版：`gh workflow run deploy.yml --ref <default>`（不要 `gh run rerun` 舊 run：期間有新合併時，它在 `default branch tip only` 失敗，不會部署） |
+| 部署 run 在 `default branch tip only` 失敗 | 不是程式問題：這個 SHA 已不是 default branch 最新版。追最新 commit 的部署 run（沒有就用上一列的 `gh workflow run`）；要回到舊版用 revert PR |
 | 部署 health、verify 或 up 失敗 | deploy.sh 已先採證再回滾。`gh run view <id> --log-failed` 看哪一步、哪個情境；`gh run download <id> -n devflow-diagnostics-deploy-<sha> -D /tmp/diag-<id>` 讀 `candidate/`（失敗版本的 `state.jsonl`、`logs/`、`health.json`、`host.txt`）與 `rollback/`（回滾後狀態）。判定是程式問題 → 照第一列建修正卡，body 附 run URL 與關鍵證據（不貼整段 log）；主機資源或 runner 問題 → 照第二列 |
 | build 失敗 | 執行中版本不受影響（`build-failed/` 記錄當下狀態）；看 `--log-failed` 的建置輸出，照第一列處理 |
 | 需要使用者決定（公開網域、付費、刪資料） | 才 `kanban_block(kind="needs_input")` |

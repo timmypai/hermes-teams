@@ -123,6 +123,7 @@ class FakeGitHub:
         self.artifacts: dict[int, dict[str, dict]] = {}
         self.compare: dict[tuple[str, str], str] = {}
         self.calls: list[list[str]] = []
+        self.tip = D  # newest commit of the default branch
 
     def run(self, cmd, gh=None, check=True, cwd=None, input=None):
         self.calls.append(cmd)
@@ -131,6 +132,8 @@ class FakeGitHub:
             path = cmd[2].split("?")[0]
             if path == f"repos/{REPO}":
                 out = {"default_branch": "main"}
+            elif path == f"repos/{REPO}/commits/main":
+                out = {"sha": self.tip}
             elif m := re.fullmatch(rf"repos/{REPO}/actions/workflows/(.+)/runs", path):
                 out = {"workflow_runs": self.runs.get(m[1], [])}
             elif m := re.fullmatch(rf"repos/{REPO}/actions/runs/(\d+)/artifacts", path):
@@ -306,6 +309,27 @@ class CheckAcceptance(Case):
         code, rep = self.check()
         self.assertEqual((code, rep["deploy_sha"]), (0, D), rep)
         self.assertEqual(self.rows(rep)["AC-1"]["scenarios"][1]["deploy"], None)
+
+    # --- the deploy that counts is the one of the default branch tip --------------------------
+
+    def test_tip_deployed_by_workflow_dispatch_counts(self) -> None:
+        self.deploy_run = wf_run(200, "deploy.yml", "workflow_dispatch", D, "main")
+        code, rep = self.check()
+        self.assertEqual((code, rep["deploy_sha"]), (0, D), rep)
+
+    def test_failed_deploy_of_the_tip_hides_an_older_success(self) -> None:
+        self.gh.tip = "e" * 40
+        self.gh.runs["deploy.yml"] = [self.deploy_run, {**wf_run(201, "deploy.yml", "push", "e" * 40, "main"),
+                                                        "conclusion": "failure"}]
+        self.assert_fails(["AC-1", "AC-2"], "部署 run 201 是 failure")
+
+    def test_running_deploy_of_the_tip_waits(self) -> None:
+        self.gh.runs["deploy.yml"] = [{**self.deploy_run, "status": "in_progress", "conclusion": None}]
+        self.assert_fails(["AC-1", "AC-2"], "還在 in_progress")
+
+    def test_tip_never_deployed(self) -> None:
+        self.gh.tip = "e" * 40
+        self.assert_fails(["AC-1", "AC-2"], f"找不到 main 最新 commit {'e' * 12} 的 deploy.yml run")
 
     # --- deterministic failures: that AC FAILs, no Decisions call for it ----------------------
 
@@ -488,6 +512,55 @@ class PlanUnjudged(Case):
         # Same plan, another failure: the stable finding text is already advised, so no second [ADV].
         self.df.check_plan("b", EPIC, advise=True, cards=cards, advised=frozenset(findings))
         self.assertEqual(len(opened), 1)
+
+
+class PlanShipGate(Case):
+    """An advisor's ok covers the [SHIP] cards it gated, not ones the plan gains later."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.df.plan_rules = lambda board, epic, cards: []
+        self.df.decide = lambda content, qs: {q["name"]: {"name": q["name"], "probability": 0.9 if q["name"] == "irreversible"
+                                                          else 0.0} for q in qs}
+        self.created: list[str] = []   # idempotency keys
+        self.links: list[tuple[str, str]] = []
+
+        def run(cmd, gh=None, check=True, cwd=None, input=None):
+            if "create" in cmd:
+                self.created.append(cmd[cmd.index("--idempotency-key") + 1])
+                return SimpleNamespace(returncode=0, stdout=f"Created t_{len(self.created):08x}\n", stderr="")
+            if "link" in cmd:
+                self.links.append((cmd[-2], cmd[-1]))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(cmd)
+        self.df.run = run
+
+    def plan(self, **ships: str) -> dict[str, dict]:
+        cards = {EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator", "parents": []}}
+        for t, status in ships.items():
+            cards[t] = {"title": f"[SHIP] {t}", "body": f"EPIC: {EPIC}", "status": status, "assignee": "devops", "parents": []}
+        return cards
+
+    def test_a_new_ship_gets_its_own_advisor_and_link(self) -> None:
+        rep = self.df.check_plan("b", EPIC, advise=True, cards=self.plan(t_a="todo"))
+        self.assertEqual((rep["advisor_card"], self.links), ("t_00000001", [("t_00000001", "t_a")]))
+        advised = set(rep["advised"])
+        # Advisor said ok; the plan now adds t_b with the same finding text: ask again and gate it.
+        rep = self.df.check_plan("b", EPIC, advise=True, cards=self.plan(t_a="todo", t_b="todo"), advised=frozenset(advised))
+        self.assertEqual(rep.get("advisor_card"), "t_00000002")
+        self.assertNotEqual(self.created[0], self.created[1])
+        self.assertIn(("t_00000002", "t_b"), self.links)
+        advised |= set(rep["advised"])
+        # t_a shipped: nothing new to gate, no third [ADV].
+        rep = self.df.check_plan("b", EPIC, advise=True, cards=self.plan(t_a="done", t_b="todo"), advised=frozenset(advised))
+        self.assertNotIn("advisor_card", rep)
+        self.assertEqual(len(self.created), 2)
+
+    def test_already_linked_ship_is_not_linked_again(self) -> None:
+        cards = self.plan(t_a="todo")
+        cards["t_a"]["parents"] = ["t_00000001"]
+        self.df.check_plan("b", EPIC, advise=True, cards=cards)
+        self.assertEqual(self.links, [])
 
 
 class PrExemption(Case):

@@ -2,10 +2,10 @@ name: devflow-kit
 # devflow 本身的檢查：腳本 lint、範本 workflow lint、檢查器單元測試。
 on:
   pull_request:
-    paths: ["devflow/**", ".github/workflows/devflow-kit.yml"]
+    paths: ["devflow/**", "host/**", ".github/workflows/devflow-kit.yml"]
   push:
     branches: [main]
-    paths: ["devflow/**", ".github/workflows/devflow-kit.yml"]
+    paths: ["devflow/**", "host/**", ".github/workflows/devflow-kit.yml"]
 permissions:
   contents: read
 jobs:
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: shellcheck
-        run: shellcheck -S warning devflow/templates/repo/.devflow/*.sh devflow/tests/*.sh
+        run: shellcheck -S warning devflow/templates/repo/.devflow/*.sh devflow/tests/*.sh host/*.sh
       - name: actionlint (template workflows)
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
@@ -28,5 +28,7 @@ jobs:
         run: python3 -m unittest discover -s devflow/tests -v
       - name: review-kit-pr merges only the approved head
         run: bash devflow/tests/review_kit_pr.sh
-      - name: deploy scenarios (success, build fail, health fail, verify fail)
+      - name: runner-host never follows container-planted symlinks as root
+        run: bash devflow/tests/runner_host.sh
+      - name: deploy scenarios (success, build fail, health fail, verify fail, rollback to the full release, stale :live tag)
         run: bash devflow/tests/deploy_scenarios.sh

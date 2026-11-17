@@ -46,8 +46,10 @@ metadata:
 ## 3. 結論
 **通過**
 ```bash
-gh pr review <pr> --approve --body "LGTM: <一句話理由>（Kanban <task-id>）"
+gh api -X POST repos/<OWNER/REPO>/pulls/<pr>/reviews -f commit_id=<你審的 headRefOid> -f event=APPROVE \
+  -f body="LGTM: <一句話理由>（Kanban <task-id>）"
 ```
+核准綁在你審的那個 commit；之後有新 commit，`devflow ship merge` 會拒絕合併，要你審新的 head。核准後才發現問題，就用下面的退件（最新的有效 review 決定能否合併）。
 ```
 kanban_complete(summary="通過：<理由>", metadata={"published_pr": "<PR URL>", "pr_url": "<PR URL>", "head_sha": "...", "verdict": "approved", "tests": [...],
                 "acceptance": {"<EPIC>/AC-1.S1": "<run URL>：head passed、base RED（When）、斷言檢查 <什麼>"}, "probes": ["<一次性檢查> → <結果>"]})
