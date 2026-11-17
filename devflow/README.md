@@ -138,4 +138,4 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 
 主機端：`host/setup-host.sh`、`host/runner-host.sh`（本機 repo），由 `deploy-kit.sh --host` 安裝。只改 skills/CLI/templates 時用 `deploy-kit.sh --kit-only`；改 `roles.json`、SOUL 後用 `deploy-kit.sh` 並重啟 gateway（`s6-svc -r /run/hermes-service/gateway-default`）。
 
-kit 本身的 PR（本 repo）：開 PR 後跑 `./review-kit-pr.sh <PR>`。它等 `ci` 綠燈，在 VM 用 reviewer profile（GitHub `paulpai0412`，不是 PR 作者）跑一次 Hermes chat，依 `devflow-review` 第 4 節審查：通過就 approve 並合併，否則 request changes（exit 4）。`.github/CODEOWNERS` 列的 gate 路徑（`bin/`、`skills/`、`templates/`、`roles.json`、`install.py`、`.github/`）另外要 code owner 核准，合併會等它（exit 3）：Bot 不能自己核准判斷自己工作的規則。
+kit 本身的 PR（本 repo）：開 PR 後跑 `./review-kit-pr.sh <PR>`。它等 `ci` 綠燈，在 VM 用 reviewer profile（GitHub `paulpai0412`，不是 PR 作者）跑一次 Hermes chat，依 `devflow-review` 第 4 節審查：通過就 approve 並合併它審過的那個 commit，否則 request changes（exit 4）。不需要人核准（使用者 2026-11-17 選定）；放寬 gate 的 PR 沒寫理由就退件，這條規則在 `devflow-review` 第 4 節。

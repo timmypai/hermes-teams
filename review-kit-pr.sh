@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Independent review of a kit PR (this repo) by the Hermes reviewer profile (its own GitHub account,
-# not the PR author): approve -> merge; findings -> request changes. Gate paths in .github/CODEOWNERS
-# still need the code owner's approval; the merge then waits for it.
+# not the PR author): approve -> merge; findings -> request changes. No human approval (user choice).
 # Approval and merge are bound to the head reviewed: a push during review is never merged on it.
 #   ./review-kit-pr.sh <PR>
 # Env: VM, VM_KEY, HERMES_CONTAINER, HERMES_RUNTIME_UID (same as deploy-kit.sh), KIT_REVIEWER.
@@ -39,7 +38,7 @@ case $verdict in
   approved)
     [[ $review == "APPROVED $head" ]] || { echo "no $REVIEWER approval on head $head: not merging" >&2; exit 1; }
     if gh pr merge "$pr" -R "$repo" --merge --match-head-commit "$head"; then echo "merged $head"
-    else echo "approved; merge blocked (head moved, or gate files need the CODEOWNERS approval)"; exit 3; fi ;;
+    else echo "approved; merge refused (head moved since review)"; exit 3; fi ;;
   changes_requested) echo "changes requested: see the review on the PR"; exit 4 ;;
   *) echo "no verdict from the reviewer session" >&2; exit 1 ;;
 esac
