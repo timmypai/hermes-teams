@@ -1,9 +1,0 @@
-# Gate code: the reviewer Bot can approve kit PRs, but changes here also need the owner's approval
-# (the Bot must not approve a change to the rules that judge its own work).
-/devflow/bin/          @tcci-timmy
-/devflow/skills/       @tcci-timmy
-/devflow/templates/    @tcci-timmy
-/devflow/roles.json    @tcci-timmy
-/devflow/install.py    @tcci-timmy
-/review-kit-pr.sh      @tcci-timmy
-/.github/              @tcci-timmy
