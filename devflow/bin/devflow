@@ -1270,8 +1270,11 @@ def board_rows(board: str, sql: str, args: tuple = ()) -> list[dict]:
 
 
 def known_chats() -> list[dict]:
-    """Chats a person uses with the default profile, most recently active first. Not the chats cards
-    were made in: automated `hermes chat --oneshot` runs make cards too, and nobody reads those."""
+    """Chats a person uses with the default profile that a card notification can reach, most recently
+    active first. Not the chats cards were made in: automated `hermes chat --oneshot` runs make cards
+    too, and nobody reads those. Not the default profile's `local` chats (its Bot Chat): the gateway's
+    kanban notifier resolves no adapter for them and skips their subscriptions without a log
+    (gateway/kanban_watchers_notifier.py `_claim_for_sub`); app (`api_server`) chats are woken."""
     if not SESSIONS_DB.exists():
         return []
     with closing(sqlite3.connect(f"file:{SESSIONS_DB}?mode=ro", uri=True)) as c:
@@ -1281,21 +1284,17 @@ def known_chats() -> list[dict]:
     seen: dict[tuple, dict] = {}
     for title, source, origin, active in rows:
         o = json.loads(origin)
-        if o.get("platform") and o.get("chat_id") and (o["platform"], o["chat_id"]) not in seen:
+        if o.get("platform") not in (None, "", "local") and o.get("chat_id") and (o["platform"], o["chat_id"]) not in seen:
             seen[(o["platform"], o["chat_id"])] = {**{f: o.get(f) for f in CHAT_FIELDS}, "title": title or "",
                                                    "source": source, "active": active or 0}
     return list(seen.values())
 
 
 def inbox() -> tuple[dict | None, str]:
-    """(chat, source): the chat set with `devflow inbox set`, else Hermes' Bot Chat (the bot's own
-    message page), else the most recently active chat."""
+    """(chat, source): the chat set with `devflow inbox set`, else the most recently active app chat."""
     if INBOX.exists():
         return json.loads(INBOX.read_text()), "set"
     chats = known_chats()
-    bot = next((c for c in chats if c["title"] == BOT_CHAT), None)
-    if bot:
-        return bot, "bot-chat"
     return (chats[0], "latest") if chats else (None, "none")
 
 

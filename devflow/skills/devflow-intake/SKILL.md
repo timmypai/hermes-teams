@@ -40,7 +40,7 @@ metadata:
      idempotency_key="epic:<slug>:<目標關鍵字>",
      body="## 目標\n...\n## 驗收\n- AC-1 [ui] ...\n- AC-2 [api] ...\n## 提示\n- 需要部署：是/否\n- 限制/偏好：...\n- 使用者原話：...\n- 來源：Hermes <日期>")
    ```
-   建立後這個對話會自動收到 EPIC 與所有子卡的通知（語音委派時通知送到 gateway 的聊天平台，不是語音 session）。沒有對話的卡（語音委派、CLI 建立）由 dispatcher tick 訂閱到收件聊天（`devflow inbox`：`set` 指定的聊天，沒指定就是 Hermes 的 Bot Chat），已經卡住的 needs_input 也會補送一次。
+   建立後這個對話會自動收到 EPIC 與所有子卡的通知（語音委派時通知送到 gateway 的聊天平台，不是語音 session）。沒有對話的卡（語音委派、CLI 建立）由 dispatcher tick 訂閱到收件聊天（`devflow inbox`：`set` 指定的聊天，沒指定就是最近用的 App 聊天；Hermes 的 Bot Chat 收不到卡片通知），已經卡住的 needs_input 也會補送一次。
 8. **回覆**：一句話：「已建立 t_xxxx，orchestrator 接手了，需要你決定的事我會問你。」
 
 ## 2. 回報進度
