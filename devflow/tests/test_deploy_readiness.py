@@ -111,6 +111,8 @@ class Readiness(Case):
         state.write_text(json.dumps(repos))
         self.gh.required = []
         self.assertEqual(list(self.failing()), ["ci-required"])
+        self.gh.rulesets_error = "Resource not accessible by integration (HTTP 403)"   # no admin / token scope
+        self.assertEqual(list(self.failing()), ["ci-required"])
         self.gh.rulesets_error = "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
         self.assertEqual(self.failing(), {})
 

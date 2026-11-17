@@ -352,7 +352,8 @@ RULES_UNSUPPORTED = "此 repo 的 GitHub 方案不支援 ruleset（GitHub Free �
 
 def _rules_error(p: subprocess.CompletedProcess) -> str:
     err = (p.stderr or p.stdout).strip()
-    if "Upgrade to GitHub Pro" in err or "HTTP 403" in err:
+    # Only GitHub's plan message: any other 403 (no admin, token scope, rate limit) is a real failure.
+    if "Upgrade to GitHub Pro" in err:
         return RULES_UNSUPPORTED
     return f"設定 ruleset 失敗：{err[-200:]}"
 
