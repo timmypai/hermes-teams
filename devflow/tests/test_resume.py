@@ -90,6 +90,38 @@ class Resume(unittest.TestCase):
         self.df.resume("b", "t_1")  # the retry `resume` would have refused on an unassigned card
         self.assertEqual(board.claims, [("ready", "developer")])
 
+    def triage(self, open_parent: bool) -> Board:
+        """A card Hermes parked in triage after blocking twice; the user's answer comes as the note."""
+        board = Board("devops", None)
+        board.task["status"] = "triage"
+        comments = []
+        inner = board.__call__
+
+        def kanban(b, cmd, task_id, *args):
+            if cmd == "comment":
+                comments.append((board.task["status"], args[0]))
+                return ""
+            return inner(b, cmd, task_id, *args)
+
+        def leave_triage(b, task_id):  # Hermes: triage -> todo, ready (and claimable) without open parents
+            board.task["status"] = "todo" if open_parent else "ready"
+            if not open_parent:
+                board.dispatch()
+        self.df.kanban, self.df.leave_triage = kanban, leave_triage
+        board.comments = comments
+        self.df.resume("b", "t_1", "使用者回覆：A")
+        return board
+
+    def test_triage_card_without_open_parents_runs_with_the_answer_posted_first(self):
+        board = self.triage(open_parent=False)
+        self.assertEqual(board.comments, [("triage", "使用者回覆：A")])
+        self.assertEqual(board.claims, [("ready", "devops")])
+
+    def test_triage_card_waiting_on_a_parent_keeps_the_answer_and_waits_in_todo(self):
+        board = self.triage(open_parent=True)
+        self.assertEqual(board.comments, [("triage", "使用者回覆：A")])
+        self.assertEqual((board.task["status"], board.task["assignee"], board.claims), ("todo", "devops", []))
+
 
 class CommentOps(unittest.TestCase):
     def setUp(self):
