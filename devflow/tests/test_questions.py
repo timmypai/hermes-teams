@@ -106,7 +106,7 @@ class RouteQuestions(unittest.TestCase):
                 ("Epic chat", "desktop", json.dumps(EPIC_CHAT), 50)])
             s.commit()
         # devops has its own Bot Chat with terminal; researcher's has no terminal; developer has none.
-        for p, tools in (("devops", "terminal\n    - clarify"), ("researcher", "file\n    - web")):
+        for p, tools in (("devops", "terminal\n    - clarify"), ("orchestrator", "terminal"), ("researcher", "file\n    - web")):
             (root / "data" / "profiles" / p).mkdir(parents=True)
             (root / "data" / "profiles" / p / "config.yaml").write_text(
                 f"model: x\nplatform_toolsets:\n  cli:\n    - {tools}\n  api_server:\n    - terminal\nkanban:\n  a: 1\n")
@@ -243,6 +243,20 @@ class RouteQuestions(unittest.TestCase):
         chats = [c for (c,) in self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_ship'")]
         self.assertEqual(chats, ["local-inbox"])
         self.assertEqual(self.df.pending("devops"), [])
+
+    def test_reassigned_blocked_card_moves_its_question_to_the_new_bot(self):
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        ev = self.board.block("t_ship")
+        self.tick()
+        self.board.db.execute("UPDATE tasks SET assignee='orchestrator' WHERE id='t_ship'")
+        self.board.db.commit()
+        self.tick()
+        self.tick()
+        self.assertEqual(sorted(self.board.sent), [("t_ship", ev, "local-devops"), ("t_ship", ev, "local-inbox"),
+                                                   ("t_ship", ev, "local-orchestrator")])
+        chats = sorted(c for (c,) in self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_ship'"))
+        self.assertEqual(chats, ["local-inbox", "local-orchestrator"])
+        self.assertEqual([p["ask_in"] for p in self.df.pending()], ["orchestrator"])
 
     def test_assignee_without_a_usable_bot_chat_is_asked_in_hermes_chat(self):
         self.board.card("t_dev", "[DEV] x", assignee="developer")    # no Bot Chat
