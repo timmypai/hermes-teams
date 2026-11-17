@@ -17,8 +17,10 @@ from pathlib import Path
 
 from test_judgment import KIT
 
-INBOX_CHAT = {"platform": "local", "chat_id": "local-inbox", "user_id": "uid:1", "chat_type": "dm"}
-EPIC_CHAT = {"platform": "local", "chat_id": "local-epic", "user_id": "uid:1", "chat_type": "dm"}
+# The default profile's app (api_server) chats: the kanban notifier can wake these. Its local Bot Chat it cannot.
+INBOX_CHAT = {"platform": "api_server", "chat_id": "local-inbox", "user_id": "uid:1", "chat_type": "dm"}
+EPIC_CHAT = {"platform": "api_server", "chat_id": "local-epic", "user_id": "uid:1", "chat_type": "dm"}
+BOT_CHAT = {"platform": "local", "chat_id": "20261110_bot", "user_id": "uid:1", "chat_type": "dm"}
 ONESHOT_CHAT = {**INBOX_CHAT, "chat_id": "local-oneshot"}
 DEVOPS_CHAT = {"platform": "local", "chat_id": "local-devops", "user_id": "uid:1", "chat_type": "dm"}
 
@@ -100,10 +102,10 @@ class RouteQuestions(unittest.TestCase):
         with closing(sqlite3.connect(root / "data" / "state.db")) as s:
             s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
             s.executemany("INSERT INTO sessions VALUES (?,?,?,?)", [
-                ("Bot Chat", "tui", json.dumps(INBOX_CHAT), 100),
+                ("Bot Chat", "tui", json.dumps(BOT_CHAT), 300),
                 ("建立 EPIC", "oneshot", json.dumps(ONESHOT_CHAT), 200),
-                ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150),
-                ("Epic chat", "desktop", json.dumps(EPIC_CHAT), 50)])
+                ("app chat", "api_server", json.dumps(INBOX_CHAT), 150),
+                ("Epic chat", "api_server", json.dumps(EPIC_CHAT), 50)])
             s.commit()
         # devops has its own Bot Chat with terminal; researcher's has no terminal; developer has none.
         for p, tools in (("devops", "terminal\n    - clarify"), ("orchestrator", "terminal"), ("researcher", "file\n    - web")):
@@ -220,10 +222,21 @@ class RouteQuestions(unittest.TestCase):
         self.tick()
         self.assertEqual(self.board.sent, [("t_cli", ev, "local-inbox")])
 
-    def test_inbox_is_bot_chat_never_an_automated_oneshot_session(self):
+    def test_inbox_is_the_latest_app_chat_never_bot_chat_or_a_oneshot_session(self):
         chat, source = self.df.inbox()
-        self.assertEqual((chat["chat_id"], source), ("local-inbox", "bot-chat"))
-        self.assertNotIn("local-oneshot", [c["chat_id"] for c in self.df.known_chats()])
+        self.assertEqual((chat["chat_id"], source), ("local-inbox", "latest"))
+        known = [c["chat_id"] for c in self.df.known_chats()]
+        self.assertNotIn("20261110_bot", known)
+        self.assertNotIn("local-oneshot", known)
+
+    def test_a_card_asked_only_in_bot_chat_is_asked_again_in_the_app_chat(self):
+        self.board.card("t_old", "[DEV] subscribed to Bot Chat before this change")
+        self.board.subscribe("t_old", BOT_CHAT)
+        ev = self.board.block("t_old")
+        self.st["asked"] = [f"b/t_old/{ev}"]   # an older tick "asked" it in Bot Chat, which never delivered
+        self.tick()
+        self.tick()
+        self.assertEqual([s for s in self.board.sent if s[2] == "local-inbox"], [("t_old", ev, "local-inbox")])
 
     def test_question_is_asked_once_in_the_assignee_bot_chat_and_hermes_also_hears(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
