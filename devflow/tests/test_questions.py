@@ -105,12 +105,16 @@ class RouteQuestions(unittest.TestCase):
                 ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150),
                 ("Epic chat", "desktop", json.dumps(EPIC_CHAT), 50)])
             s.commit()
-        # devops has its own Bot Chat; developer has none (its questions stay in Hermes' chat).
-        (root / "data" / "profiles" / "devops").mkdir(parents=True)
-        with closing(sqlite3.connect(root / "data" / "profiles" / "devops" / "state.db")) as s:
-            s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
-            s.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("Bot Chat", "gui", json.dumps(DEVOPS_CHAT), 10))
-            s.commit()
+        # devops has its own Bot Chat with terminal; researcher's has no terminal; developer has none.
+        for p, tools in (("devops", "terminal\n    - clarify"), ("researcher", "file\n    - web")):
+            (root / "data" / "profiles" / p).mkdir(parents=True)
+            (root / "data" / "profiles" / p / "config.yaml").write_text(
+                f"model: x\nplatform_toolsets:\n  cli:\n    - {tools}\n  api_server:\n    - terminal\nkanban:\n  a: 1\n")
+            with closing(sqlite3.connect(root / "data" / "profiles" / p / "state.db")) as s:
+                s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
+                s.execute("INSERT INTO sessions VALUES (?,?,?,?)",
+                          ("Bot Chat", "gui", json.dumps({**DEVOPS_CHAT, "chat_id": f"local-{p}"}), 10))
+                s.commit()
         self.profiles: list[tuple] = []
 
     def kanban(self, board, cmd, tid, *args):
@@ -240,12 +244,13 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(chats, ["local-inbox"])
         self.assertEqual(self.df.pending("devops"), [])
 
-    def test_assignee_without_bot_chat_is_asked_in_hermes_chat(self):
-        self.board.card("t_dev", "[DEV] x", assignee="developer")
-        ev = self.board.block("t_dev")
+    def test_assignee_without_a_usable_bot_chat_is_asked_in_hermes_chat(self):
+        self.board.card("t_dev", "[DEV] x", assignee="developer")    # no Bot Chat
+        self.board.card("t_res", "[RES] y", assignee="researcher")   # Bot Chat without terminal
+        ev_dev, ev_res = self.board.block("t_dev"), self.board.block("t_res")
         self.tick()
-        self.assertEqual(self.board.sent, [("t_dev", ev, "local-inbox")])
-        self.assertEqual([p["ask_in"] for p in self.df.pending()], ["default"])
+        self.assertEqual(sorted(self.board.sent), [("t_dev", ev_dev, "local-inbox"), ("t_res", ev_res, "local-inbox")])
+        self.assertEqual([p["ask_in"] for p in self.df.pending()], ["default", "default"])
 
 
 if __name__ == "__main__":

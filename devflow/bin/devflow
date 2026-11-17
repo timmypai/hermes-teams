@@ -1402,10 +1402,27 @@ def route_questions(board: str, st: dict) -> None:
 ASKED = ("needs_input", "capability")
 
 
+def chat_toolsets(profile: str) -> set[str]:
+    """`platform_toolsets.cli` of a profile's config.yaml (the toolsets of its Bot Chat), read as the
+    block style Hermes writes: `platform_toolsets:` / `  cli:` / `  - name` (no YAML parser here)."""
+    cfg = DATA / "profiles" / profile / "config.yaml"
+    lines = cfg.read_text().splitlines() if cfg.exists() else []
+    out, section, block = set(), False, False
+    for line in lines:
+        if not line.startswith(" "):
+            section, block = line.rstrip() == "platform_toolsets:", False
+        elif section and re.fullmatch(r"\s+\w+:\s*", line):
+            block = line.strip() == "cli:"
+        elif block and line.strip().startswith("- "):
+            out.add(line.strip()[2:].strip())
+    return out
+
+
 def profile_bot_chat(profile: str) -> dict | None:
-    """The profile's own Bot Chat (local), or None for default / a profile without one."""
+    """The profile's own Bot Chat (local), or None for default / a profile without one or without
+    `terminal` there (it could not run `devflow resume`)."""
     db = DATA / "profiles" / profile / "state.db"
-    if profile == "default" or not db.exists():
+    if profile == "default" or not db.exists() or "terminal" not in chat_toolsets(profile):
         return None
     with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
         row = c.execute("SELECT origin_json FROM sessions WHERE title = ? AND origin_json IS NOT NULL "
