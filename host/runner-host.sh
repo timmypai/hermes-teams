@@ -8,15 +8,19 @@
 set -euo pipefail
 . /etc/devflow/host.env   # HERMES_DATA_HOST, RUNNER_USER, RUNNER_TARBALL
 
-REQ="$HERMES_DATA_HOST/devflow/runner/requests"
-STATUS="$HERMES_DATA_HOST/devflow/runner/status"
+# Relative to the data dir: the owner may not be able to reach it by absolute path (the Hermes
+# runtime's home above it is 0700), so root enters it first and the owner works from there.
+REQ=devflow/runner/requests
+STATUS=devflow/runner/status
 OWNER=$(stat -c %u:%g "$HERMES_DATA_HOST")
 [[ ${OWNER%:*} != 0 ]] || { echo "refusing: $HERMES_DATA_HOST is owned by root" >&2; exit 1; }
 uid=$(id -u "$RUNNER_USER")
 home=$(getent passwd "$RUNNER_USER" | cut -d: -f6)
 
+# The data dir's parents are host-owned, so root may cd into it; everything below it is the
+# container's and is only touched after dropping to its owner.
 as_owner() {
-  (cd / && setpriv --reuid="${OWNER%:*}" --regid="${OWNER#*:}" --clear-groups -- "$@")
+  (cd "$HERMES_DATA_HOST" && setpriv --reuid="${OWNER%:*}" --regid="${OWNER#*:}" --clear-groups -- "$@")
 }
 
 as_user() {
@@ -52,10 +56,12 @@ PY
 
 write_status() { # key repo state message
   as_owner python3 - "$STATUS" "$@" <<'PY'
-import json, os, sys, tempfile, time
+import json, os, sys, time
 d, key, repo, state, msg = sys.argv[1:]
 os.makedirs(d, exist_ok=True)
-fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{key}.")
+# Not tempfile.mkstemp: it makes the path absolute, and the owner cannot traverse the data dir's parents.
+tmp = os.path.join(d, f".{key}.{os.getpid()}")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
 with os.fdopen(fd, "w") as f:
     json.dump({"repo": repo, "state": state, "message": msg[-600:], "at": int(time.time())}, f)
 os.chmod(tmp, 0o644)

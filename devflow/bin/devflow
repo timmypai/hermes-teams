@@ -1197,7 +1197,8 @@ def route_questions(board: str, st: dict) -> None:
                 continue
             subscribe(board, tid, chat)
             subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
-        if t["status"] not in ("blocked", "triage") or t["block_kind"] != "needs_input":
+        # Both go to blocked for a human (Hermes' typed blocks); the person has to be asked.
+        if t["status"] not in ("blocked", "triage") or t["block_kind"] not in ("needs_input", "capability"):
             continue
         ev = block_event(board, tid)
         key = f"{board}/{tid}/{ev}"

@@ -55,7 +55,10 @@ metadata:
   2. `clarify` 回報無法使用或被拒（被通知喚醒時沒人在看這個聊天）：改成在聊天留一則訊息，「需要你決定（<board> <task>）：<問題>\n1. <選項>（建議）\n2. <選項>\n直接回覆編號或你的想法」，然後結束這一輪。使用者之後在這個聊天回覆，就是這張卡的答案。
   3. 拿到答案 → `devflow resume <slug> <task> --note "使用者回覆：..."`，回一句「已交回 <assignee> 繼續」。
   問題可能出現在收件聊天，不是建 EPIC 的聊天；照樣處理。同一張卡已經回覆過、卡片不再 blocked 時不要再問。
-- **gave_up / crashed / timed_out / capability**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="<task id>、失敗原因摘要、EPIC id")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。
+- **capability**（缺權限或資源，只有人給得了：主機管理權、帳號、金鑰、付費服務）：從 block reason 找出「缺什麼、誰能給」，照 needs_input 的 1–3 問使用者。問題寫成一個具體動作，例如「t_xxxx（teams-transcription）：缺主機上的部署 runner，要我用 devflow 共用 runner 註冊嗎？」；選項至少有「同意，由 <誰> 做」和「先不要」。不建 `[ADJ]`；使用者回覆要改計畫時才建。
+- **gave_up / crashed / timed_out**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="<task id>、失敗原因摘要、EPIC id")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。
+
+被卡片通知喚醒的每一輪，最後都要留一則使用者看得到的訊息，第一句說「需要你決定」或「不用你處理」。需要時就是上面的問題（卡號、具體動作、選項）；不要只寫「需要取得…」「待確認…」這種沒有問題、使用者不知道要回什麼的結論。
 
 ## 4. Advisor（`[ADV]` 卡固定用 Opus 5.5：Copilot `claude-opus-5.5`，與其他 Bot 的 GPT 不同家，專門找盲點）
 - **對話中**：使用者問「該不該、怎麼選」時，給建議、取捨與你的推薦；可讀 board 與 repo 佐證。
