@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from test_judgment import KIT
@@ -93,9 +94,14 @@ class RouteQuestions(unittest.TestCase):
         self.df.kanban = self.kanban
         self.df.replay_from = self.replay_from
         self.st: dict = {}
-        # The inbox defaults to the newest chat a card was made in.
-        self.board.card("t_old", "[EPIC] earlier work", status="done")
-        self.board.subscribe("t_old", INBOX_CHAT)
+        # The default profile's chats: Bot Chat is the inbox even when an automated oneshot run is newer.
+        with closing(sqlite3.connect(root / "data" / "state.db")) as s:
+            s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
+            s.executemany("INSERT INTO sessions VALUES (?,?,?,?)", [
+                ("Bot Chat", "tui", json.dumps(INBOX_CHAT), 100),
+                ("建立 EPIC", "oneshot", json.dumps({**INBOX_CHAT, "chat_id": "local-oneshot"}), 200),
+                ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150)])
+            s.commit()
 
     def kanban(self, board, cmd, tid, *args):
         assert cmd == "notify-subscribe", cmd
@@ -123,11 +129,12 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(self.board.sent, [("t_cli", ev, "local-inbox")])
 
     def test_card_in_an_epic_path_asks_in_the_epic_chat(self):
-        self.board.card("t_epic", "[EPIC] goal")
-        self.board.subscribe("t_epic", EPIC_CHAT)
+        epic = "t_e01c0ffe"   # real ids are t_ + hex; [ADJ] bodies name them as `EPIC: t_…`
+        self.board.card(epic, "[EPIC] goal")
+        self.board.subscribe(epic, EPIC_CHAT)
         self.board.card("t_dev", "[DEV] step")
-        self.board.db.execute("INSERT INTO task_links VALUES ('t_dev', 't_epic')")
-        self.board.card("t_adj", "[ADJ] fix", body="EPIC: t_epic\nretry t_dev")
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_dev', ?)", (epic,))
+        self.board.card("t_adj", "[ADJ] fix", body=f"EPIC: {epic}\nretry t_dev")
         ev_dev, ev_adj = self.board.block("t_dev"), self.board.block("t_adj")
         self.tick()
         self.assertEqual(sorted(self.board.sent), [("t_adj", ev_adj, "local-epic"), ("t_dev", ev_dev, "local-epic")])
@@ -166,6 +173,11 @@ class RouteQuestions(unittest.TestCase):
         self.df.replay_from = real
         self.tick()
         self.assertEqual(self.board.sent, [("t_cli", ev, "local-inbox")])
+
+    def test_inbox_is_bot_chat_never_an_automated_oneshot_session(self):
+        chat, source = self.df.inbox()
+        self.assertEqual((chat["chat_id"], source), ("local-inbox", "bot-chat"))
+        self.assertNotIn("local-oneshot", [c["chat_id"] for c in self.df.known_chats()])
 
 
 if __name__ == "__main__":

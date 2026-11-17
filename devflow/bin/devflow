@@ -1075,6 +1075,10 @@ def tick_board(board: str, st: dict) -> None:
 # chat's cursor back to just before the block so Hermes' own notifier sends it and wakes Hermes.
 
 INBOX = ROOT / "state" / "inbox.json"
+SESSIONS_DB = DATA / "state.db"   # the default profile's sessions (Bot Chat, desktop, app)
+# Sessions no person reads: `hermes chat --oneshot`, kanban workers, subagents, cron jobs.
+UNREAD_SOURCES = ("oneshot", "kanban", "subagent", "cron")
+BOT_CHAT = "Bot Chat"
 OPEN = ("todo", "ready", "running", "blocked", "review", "scheduled", "triage")
 CHAT_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "user_id_alt", "chat_type")
 EPIC_REF = re.compile(r"\bEPIC:\s*(t_[0-9a-f]+)")
@@ -1087,26 +1091,32 @@ def board_rows(board: str, sql: str, args: tuple = ()) -> list[dict]:
 
 
 def known_chats() -> list[dict]:
-    """Chats the default profile follows devflow cards in (cards created there), newest first."""
+    """Chats a person uses with the default profile, most recently active first. Not the chats cards
+    were made in: automated `hermes chat --oneshot` runs make cards too, and nobody reads those."""
+    if not SESSIONS_DB.exists():
+        return []
+    with closing(sqlite3.connect(f"file:{SESSIONS_DB}?mode=ro", uri=True)) as c:
+        rows = c.execute("SELECT title, source, origin_json, last_activity_at FROM sessions WHERE origin_json IS NOT NULL "
+                         f"AND source NOT IN ({','.join('?' * len(UNREAD_SOURCES))}) ORDER BY last_activity_at DESC",
+                         UNREAD_SOURCES).fetchall()
     seen: dict[tuple, dict] = {}
-    for board in load_state():
-        if not (BOARDS / board / "kanban.db").exists():
-            continue
-        for s in board_rows(board, "SELECT s.*, t.title FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
-                                   "WHERE COALESCE(s.notifier_profile, '') IN ('', 'default') "
-                                   "AND s.delivery_mode = 'notify+wake'"):
-            k = (s["platform"], s["chat_id"], s["thread_id"] or "")
-            if k not in seen or s["created_at"] > seen[k]["created_at"]:
-                seen[k] = {**{f: s[f] for f in CHAT_FIELDS}, "created_at": s["created_at"], "board": board,
-                           "title": s["title"]}
-    return sorted(seen.values(), key=lambda c: -c["created_at"])
+    for title, source, origin, active in rows:
+        o = json.loads(origin)
+        if o.get("platform") and o.get("chat_id") and (o["platform"], o["chat_id"]) not in seen:
+            seen[(o["platform"], o["chat_id"])] = {**{f: o.get(f) for f in CHAT_FIELDS}, "title": title or "",
+                                                   "source": source, "active": active or 0}
+    return list(seen.values())
 
 
 def inbox() -> tuple[dict | None, str]:
-    """(chat, source): the chat set with `devflow inbox set`, else the newest chat cards were made in."""
+    """(chat, source): the chat set with `devflow inbox set`, else Hermes' Bot Chat (the bot's own
+    message page), else the most recently active chat."""
     if INBOX.exists():
         return json.loads(INBOX.read_text()), "set"
     chats = known_chats()
+    bot = next((c for c in chats if c["title"] == BOT_CHAT), None)
+    if bot:
+        return bot, "bot-chat"
     return (chats[0], "latest") if chats else (None, "none")
 
 
@@ -1196,20 +1206,21 @@ def cmd_inbox(a) -> None:
         current, _ = inbox()
         for c in known_chats():
             mark = "*" if current and (c["platform"], c["chat_id"]) == (current["platform"], current["chat_id"]) else " "
-            print(f"{mark} {c['platform']}:{c['chat_id']}  {time.strftime('%F %R', time.localtime(c['created_at']))}  "
-                  f"{c['board']}  {c['title'][:50]}")
+            print(f"{mark} {c['platform']}:{c['chat_id']}  {time.strftime('%F %R', time.localtime(c['active']))}  "
+                  f"{c['source']}  {c['title'][:50]}")
         return
     if a.action == "set":
         chat = next((c for c in known_chats() if f"{c['platform']}:{c['chat_id']}" == a.chat
                      or c["chat_id"] == a.chat), None)
         if chat is None:
-            die(f"{a.chat!r} 不在 `devflow inbox list`：先在那個聊天建過一張卡")
+            die(f"{a.chat!r} 不在 `devflow inbox list`（Hermes default profile 的聊天）")
         INBOX.parent.mkdir(parents=True, exist_ok=True)
-        INBOX.write_text(json.dumps({f: chat[f] for f in CHAT_FIELDS}, ensure_ascii=False) + "\n")
+        INBOX.write_text(json.dumps({f: chat[f] for f in (*CHAT_FIELDS, "title")}, ensure_ascii=False) + "\n")
     elif a.action == "unset":
         INBOX.unlink(missing_ok=True)
     chat, source = inbox()
-    print(json.dumps({"inbox": chat and f"{chat['platform']}:{chat['chat_id']}", "source": source}, ensure_ascii=False))
+    print(json.dumps({"inbox": chat and f"{chat['platform']}:{chat['chat_id']}", "title": chat and chat.get("title"),
+                      "source": source}, ensure_ascii=False))
 
 
 def cmd_tick(a) -> None:
