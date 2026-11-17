@@ -13,6 +13,19 @@ jobs:
     runs-on: [self-hosted, devflow]
     steps:
       - uses: actions/checkout@v4
+      # 只部署 default branch 的最新 commit：擋住分支上的 workflow_dispatch，也擋住較新版本上線後
+      # 重跑舊 run 把服務降版。在 concurrency 內、寫入秘密前檢查；較新的 run 會排在這次之後。
+      # 要回到舊版：revert PR 合併後正常部署。這只防誤用，不是安全邊界（README「信任邊界」）。
+      - name: default branch tip only
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tip=$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | cut -f1)
+          if [[ $GITHUB_REF != "refs/heads/$DEFAULT_BRANCH" || $GITHUB_SHA != "$tip" ]]; then
+            echo "::error::devflow: 只部署 $DEFAULT_BRANCH 的最新 commit ${tip:0:12}；這次是 $GITHUB_REF ${GITHUB_SHA:0:12}，未部署。最新版要部署：gh workflow run deploy.yml --ref $DEFAULT_BRANCH"
+            echo "### 未部署：${GITHUB_SHA::12} 不是 $DEFAULT_BRANCH 的最新 commit ${tip:0:12}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
       - name: app env
         env:
           APP_ENV: ${{ secrets.DEVFLOW_APP_ENV }}

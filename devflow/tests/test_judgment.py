@@ -48,6 +48,14 @@ class Fake:
         self.cards: dict[str, dict] = {}
         self.links: list[tuple[str, str]] = []
         self.resumed: list[str] = []
+        # The reviewer bot ("rev") approved the current head.
+        self.reviews: list[dict] = [self.review("APPROVED")]
+
+    def review(self, state: str, commit: str | None = None, user: str = "rev", at: str = "2026-11-01T00:00:00Z") -> dict:
+        return {"user": user, "state": state, "commit_id": commit or self.pr["headRefOid"], "submitted_at": at}
+
+    def pr_reviews(self, repo, number):
+        return list(self.reviews)
 
     def pr_meta(self, repo, number):
         import hashlib
@@ -104,9 +112,10 @@ class JudgmentCase(unittest.TestCase):
             {"b": {"slug": "b", "repo": REPO, "path": "/x", "port": 1, "default_branch": "main"}}))
         self.df = load_devflow(self.root)
         self.f = Fake(self.df)
-        for name in ("pr_meta", "decide", "run", "kanban", "resume"):
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
             setattr(self.df, name, getattr(self.f, name))
         self.df.pr_files = lambda repo, n: self.f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
 
     def call(self, fn, env_task: str | None = "t_ship") -> tuple[int, str]:
         if env_task:
@@ -265,6 +274,29 @@ class ShipMerge(JudgmentCase):
         code, out = self.ship()
         self.assertEqual((code, self.f.decide_calls), (0, 0))
         self.assertIn("m" * 40, out)
+
+    def test_merges_only_on_the_reviewers_latest_effective_approval_of_the_head(self) -> None:
+        r = self.f.review
+        refused = {
+            "同一 head：先 APPROVED，後 CHANGES_REQUESTED": [r("APPROVED"), r("CHANGES_REQUESTED", at="2026-11-02T00:00:00Z")],
+            "目前 head 的核准被撤銷（狀態變 DISMISSED）": [r("CHANGES_REQUESTED"), r("DISMISSED", at="2026-11-02T00:00:00Z")],
+            "最新的 APPROVED 在舊 head": [r("APPROVED", commit="b" * 40)],
+            "只有其他帳號 APPROVED": [r("APPROVED", user="bob")],
+            "沒有有效 review": [r("COMMENTED")],
+        }
+        for case, reviews in refused.items():
+            self.f.reviews = reviews
+            self.assertEqual(self.ship()[0], 1, case)
+            self.assertEqual((self.f.merges, self.f.decide_calls), ([], 0), case)
+        allowed = {
+            "APPROVED 之後只有 COMMENTED": [r("APPROVED"), r("COMMENTED", at="2026-11-02T00:00:00Z")],
+            "先退件，後在目前 head 重新 APPROVED": [r("CHANGES_REQUESTED"), r("APPROVED", at="2026-11-02T00:00:00Z")],
+        }
+        for case, reviews in allowed.items():
+            self.f.reviews = reviews
+            self.f.pr.update(state="OPEN", mergeCommit=None)
+            self.assertEqual(self.ship()[0], 0, case)
+        self.assertEqual(len(self.f.merges), 2)
 
 
 class Tick(JudgmentCase):

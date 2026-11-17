@@ -72,6 +72,52 @@ class Resume(unittest.TestCase):
     def test_implementer_resume_after_ready_block_runs_in_ready_lane(self):
         self.assertEqual(self.run_resume(Board("developer", None)), [("ready", "developer")])
 
+    def test_failed_reassign_leaves_the_card_assigned_for_a_retry(self):
+        board = Board("developer", None)
+        fail = {"assign developer": 1}  # the first re-assign fails, the restore succeeds
+
+        def flaky(b, cmd, task_id, *args):
+            key = " ".join((cmd, *args))
+            if fail.get(key):
+                fail[key] -= 1
+                raise SystemExit(1)
+            return board(b, cmd, task_id, *args)
+        self.df.kanban = flaky
+        with self.assertRaises(SystemExit):
+            self.df.resume("b", "t_1")
+        self.assertEqual((board.task["status"], board.task["assignee"], board.claims), ("blocked", "developer", []))
+        self.df.kanban = board
+        self.df.resume("b", "t_1")  # the retry `resume` would have refused on an unassigned card
+        self.assertEqual(board.claims, [("ready", "developer")])
+
+
+class CommentOps(unittest.TestCase):
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        shutil.copy(KIT / "roles.json", root / "roles.json")
+        self.df = load_devflow(root)
+
+    def test_a_failed_op_stops_the_ops_that_depend_on_it(self):
+        calls, comments = [], []
+
+        def kanban(board, cmd, *args):
+            if cmd == "comment":
+                comments.append(args[1])
+                return ""
+            calls.append(cmd)
+            if cmd == "link":
+                raise SystemExit(1)
+            return ""
+        self.df.kanban = kanban
+        ops = [{"op": "link", "parent": "t_new", "child": "t_c"}, {"op": "unlink", "parent": "t_old", "child": "t_c"},
+               {"op": "archive", "task": "t_old"}]
+        body = "```devflow-ops\n" + json.dumps(ops) + "\n```"
+        applied: list[str] = []
+        self.df.apply_comment_ops("b", "t_adj", [{"author": "orchestrator", "created_at": 1, "body": body}], applied)
+        self.assertEqual(calls, ["link"])
+        self.assertEqual(comments[0].count("\n- 未執行 "), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

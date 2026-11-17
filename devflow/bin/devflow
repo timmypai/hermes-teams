@@ -784,9 +784,19 @@ def plan_risks(epic: str, cards: dict[str, dict]) -> tuple[dict[str, float], str
     return {n: float(answers[n]["probability"]) for n, _ in PLAN_QUESTIONS}, ""
 
 
+SHIP_PENDING = ("todo", "ready", "triage", "scheduled")
+
+
+def pending_ships(cards: dict[str, dict]) -> list[str]:
+    return sorted(t for t, c in cards.items() if card_type(c["title"]) == "SHIP" and c["status"] in SHIP_PENDING)
+
+
 def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: list[str], risky: bool) -> str:
     import hashlib
-    key = f"adv-{epic}-" + hashlib.sha1("\n".join(sorted(findings)).encode()).hexdigest()[:8]
+    ships = pending_ships(cards) if risky else []
+    # The gated [SHIP] cards are part of the key: a risky plan that gains a SHIP gets a new [ADV], not the
+    # earlier one, which may already have said ok for a plan without it.
+    key = f"adv-{epic}-" + hashlib.sha1("\n".join(sorted(findings) + ships).encode()).hexdigest()[:8]
     body = (f"EPIC: {epic}\n\n## 目標\n檢查 orchestrator 的計畫是否對準 EPIC 的驗收條件，對每一項疑慮給結論與具體建議。\n\n"
             "## 自動檢查發現\n" + "\n".join(f"- {f}" for f in findings) +
             f"\n\n## 使用者目標（EPIC 原文）\n{cards[epic]['body']}\n\n## 計畫\n" +
@@ -796,16 +806,18 @@ def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: l
                "--workspace", "scratch", "--body", body, "--idempotency-key", key, "--created-by", "devflow-check",
                "--model", ADVISOR["model"], "--provider", ADVISOR["provider"]]).stdout
     adv = re.search(r"t_[0-9a-f]{8}", out).group(0)
-    if risky:
-        for t, c in cards.items():
-            if card_type(c["title"]) == "SHIP" and c["status"] in ("todo", "ready", "triage", "scheduled"):
-                run([HERMES, "kanban", "--board", board, "link", adv, t], check=False)
+    for t in ships:
+        if adv not in cards[t].get("parents", []):
+            # Fails loudly: a SHIP left ungated must not be recorded as advised (the tick retries).
+            run([HERMES, "kanban", "--board", board, "link", adv, t])
     return adv
 
 
 def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | None = None,
                advised: frozenset[str] = frozenset()) -> dict:
-    """Rules + Decisions risks. With `advise`, findings not in `advised` open an [ADV] card."""
+    """Rules + Decisions risks. With `advise`, findings not in `advised` open an [ADV] card.
+    report["advised"] holds the keys to remember: the irreversible-risk finding counts once per
+    pending [SHIP] it gates, every other finding once."""
     cards = cards or plan_cards(board, epic)
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
@@ -816,14 +828,21 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         # [SHIP] because an irreversible operation cannot be ruled out. Stable text (no error
         # message) so a later failure does not open another [ADV] for the same plan.
         flagged = {n for n, _ in PLAN_QUESTIONS}
-        findings += [f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in PLAN_QUESTIONS]
+        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in PLAN_QUESTIONS}
     else:
         flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
-        findings += [f"Decisions {n}：{q}" for n, q in PLAN_QUESTIONS if n in flagged]
-    report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note}
-    new = [f for f in findings if f not in advised]
+        risk = {n: f"Decisions {n}：{q}" for n, q in PLAN_QUESTIONS if n in flagged}
+    findings += list(risk.values())
+    risky = "irreversible" in flagged
+    keys = {f: [f] for f in findings}
+    if risky:
+        f = risk["irreversible"]
+        keys[f] = [f"{f} @ {s}" for s in pending_ships(cards)] or [f]
+    report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note,
+              "advised": sorted({k for ks in keys.values() for k in ks})}
+    new = [f for f in findings if any(k not in advised for k in keys[f])]
     if new and advise:
-        report["advisor_card"] = open_advisor_card(board, epic, cards, new, "irreversible" in flagged)
+        report["advisor_card"] = open_advisor_card(board, epic, cards, new, risky)
     return report
 
 
@@ -938,16 +957,27 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
     if status == "ready":
         kanban(board, "block", task_id, "devflow resume")
     kanban(board, "assign", task_id, "none")
-    if not rework:
-        kanban(board, "assign", task_id, assignee)
+    try:
+        if not rework:
+            kanban(board, "assign", task_id, assignee)
+            kanban(board, "unblock", task_id)
+            return f"resumed {task_id} ({assignee})"
         kanban(board, "unblock", task_id)
-        return f"resumed {task_id} ({assignee})"
-    kanban(board, "unblock", task_id)
-    if json.loads(kanban(board, "show", task_id, "--json"))["task"]["status"] == "review":
-        kanban(board, "reopen-review", task_id)  # -> ready/todo, assignee = the implementer
-    if json.loads(kanban(board, "show", task_id, "--json"))["task"]["assignee"] != assignee:
-        kanban(board, "assign", task_id, assignee)
-    return f"resumed {task_id} ({assignee}, review -> implementer)"
+        if json.loads(kanban(board, "show", task_id, "--json"))["task"]["status"] == "review":
+            kanban(board, "reopen-review", task_id)  # -> ready/todo, assignee = the implementer
+        if json.loads(kanban(board, "show", task_id, "--json"))["task"]["assignee"] != assignee:
+            kanban(board, "assign", task_id, assignee)
+        return f"resumed {task_id} ({assignee}, review -> implementer)"
+    except BaseException:
+        # `resume` refuses unassigned cards: a failure after unassigning must not leave one behind, or
+        # nothing could retry it. Not in the review lane, which would run the implementer as reviewer.
+        try:
+            t = json.loads(kanban(board, "show", task_id, "--json"))["task"]
+            if not t["assignee"] and t["status"] != "review":
+                kanban(board, "assign", task_id, assignee)
+        except BaseException:  # noqa: BLE001 - the original failure is the one to report
+            pass
+        raise
 
 
 def apply_op(board: str, op: dict) -> str:
@@ -989,11 +1019,16 @@ def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[
                 kanban(board, "comment", tid, f"devflow-ops：JSON 無法解析（{err}），沒有執行")
                 continue
             done = []
-            for op in ops:
+            for i, op in enumerate(ops):
                 try:
                     done.append("✓ " + apply_op(board, op))
-                except (SystemExit, Exception) as err:  # noqa: BLE001 - report, keep going
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - report and stop
+                    # Ops in a block depend on each other (link the new parent before unlinking the
+                    # old one): stop at the first failure rather than run the rest without it.
                     done.append(f"✗ {json.dumps(op, ensure_ascii=False)}：{err}")
+                    done += [f"- 未執行 {json.dumps(o, ensure_ascii=False)}" for o in ops[i + 1:]]
+                    done.append("第一個失敗後就停止；修正原因後，把失敗與未執行的操作貼成新的 devflow-ops 區塊。")
+                    break
             kanban(board, "comment", tid, "devflow-ops 結果：\n" + "\n".join(done))
 
 
@@ -1021,7 +1056,7 @@ def tick_board(board: str, st: dict) -> None:
             fp = plan_fingerprint(tid, cards, repo)
             if plans.get(tid) != fp:
                 rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
-                advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["findings"]))
+                advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 kanban(board, "comment", tid, "devflow check plan：" + (
                     "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（皆已交 advisor 判斷過）")
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
@@ -1062,7 +1097,10 @@ def cmd_tick(a) -> None:
         print(f"{time.strftime('%FT%T')} {a.board}: {err!r}", flush=True)
     else:
         st.setdefault("mtime", {})[a.board] = mtime
-    TICK.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    # Atomic: the hook reads this file without the lock, and a torn write would stop every board's tick.
+    tmp = TICK.with_name(TICK.name + ".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    os.replace(tmp, TICK)
 
 
 IMAGES = (".png", ".jpg", ".jpeg", ".webp")
@@ -1405,12 +1443,23 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
         common: list[str] = []
         deploys = repo_deploys(board)
         if deploys:
-            runs = workflow_runs(repo, "deploy.yml", event="push", branch=branch)
-            r = pick_run(runs or [], "deploy.yml", "push", branch=branch, success=True)
-            if r is None:
-                common.append(f"找不到 {branch} 上成功的 deploy.yml push run")
+            # What runs now is the deploy of the default branch tip: an older success does not count when
+            # the tip's deploy failed (rolled back, maybe unhealthy) or is still running.
+            tip = (gh_json(["api", f"repos/{repo}/commits/{branch}"], check=False) or {}).get("sha")
+            runs = workflow_runs(repo, "deploy.yml", branch=branch, head_sha=tip) if tip else None
+            picked = [pick_run(runs or [], "deploy.yml", ev, sha=tip, branch=branch) for ev in ("push", "workflow_dispatch")]
+            r = max((x for x in picked if x), key=lambda x: (x.get("run_number") or 0, x.get("id") or 0), default=None)
+            if not tip:
+                common.append(f"讀不到 {branch} 的最新 commit")
+            elif r is None:
+                common.append(f"找不到 {branch} 最新 commit {tip[:12]} 的 deploy.yml run（push 或 workflow_dispatch）")
+            elif r.get("status") != "completed":
+                common.append(f"{branch} 最新 commit {tip[:12]} 的部署 run {r['id']} 還在 {r.get('status')}，完成後再驗收")
+            elif r.get("conclusion") != "success":
+                common.append(f"{branch} 最新 commit {tip[:12]} 的部署 run {r['id']} 是 {r.get('conclusion')}：線上不是這個版本，"
+                              "或它沒通過部署驗證")
             else:
-                deploy_sha = r["head_sha"]
+                deploy_sha = tip
                 reps, root, errs = fetch_reports(repo, r, "deploy", deploy_sha, tmp)
                 if "acceptance.json" in reps:
                     errs += identity_errors(reps["acceptance.json"], "deploy 報告", repo, deploy_sha, r, "deploy")
@@ -1583,6 +1632,33 @@ def pr_meta(repo: str, number: int) -> dict:
                   "number,url,title,body,headRefOid,state,mergeCommit"])
     pr["fingerprint"] = hashlib.sha1(json.dumps([pr["headRefOid"], pr["title"], pr["body"]]).encode()).hexdigest()[:12]
     return pr
+
+
+REVIEW_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def pr_reviews(repo: str, number: int) -> list[dict]:
+    """Submitted reviews in GitHub's (chronological) order."""
+    out = run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{number}/reviews?per_page=100",
+               "--jq", ".[] | {user: .user.login, state, commit_id, submitted_at}"], gh="builder").stdout
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def review_problem(repo: str, number: int, head: str) -> str | None:
+    """Why the reviewer bot has not approved `head`, or None. Its latest effective review (approve,
+    request changes, or a dismissed one; comments change nothing) must be APPROVED on exactly `head`:
+    an older approval followed by a request for changes or a dismissal no longer counts."""
+    login = gh_login("reviewer")
+    mine = [r for r in pr_reviews(repo, number)
+            if (r.get("user") or "").lower() == login.lower() and r.get("state") in REVIEW_STATES]
+    if not mine:
+        return f"reviewer {login} 沒有有效的 review"
+    last = sorted(mine, key=lambda r: r.get("submitted_at") or "")[-1]  # stable: API order breaks ties
+    if last["state"] != "APPROVED":
+        return f"reviewer {login} 最新的有效 review 是 {last['state']}"
+    if last.get("commit_id") != head:
+        return f"reviewer {login} 核准的是 {(last.get('commit_id') or '?')[:12]}，目前 head 是 {head[:12]}"
+    return None
 
 
 def pr_files(repo: str, number: int) -> list[dict]:
@@ -1809,6 +1885,9 @@ def cmd_ship_merge(a) -> None:
         return
     if pr["state"] != "OPEN":
         die(f"PR #{a.pr} is {pr['state']}")
+    problem = review_problem(repo, a.pr, pr["headRefOid"])
+    if problem:
+        die(f"未合併：{problem}；reviewer 要在目前 head 核准後再出貨")
     try:
         rec, verdict = gate(e["slug"], repo, a.pr, pr)
     except DecisionsError as err:
