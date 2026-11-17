@@ -592,7 +592,13 @@ def deploy_readiness(slug: str) -> list[dict]:
     rules = gh_json(["api", f"repos/{repo}/rules/branches/{branch}"], check=False) or []
     required = {c.get("context") for r in rules if r.get("type") == "required_status_checks"
                 for c in r["parameters"]["required_status_checks"]}
-    item("ci-required", CI_GATE in required or e.get("contract_note") == RULES_UNSUPPORTED,
+    # Exempt only a plan GitHub refuses rulesets for right now: a stored note goes stale when a
+    # private repo turns public or the plan changes.
+    unsupported = False
+    if CI_GATE not in required:
+        p = run(["gh", "api", f"repos/{repo}/rulesets"], gh="builder", check=False)
+        unsupported = p.returncode != 0 and _rules_error(p) == RULES_UNSUPPORTED
+    item("ci-required", CI_GATE in required or unsupported,
          f"{branch} 沒有 required check {CI_GATE}：契約合併後跑 devflow repo protect {slug}")
     if not deploys:
         return out

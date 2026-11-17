@@ -29,6 +29,7 @@ class FakeGitHub:
         self.runners = [{"name": "vm-o__r", "status": "online", "labels": [{"name": "self-hosted"}, {"name": "devflow"}]}]
         self.private = False
         self.policy = "all_external_contributors"
+        self.rulesets_error = ""   # stderr of a refused `repos/o/r/rulesets` read; "" = readable
 
     def run(self, cmd, gh=None, check=True, cwd=None, input=None):
         ok = lambda out: SimpleNamespace(returncode=0, stdout=out, stderr="")  # noqa: E731
@@ -47,6 +48,9 @@ class FakeGitHub:
             return ok(json.dumps({"runners": self.runners}))
         if url == f"repos/{REPO}/actions/permissions/fork-pr-contributor-approval":
             return ok(json.dumps({"approval_policy": self.policy}))
+        if url == f"repos/{REPO}/rulesets":
+            return SimpleNamespace(returncode=1 if self.rulesets_error else 0, stdout="" if self.rulesets_error else "[]",
+                                   stderr=self.rulesets_error)
         if cmd[:3] == ["gh", "repo", "view"]:
             return ok(json.dumps({"isPrivate": self.private}))
         raise AssertionError(cmd)
@@ -98,6 +102,17 @@ class Readiness(Case):
         self.gh.policy = "first_time_contributors"
         self.gh.files[".devflow/config.env"] = CONFIG.replace("18100", "18101")
         self.assertEqual(sorted(self.failing()), ["ci-required", "fork-approval", "port", "runner-online"])
+
+    def test_unsupported_plan_exemption_is_read_live_not_from_the_stored_note(self) -> None:
+        # repos.json still says "unsupported" from when the repo was private; it is public now.
+        state = self.root / "state" / "repos.json"
+        repos = json.loads(state.read_text())
+        repos["b"]["contract_note"] = self.df.RULES_UNSUPPORTED
+        state.write_text(json.dumps(repos))
+        self.gh.required = []
+        self.assertEqual(list(self.failing()), ["ci-required"])
+        self.gh.rulesets_error = "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+        self.assertEqual(self.failing(), {})
 
     def test_missing_contract_files_are_listed(self) -> None:
         del self.gh.files["Dockerfile"], self.gh.files[".github/workflows/deploy.yml"]
