@@ -59,6 +59,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    - `[DEV]` 一卡一 PR，能獨立合併；每張 `[DEV]`/`[OPS]` 後面接一張 `[SHIP]`（parent = 該卡）。
    - 依賴前一個 PR 程式碼的 `[DEV]`，parent 要指向前一張 `[SHIP]`（合併後 worktree 才會基於新 main）。互不相干的 `[DEV]` 並行。
    - 不需要部署的工作（純研究、文件）不用 `[SHIP]`。
+   - 有 `[SHIP]` 時先跑 `terminal: devflow repo doctor <slug>`，看 `deploy`：`contract-files` 或 `port` 沒過 → 加一張 `[OPS]` 用 PR 修，後面接它自己的 `[SHIP]`；其他 `[DEV]` 的 parent 指向這張 `[SHIP]`，讓每張 `[SHIP]` 都在這張 `[OPS]` 下游。`[OPS]` body 寫出這些項目 id 與 doctor 給的修法（`check plan` 會檢查）。`runner-online`／`runner-request`／`fork-approval` 沒過不用建卡：`[SHIP]` 合併前會擋下並問使用者。不設計新的部署方式或安全門檻。
    - 每條 AC 至少一張卡負責；卡片 body 寫「覆蓋：AC-1, AC-3」，`## 驗收` 照抄那幾條 AC（可加這張卡自己的技術驗收）。
    - 卡片只寫目標與驗收，不寫實作細節；做法交給 architect / developer。
 4. 建卡：

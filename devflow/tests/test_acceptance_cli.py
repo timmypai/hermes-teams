@@ -520,6 +520,7 @@ class PlanShipGate(Case):
     def setUp(self) -> None:
         super().setUp()
         self.df.plan_rules = lambda board, epic, cards: []
+        self.df.readiness_rules = lambda board, cards: []
         self.df.decide = lambda content, qs: {q["name"]: {"name": q["name"], "probability": 0.9 if q["name"] == "irreversible"
                                                           else 0.0} for q in qs}
         self.created: list[str] = []   # idempotency keys

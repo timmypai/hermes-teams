@@ -45,6 +45,7 @@ class Binding(unittest.TestCase):
         self.df.create_project = self.fake_create
         self.df.bind_board = self.fake_bind
         self.df.set_board_project = self.fake_set
+        self.df.deploy_readiness = lambda slug: []   # deploy channel: test_deploy_readiness.py
 
     def git(self, path: Path, url: str) -> None:
         path.mkdir(parents=True, exist_ok=True)

@@ -69,15 +69,15 @@ metadata:
 ## 身分與憑證
 - GitHub：reviewer 用自己的帳號；其他 Bot 共用 builder 帳號（`GH_CONFIG_DIR` 已設定）。`git push` 走 `gh auth git-credential`。
 - 不輸出 token、`.env`、`auth.json`、cookie、私鑰。應用程式秘密放 GitHub Secrets。
-- 部署只透過 GitHub Actions（merge 到 main 觸發 deploy workflow 跑在 Oracle VM self-hosted runner）。
+- 部署只透過 GitHub Actions（merge 到 main 觸發 deploy workflow 跑在 Oracle VM self-hosted runner）。部署通道只有這一種，所有 repo 共用；EPIC 沒寫明時不提出專用帳號、獨立 Docker daemon、job 前准入等新門檻（使用者 2026-11-17 接受 README「信任邊界」）。通道不通時照 `devflow repo doctor` 的失敗項目修；修不了就 `capability` 問使用者，不另設計部署方式。
 
 ## devflow CLI（`/opt/data/devflow/bin/devflow`）
 | 指令 | 用途 |
 |---|---|
 | `devflow repo list` | 已接入的 repo / board |
-| `devflow repo add OWNER/REPO [--create] [--public] [--no-runner]` | 建 board + clone + 設定 builder/reviewer 權限 + 分配埠 + 綁定 Hermes 專案 + 申請 runner（`--create` 先建 GitHub repo） |
+| `devflow repo add OWNER/REPO [--create] [--public] [--no-runner]` | 建 board + clone + 設定 builder/reviewer 權限 + 分配埠 + 綁定 Hermes 專案 + 公開 repo 的 fork PR 一律要核准 + 申請 runner 並等 2 分鐘讀回 + 輸出 `deploy_ready`/`deploy`（同 doctor）（`--create` 先建 GitHub repo） |
 | `devflow repo bind SLUG` | 只做專案綁定（冪等）：沿用主路徑 = clone 的專案或新建，寫入看板 `project_id` 與專案 `board_slug`；有衝突就停止不改 |
-| `devflow repo doctor [SLUG]` | 唯讀檢查專案 ↔ 看板 ↔ repo 綁定；不一致時 exit 1 |
+| `devflow repo doctor [SLUG]` | 唯讀檢查專案 ↔ 看板 ↔ repo 綁定與部署就緒（`deploy` 各項 id：`contract-files`、`port`、`ci-required`、`runner-online`、`runner-request`、`fork-approval`，附修法）；有問題時 exit 1 |
 | `devflow repo sync SLUG` | 主 checkout fetch + 快轉到 origin 預設分支 |
 | `devflow repo path SLUG` | 印出主 checkout 路徑 |
 | `devflow contract SLUG [DIR] [--ui]` | 把 devflow repo 契約檔（CI/CD、deploy、test、verify；`--ui` 加 Playwright）補進 DIR，不覆蓋既有檔，列出與範本不同的檔 |

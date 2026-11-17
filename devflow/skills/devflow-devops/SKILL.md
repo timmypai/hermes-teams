@@ -53,7 +53,7 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 ## 3. 接入 repo（`[OPS]` 卡，或 Hermes 直接要求）
 1. `devflow repo add OWNER/REPO`（若尚未）：建 board、clone、設定 squash/自動刪分支、讓 builder 與 reviewer 都有 push 權限、分配埠、自動申請 self-hosted runner。
 2. 在 worktree：`devflow contract <slug> .`，依專案調整 `test.sh`、`Dockerfile`、`compose.yml`（容器埠、volume）。既有 repo 第一次接入規則檢查：`bash .devflow/check.sh --write-baseline` 把現有違規記成舊債（之後只擋新增），commit `.devflow/rules/baseline.json`；不要用 baseline 收新寫的程式。專案自己的模組邊界規則照 `.devflow/rules/*.toml` 的格式加（附 `expect = "fail"` 與 `"pass"` 範例）。改部署相關腳本時，重跑一次或中途失敗後再跑都要得到同樣狀態（`pstack:principle-make-operations-idempotent`）。
-3. `devflow runner status OWNER/REPO` 應看到 github runner `online`；沒有就 `devflow runner request OWNER/REPO`（約 1 分鐘）。
+3. `devflow repo doctor <slug>` 讀回接入結果（`repo add` 的輸出也有同一份 `deploy`）：每個失敗項目照 `detail` 的修法處理；`contract-files`、`port` 由這張卡的 PR 修；`ci-required` 在契約合併後由 `[SHIP]` 跑 `devflow repo protect`；`runner-online` 沒有 runner → `devflow runner request <repo>`；`runner-request` 失敗（主機沒處理申請）→ `kanban_block(kind="capability")`，reason 第一行用 `問題：<repo> 的 runner 申請主機沒處理，要由你在 VM 檢查 devflow-runner-requests 服務後回覆嗎？選項：A 我檢查後回覆 / B 先不部署（建議 A）`。部署通道只有共用 runner + 契約 `deploy.yml`，不提出其他方式。
 4. 走 PR（同 `devflow-develop` §5–6，`reviewer="reviewer"`）。
 
 ## 4. 出貨（`[SHIP]` 卡，workspace = 主 checkout）
@@ -65,8 +65,9 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
    - `0`：已合併，輸出 `merged_sha`。
    - `3`：有疑慮，等 `[ADV]` advisor 結論（Decisions API 無法判斷時也是這樣：advisor 代替 Decisions 判斷）。看輸出的 `wait`：`dependency` → `kanban_link(parent_id="<輸出的 advisor>", child_id="<本卡>")`，再 `kanban_block(kind="dependency", reason="devflow ship merge：等 advisor 判斷 PR #N")`，advisor 完成後本卡自動回來，從這一步重跑（不要用沒有 kind 的 block：連續兩次會被送去 triage）；`retry` → tick 還沒建 `[ADV]`：`kanban_heartbeat`，等 1 分鐘重跑，最多 10 次，仍是 `retry` 才 `kanban_block(kind="needs_input", reason=...)`。
    - `4`：advisor 回 `revise`（或沒寫 verdict）→ 照第 1 步「未出貨」完成本卡。
+   - `5`：共用部署通道沒就緒（輸出 `deploy_channel` 列出失敗項目與修法）。先照修法做一次：`runner-online` 沒有 runner → `devflow runner request <repo>`，2 分鐘後重跑；`fork-approval` → `devflow repo add <repo>`（冪等）後重跑。仍是 `5`，或是 `runner-request`（主機沒處理申請，容器內修不了）→ `kanban_block(kind="capability", reason=<輸出的 question 原文>)`，等使用者回覆後從這一步重跑。不要自己設計專用帳號、獨立 Docker、job 前准入或其他部署方式，也不要開 `[ADJ]`。
    - `1`：其他錯誤（PR 在判斷後被修改、merge 被拒）→ 看訊息；PR 被修改就直接重跑。訊息是 reviewer 沒核准目前 head（沒核准、核准後退件或被撤銷、只核准過舊 head）→ 不要自己核准或合併，`kanban_complete(summary="未出貨：reviewer 未核准 PR #N 目前的 head <sha 前 7 碼>", metadata={"shipped": false})`，由 orchestrator 安排重新審查。
-4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：先 `devflow runner status <repo>` 確認 runner online（不在就 `devflow runner request`），再追部署：
+4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：追部署（第 2 步已 merged 而跳過第 3 步時，先 `devflow repo doctor <slug>`，`runner-online`／`runner-request` 沒過照第 3 步 `5` 處理）：
    ```bash
    gh run list --workflow deploy.yml --commit <sha> --json databaseId,status,conclusion,url   # 剛 merge 可能要等幾秒才出現
    gh run watch <id> --exit-status
@@ -82,11 +83,11 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 6. `devflow repo sync <slug>`；`devflow repo list` 顯示 `contract=no` 時跑 `devflow repo protect <slug>`（default branch 已有 `devflow-ci` 就會設成 required check，之後的 PR 卡改用 contract；GitHub Free 的 private repo 會回報不支援，維持 local-only，不要處理）。
 7. `kanban_complete(summary="已合併並部署 <sha 前 7 碼>，部署後 smoke 與整合驗收通過", metadata={"merged_sha", "deploy_run_id", "deploy_run_url", "integration_run_url", "verify": "<smoke 與整合 run 各情境結果>", "evidence_artifact": "devflow-evidence-deploy-<sha>-<attempt>"})`。summary 裡的數字（耗時、回應時間、容量）要說明怎麼量的、和什麼比（`pstack:principle-explain-the-number`）。
 
-## 5. 失敗處理（不 block，改建卡）
+## 5. 失敗處理（程式問題改建卡；只有人能修的主機或權限問題才 block）
 | 狀況 | 做法 |
 |---|---|
 | CI 紅（程式碼）、merge 衝突、部署失敗且是程式碼問題 | 建 `[DEV] 修正 PR #N：<原因>`（assignee developer、`workspace_kind="worktree"`、`workspace_path`=原 DEV 卡的 worktree、`completion_contract` 照 `devflow repo list`、body 附錯誤摘要與 run URL、`EPIC: ...`）→ 建新 `[SHIP]`（parent = 修正卡）→ `kanban_link(parent_id=<新 SHIP>, child_id=<EPIC>)` → 本卡 `kanban_complete(summary="未出貨：<原因>；改由 t_x → t_y", created_cards=[...])` |
-| runner offline / 主機 Docker 問題 | `devflow runner request` 重註冊；`devflow runner status`；修好後部署最新版：`gh workflow run deploy.yml --ref <default>`（不要 `gh run rerun` 舊 run：期間有新合併時，它在 `default branch tip only` 失敗，不會部署） |
+| runner offline / 主機 Docker 問題 | `devflow repo doctor <slug>` 看 `runner-online`／`runner-request` 的 `detail`；沒有 runner 就 `devflow runner request`。修好後部署最新版：`gh workflow run deploy.yml --ref <default>`（不要 `gh run rerun` 舊 run：期間有新合併時，它在 `default branch tip only` 失敗，不會部署）。容器內修不了（主機沒處理申請、runner 服務停了）→ `kanban_block(kind="capability")`，問題寫成誰在 VM 做什麼；不建卡、不設計其他部署方式 |
 | 部署 run 在 `default branch tip only` 失敗 | 不是程式問題：這個 SHA 已不是 default branch 最新版。追最新 commit 的部署 run（沒有就用上一列的 `gh workflow run`）；要回到舊版用 revert PR |
 | 部署 health、verify 或 up 失敗 | deploy.sh 已先採證再回滾。`gh run view <id> --log-failed` 看哪一步、哪個情境；`gh run download <id> -n devflow-diagnostics-deploy-<sha> -D /tmp/diag-<id>` 讀 `candidate/`（失敗版本的 `state.jsonl`、`logs/`、`health.json`、`host.txt`）與 `rollback/`（回滾後狀態）。判定是程式問題 → 照第一列建修正卡，body 附 run URL 與關鍵證據（不貼整段 log）；主機資源或 runner 問題 → 照第二列 |
 | build 失敗 | 執行中版本不受影響（`build-failed/` 記錄當下狀態）；看 `--log-failed` 的建置輸出，照第一列處理 |

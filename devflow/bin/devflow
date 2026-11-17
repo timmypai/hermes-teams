@@ -187,13 +187,23 @@ def cmd_repo_add(a) -> None:
         save_state(state)
     project = bind_project(slug)
     contract = protect_repo(slug)
+    fork = require_fork_approval(repo)
     if a.no_runner:
         runner = "skipped (--no-runner)"
     elif has_devflow_runner(repo):
         runner = "already registered"
     else:
         runner = request_runner(repo)
-    print(json.dumps({**entry(slug), **contract, "project": project, "notes": notes, "runner": runner},
+        # Read the registration back instead of trusting the request: a host watcher that never
+        # consumes requests (as on 2026-11-17) shows up here and in `deploy` below, not at [SHIP].
+        for _ in range(0 if runner.startswith("error") else RUNNER_WAIT // 10):
+            time.sleep(10)
+            if has_devflow_runner(repo):
+                runner = "registered"
+                break
+    deploy = deploy_readiness(slug)
+    print(json.dumps({**entry(slug), **contract, "project": project, "notes": notes, "fork_approval": fork,
+                      "runner": runner, "deploy_ready": all(i["ok"] for i in deploy), "deploy": deploy},
                      ensure_ascii=False, indent=2))
 
 
@@ -317,14 +327,18 @@ def cmd_repo_bind(a) -> None:
 
 
 def cmd_repo_doctor(a) -> None:
-    """Read-only: report each board's project binding; exit 1 when anything needs a write or a person."""
+    """Read-only: each board's project binding and deploy channel; exit 1 when anything needs a
+    write or a person."""
     bad = False
     for slug in [entry(a.slug)["slug"]] if a.slug else list(load_state()):
         project, actions, problems = binding_plan(slug)
         state = "ok" if not actions and not problems else ("stop" if problems else "needs-bind")
-        bad |= state != "ok"
+        deploy = deploy_readiness(slug)
+        ready = all(i["ok"] for i in deploy)
+        bad |= state != "ok" or not ready
         print(json.dumps({"slug": slug, "state": state, "project": project and project["id"],
-                          "actions": actions, "problems": problems}, ensure_ascii=False))
+                          "actions": actions, "problems": problems, "deploy_ready": ready, "deploy": deploy},
+                         ensure_ascii=False))
     if bad:
         sys.exit(1)
 
@@ -333,11 +347,19 @@ CI_GATE = "devflow-ci"
 RULESET = "devflow"
 
 
+RULES_UNSUPPORTED = "此 repo 的 GitHub 方案不支援 ruleset（GitHub Free 的 private repo）；PR 卡改用 local-only"
+
+
 def _rules_error(p: subprocess.CompletedProcess) -> str:
     err = (p.stderr or p.stdout).strip()
     if "Upgrade to GitHub Pro" in err or "HTTP 403" in err:
-        return "此 repo 的 GitHub 方案不支援 ruleset（GitHub Free 的 private repo）；PR 卡改用 local-only"
+        return RULES_UNSUPPORTED
     return f"設定 ruleset 失敗：{err[-200:]}"
+
+
+def branch_file(repo: str, branch: str, path: str) -> str | None:
+    p = run(["gh", "api", f"repos/{repo}/contents/{path}?ref={branch}", "--jq", ".content"], gh="builder", check=False)
+    return base64.b64decode(p.stdout).decode(errors="replace") if p.returncode == 0 else None
 
 
 def protect_repo(slug: str) -> dict:
@@ -348,9 +370,7 @@ def protect_repo(slug: str) -> dict:
     {"contract": bool, "contract_note": str}."""
     e = entry(slug)
     repo, branch = e["repo"], e["default_branch"]
-    ci = run(["gh", "api", f"repos/{repo}/contents/.github/workflows/ci.yml?ref={branch}", "--jq", ".content"],
-             gh="builder", check=False)
-    text = base64.b64decode(ci.stdout).decode(errors="replace") if ci.returncode == 0 else ""
+    text = branch_file(repo, branch, ".github/workflows/ci.yml") or ""
     if not re.search(rf"^\s+{CI_GATE}:\s*$", text, re.M):
         note = f"{branch} 的 ci.yml 還沒有 {CI_GATE} job；devflow 契約合併後執行 devflow repo protect {slug}"
     else:
@@ -500,6 +520,109 @@ def cmd_runner_status(a) -> None:
         print(f"github: {r['name']} {r['status']} busy={r['busy']} labels={labels}")
     if not runners.get("runners"):
         print("github: no runners registered")
+
+
+# --- deploy readiness: the one deploy channel, read back --------------------------------------
+# Every repo ships the same way: the contract's deploy.yml on the shared host's per-repo runner.
+# These checks read that channel back from GitHub and the host watcher; the ids are stable because
+# `check plan` and the [OPS] card that fixes them name them. PR_FIXABLE items need a PR ([OPS] in
+# the plan); `ci-required` follows the contract merge (`repo protect` at [SHIP]); CHANNEL items no PR
+# can fix: `ship merge` refuses on them with the question for the user (an [OPS] card with a
+# completion_contract cannot complete without a PR, so the plan does not ask for one).
+
+RUNNER_STALE = 300   # seconds a registration request may wait for the host watcher
+RUNNER_WAIT = 120    # seconds `repo add` waits for a requested runner to register
+FORK_POLICY = "all_external_contributors"
+PR_FIXABLE = ("contract-files", "port")
+CHANNEL = ("runner-online", "runner-request", "fork-approval")
+
+
+def env_values(text: str) -> dict[str, str]:
+    pairs = (line.partition("=") for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return {k.strip(): v.strip().strip("'\"") for k, sep, v in pairs if sep}
+
+
+def stale_runner_request(repo: str) -> int | None:
+    """Seconds a registration request has waited, once past RUNNER_STALE; None otherwise."""
+    try:
+        age = int(time.time() - (RUNNER_REQ / f"{runner_key(repo)}.json").stat().st_mtime)
+    except FileNotFoundError:
+        return None
+    return age if age > RUNNER_STALE else None
+
+
+def require_fork_approval(repo: str) -> str:
+    """A public repo's fork PRs could run workflows on the shared self-hosted host: every external
+    contributor's run waits for an owner's approval. Private repos: forks cannot run workflows."""
+    info = gh_json(["repo", "view", repo, "--json", "isPrivate"], check=False)
+    if info is None or info["isPrivate"]:
+        return "private" if info else "error: cannot read repo visibility"
+    p = run(["gh", "api", "-X", "PUT", f"repos/{repo}/actions/permissions/fork-pr-contributor-approval",
+             "-f", f"approval_policy={FORK_POLICY}"], gh="builder", check=False)
+    return FORK_POLICY if p.returncode == 0 else f"error: {(p.stderr or p.stdout).strip()[-200:]}"
+
+
+def deploy_readiness(slug: str) -> list[dict]:
+    """[{id, ok, detail}] for what a [SHIP] card relies on, read live (repos.json can be stale)."""
+    e = entry(slug)
+    repo, branch = e["repo"], e["default_branch"]
+    out: list[dict] = []
+
+    def item(id_: str, ok: bool, detail: str) -> None:
+        out.append({"id": id_, "ok": ok, "detail": "" if ok else detail})
+
+    cfg_text = branch_file(repo, branch, ".devflow/config.env")
+    cfg = env_values(cfg_text or "")
+    deploys = cfg.get("DEVFLOW_DEPLOY", "true") != "false"
+    tree = gh_json(["api", f"repos/{repo}/git/trees/{branch}?recursive=1"], check=False) or {}
+    paths = {t["path"] for t in tree.get("tree", [])}
+    need = [".devflow/config.env", ".devflow/test.sh", ".devflow/verify.sh", ".github/workflows/ci.yml"]
+    if cfg.get("DEVFLOW_SERVICE", "app"):
+        need += ["Dockerfile", "deploy/compose.yml"]
+    if deploys:
+        need += [".devflow/deploy.sh", ".github/workflows/deploy.yml"]
+    missing = [p for p in need if p not in paths]
+    item("contract-files", not missing,
+         f"{branch} 缺 {', '.join(missing)}：在 [OPS] worktree 跑 devflow contract {slug} . 補齊後走 PR")
+    if cfg_text is not None:
+        port = cfg.get("DEVFLOW_PORT")
+        shared = [s for s, x in load_state().items() if s != slug and x["port"] == e["port"]]
+        item("port", port == str(e["port"]) and not shared,
+             f"{branch} 的 DEVFLOW_PORT={port}，devflow 分配 {e['port']}" + (f"，且與 {', '.join(shared)} 重複" if shared else ""))
+    rules = gh_json(["api", f"repos/{repo}/rules/branches/{branch}"], check=False) or []
+    required = {c.get("context") for r in rules if r.get("type") == "required_status_checks"
+                for c in r["parameters"]["required_status_checks"]}
+    item("ci-required", CI_GATE in required or e.get("contract_note") == RULES_UNSUPPORTED,
+         f"{branch} 沒有 required check {CI_GATE}：契約合併後跑 devflow repo protect {slug}")
+    if not deploys:
+        return out
+    runners = gh_json(["api", f"repos/{repo}/actions/runners"], check=False)
+    mine = [r for r in (runners or {}).get("runners", []) if "devflow" in {l["name"] for l in r.get("labels", [])}]
+    online = [r for r in mine if r["status"] == "online"]
+    item("runner-online", bool(online),
+         "讀不到 runner 清單（builder 需要 repo admin）" if runners is None
+         else f"runner {', '.join(r['name'] for r in mine)} offline：主機 devflow-runner@{runner_key(repo)} 服務" if mine
+         else f"沒有 devflow runner：devflow runner request {repo}")
+    age = stale_runner_request(repo)
+    st_file = RUNNER_STATUS / f"{runner_key(repo)}.json"
+    host = json.loads(st_file.read_text()) if st_file.exists() else {}
+    item("runner-request", age is None and (bool(online) or host.get("state") != "error"),
+         f"主機 {age // 60} 分鐘沒處理 runner 申請：VM 上查 devflow-runner-requests.path／.service" if age is not None
+         else f"主機註冊失敗：{host.get('message', '')[-200:]}")
+    info = gh_json(["repo", "view", repo, "--json", "isPrivate"], check=False)
+    if info is None or not info["isPrivate"]:
+        pol = gh_json(["api", f"repos/{repo}/actions/permissions/fork-pr-contributor-approval"], check=False) or {}
+        item("fork-approval", pol.get("approval_policy") == FORK_POLICY,
+             f"公開 repo 的 fork PR workflow 要每次核准（{FORK_POLICY}），現在是 {pol.get('approval_policy') or '讀不到'}："
+             f"devflow repo add {repo} 會設定")
+    return out
+
+
+def channel_question(slug: str, failing: list[dict]) -> str:
+    """The capability block reason when the shared deploy channel is down: who does what, then evidence."""
+    ids = "、".join(i["id"] for i in failing)
+    return (f"問題：{entry(slug)['repo']} 的部署通道沒就緒（{ids}），要由你在 VM 檢查 devflow runner 服務後回覆嗎？"
+            "選項：A 我檢查後回覆 / B 這次先不部署（建議 A）\n" + "\n".join(f"- {i['id']}：{i['detail']}" for i in failing))
 
 
 def cmd_resume(a) -> None:
@@ -791,6 +914,33 @@ def pending_ships(cards: dict[str, dict]) -> list[str]:
     return sorted(t for t, c in cards.items() if card_type(c["title"]) == "SHIP" and c["status"] in SHIP_PENDING)
 
 
+def readiness_rules(board: str, cards: dict[str, dict]) -> list[str]:
+    """A pending [SHIP] whose repo misses contract files or has the wrong port needs an [OPS] card
+    ahead of it that names those doctor items: the fix is a planned PR, not invented at ship time."""
+    ships = pending_ships(cards)
+    failing = [i["id"] for i in deploy_readiness(board) if not i["ok"] and i["id"] in PR_FIXABLE] if ships else []
+    if not failing:
+        return []
+
+    def fixes(t: str) -> bool:
+        body = cards[t]["body"] or ""
+        return card_type(cards[t]["title"]) == "OPS" and all(
+            re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", body) for i in failing)
+
+    found = []
+    for ship in ships:
+        ancestors, stack = set(), list(cards[ship].get("parents", []))
+        while stack:
+            t = stack.pop()
+            if t in cards and t not in ancestors:
+                ancestors.add(t)
+                stack.extend(cards[t].get("parents", []))
+        if not any(fixes(t) for t in ancestors):
+            found.append(f"{ship}: repo 契約未就緒（{', '.join(failing)}；devflow repo doctor {board}）："
+                         "[SHIP] 上游要有一張 [OPS] 卡用 PR 修這些項目，body 寫明項目 id")
+    return found
+
+
 def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: list[str], risky: bool) -> str:
     import hashlib
     ships = pending_ships(cards) if risky else []
@@ -821,7 +971,7 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     cards = cards or plan_cards(board, epic)
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
-    findings = plan_rules(board, epic, cards)
+    findings = plan_rules(board, epic, cards) + readiness_rules(board, cards)
     risks, note = plan_risks(epic, cards)
     if note:
         # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
@@ -2067,7 +2217,8 @@ def cmd_check_pr(a) -> None:
 
 def cmd_ship_merge(a) -> None:
     """Exit 0 merged (or already merged); 3 waiting for the [ADV] verdict; 4 advisor says revise;
-    1 anything else (no judgment, PR changed meanwhile, merge refused)."""
+    5 the shared deploy channel is not ready (output: capability question); 1 anything else (no
+    judgment, PR changed meanwhile, merge refused)."""
     e = entry(a.board)
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
@@ -2076,6 +2227,13 @@ def cmd_ship_merge(a) -> None:
         return
     if pr["state"] != "OPEN":
         die(f"PR #{a.pr} is {pr['state']}")
+    # Merging starts deploy.yml on the shared runner; a PR cannot fix the runner or GitHub settings,
+    # so a broken channel stops here with the question for the user, before any judgment is spent.
+    down = [i for i in deploy_readiness(e["slug"]) if i["id"] in CHANNEL and not i["ok"]]
+    if down:
+        print(json.dumps({"merged": False, "deploy_channel": down, "question": channel_question(e["slug"], down)},
+                         ensure_ascii=False))
+        sys.exit(5)
     problem = review_problem(repo, a.pr, pr["headRefOid"])
     if problem:
         die(f"未合併：{problem}；reviewer 要在目前 head 核准後再出貨")
@@ -2118,7 +2276,7 @@ def main() -> None:
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_protect)
     p = repo.add_parser("bind", help="match or create the board's project and write both links (idempotent)")
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_bind)
-    p = repo.add_parser("doctor", help="read-only: check project <-> board <-> repo bindings")
+    p = repo.add_parser("doctor", help="read-only: project <-> board <-> repo bindings and deploy readiness")
     p.add_argument("slug", nargs="?"); p.set_defaults(fn=cmd_repo_doctor)
     p = sub.add_parser("contract", help="copy missing devflow contract files into DIR")
     p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")

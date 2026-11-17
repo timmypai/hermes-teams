@@ -116,6 +116,8 @@ class JudgmentCase(unittest.TestCase):
             setattr(self.df, name, getattr(self.f, name))
         self.df.pr_files = lambda repo, n: self.f.files
         self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.channel: list[dict] = []   # deploy_readiness items; empty = channel ready
+        self.df.deploy_readiness = lambda slug: self.channel
 
     def call(self, fn, env_task: str | None = "t_ship") -> tuple[int, str]:
         if env_task:
@@ -222,6 +224,18 @@ class ShipMerge(JudgmentCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.f.statuses, ["success"])
         self.assertIn("a" * 40, self.f.merges[0][self.f.merges[0].index("--match-head-commit") + 1])
+
+    def test_down_deploy_channel_stops_before_judging_with_a_question(self) -> None:
+        # A contract PR fixes contract-files; only the shared channel (runner, GitHub settings) stops a merge.
+        self.channel = [{"id": "contract-files", "ok": False, "detail": "main 缺 Dockerfile"},
+                        {"id": "runner-request", "ok": False, "detail": "主機 12 分鐘沒處理 runner 申請"}]
+        code, out = self.ship()
+        res = json.loads(out)
+        self.assertEqual((code, [i["id"] for i in res["deploy_channel"]]), (5, ["runner-request"]))
+        self.assertTrue(res["question"].startswith("問題：o/r 的部署通道沒就緒（runner-request）"), res["question"])
+        self.assertEqual((self.f.decide_calls, self.f.statuses, self.f.merges), (0, [], []))
+        self.channel = self.channel[:1]
+        self.assertEqual(self.ship()[0], 0)
 
     def test_finding_without_advisor_posts_pending_and_asks_to_retry(self) -> None:
         self.f.answers = {"unlabeled_fix": 0.8}
