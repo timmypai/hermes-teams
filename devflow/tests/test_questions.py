@@ -19,6 +19,7 @@ from test_judgment import KIT
 
 INBOX_CHAT = {"platform": "local", "chat_id": "local-inbox", "user_id": "uid:1", "chat_type": "dm"}
 EPIC_CHAT = {"platform": "local", "chat_id": "local-epic", "user_id": "uid:1", "chat_type": "dm"}
+ONESHOT_CHAT = {**INBOX_CHAT, "chat_id": "local-oneshot"}
 
 
 class Board:
@@ -99,8 +100,9 @@ class RouteQuestions(unittest.TestCase):
             s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
             s.executemany("INSERT INTO sessions VALUES (?,?,?,?)", [
                 ("Bot Chat", "tui", json.dumps(INBOX_CHAT), 100),
-                ("建立 EPIC", "oneshot", json.dumps({**INBOX_CHAT, "chat_id": "local-oneshot"}), 200),
-                ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150)])
+                ("建立 EPIC", "oneshot", json.dumps(ONESHOT_CHAT), 200),
+                ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150),
+                ("Epic chat", "desktop", json.dumps(EPIC_CHAT), 50)])
             s.commit()
 
     def kanban(self, board, cmd, tid, *args):
@@ -146,6 +148,27 @@ class RouteQuestions(unittest.TestCase):
         self.board.notify()                       # Hermes delivered it on its own
         self.tick()
         self.assertEqual(self.board.sent, [("t_chat", ev, "local-epic")])
+
+    def test_a_card_pinged_only_in_a_oneshot_session_asks_in_bot_chat(self):
+        self.board.card("t_auto", "[DEV] made by an automated oneshot run")
+        self.board.subscribe("t_auto", ONESHOT_CHAT)
+        ev = self.board.block("t_auto")
+        self.board.notify()                       # nobody reads the oneshot session
+        self.tick()
+        self.tick()
+        self.assertEqual(self.board.sent, [("t_auto", ev, "local-oneshot"), ("t_auto", ev, "local-inbox")])
+
+    def test_an_epic_followed_only_by_a_oneshot_session_routes_its_cards_to_bot_chat(self):
+        epic = "t_e02c0ffe"
+        self.board.card(epic, "[EPIC] made by an automated oneshot run")
+        self.board.subscribe(epic, ONESHOT_CHAT)
+        self.board.card("t_dev", "[DEV] step")
+        self.board.subscribe("t_dev", ONESHOT_CHAT)   # inherited from the creator
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_dev', ?)", (epic,))
+        ev = self.board.block("t_dev")
+        self.board.notify()
+        self.tick()
+        self.assertEqual(self.board.sent, [("t_dev", ev, "local-oneshot"), ("t_dev", ev, "local-inbox")])
 
     def test_blocking_again_after_an_answer_asks_again(self):
         self.board.card("t_cli", "[DEV] made from the CLI")

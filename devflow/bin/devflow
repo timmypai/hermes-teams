@@ -1120,9 +1120,10 @@ def inbox() -> tuple[dict | None, str]:
     return (chats[0], "latest") if chats else (None, "none")
 
 
-def epic_chat(tid: str, tasks: dict[str, dict], subs: dict[str, list], children: dict[str, list]) -> dict | None:
-    """The chat of the card's EPIC: devflow links each path's leaf card as the EPIC's parent, and
-    [ADJ]/[ADV] bodies name it (`EPIC: t_x`)."""
+def epic_chat(tid: str, tasks: dict[str, dict], subs: dict[str, list], children: dict[str, list],
+              readable) -> dict | None:
+    """A chat a person reads that the card's EPIC notifies: devflow links each path's leaf card as the
+    EPIC's parent, and [ADJ]/[ADV] bodies name it (`EPIC: t_x`)."""
     seen, stack = set(), [tid]
     while stack:
         t = stack.pop()
@@ -1131,8 +1132,10 @@ def epic_chat(tid: str, tasks: dict[str, dict], subs: dict[str, list], children:
         seen.add(t)
         refs = EPIC_REF.findall(tasks.get(t, {}).get("body") or "")
         for c in [*children.get(t, []), *refs]:
-            if (tasks.get(c, {}).get("title") or "").startswith("[EPIC]") and subs.get(c):
-                return subs[c][0]
+            if (tasks.get(c, {}).get("title") or "").startswith("[EPIC]"):
+                chat = next((s for s in subs.get(c, []) if readable(s)), None)
+                if chat:
+                    return chat
             stack.append(c)
     return None
 
@@ -1178,11 +1181,18 @@ def route_questions(board: str, st: dict) -> None:
     for link in board_rows(board, "SELECT parent_id, child_id FROM task_links"):
         children.setdefault(link["parent_id"], []).append(link["child_id"])
     box, _ = inbox()
+    # Only chats a person reads count as asking: a ping into a `hermes chat --oneshot` session (what
+    # the existing subscriptions are) reaches nobody.
+    people = {(c["platform"], c["chat_id"]) for c in known_chats()} | ({(box["platform"], box["chat_id"])} if box else set())
+
+    def readable(s: dict) -> bool:
+        return (s["platform"], s["chat_id"]) in people
+
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
-        if not subs.get(tid):
-            chat = epic_chat(tid, tasks, subs, children) or box
+        if not any(readable(s) for s in subs.get(tid, [])):
+            chat = epic_chat(tid, tasks, subs, children, readable) or box
             if chat is None:
                 continue
             subscribe(board, tid, chat)
@@ -1191,9 +1201,10 @@ def route_questions(board: str, st: dict) -> None:
             continue
         ev = block_event(board, tid)
         key = f"{board}/{tid}/{ev}"
-        if ev is None or key in asked or any((s["last_ping_event_id"] or 0) >= ev for s in subs[tid]):
+        mine = [s for s in subs[tid] if readable(s)]
+        if ev is None or key in asked or not mine or any((s["last_ping_event_id"] or 0) >= ev for s in mine):
             continue
-        sub = next((s for s in subs[tid] if s["delivery_mode"] == "notify+wake"), subs[tid][0])
+        sub = next((s for s in mine if s["delivery_mode"] == "notify+wake"), mine[0])
         # A cursor still before the block means the notifier has not reached it yet: nothing to do.
         if sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
             continue
