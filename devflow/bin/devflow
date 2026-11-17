@@ -941,9 +941,17 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
     `kanban_skills_unavailable` on every run. For that case the card is unblocked unassigned (the
     review lane skips unassigned cards) and `reopen-review` moves it to the implementer's lane."""
     d = json.loads(kanban(board, "show", task_id, "--json"))
+    if d["task"]["status"] == "triage":
+        # Hermes parks a card that blocked twice for the same reason in triage; the CLI only leaves it
+        # through an LLM `specify`. Its own writer, with no field changes, just moves it to todo/ready.
+        run([HERMES_PY, "-c", "import sys; from pathlib import Path; from hermes_cli import kanban_db_connect as k, "
+             "kanban_db as kb; c = k.connect(Path(sys.argv[1])); "
+             "sys.exit(0 if kb.specify_triage_task(c, sys.argv[2]) else 1)",
+             str(BOARDS / board / "kanban.db"), task_id])
+        d = json.loads(kanban(board, "show", task_id, "--json"))
     status, assignee = d["task"]["status"], d["task"]["assignee"]
     if status not in ("blocked", "scheduled", "ready"):
-        die(f"{task_id} is {status}; only blocked/scheduled/ready cards can be resumed")
+        die(f"{task_id} is {status}; only blocked/scheduled/ready/triage cards can be resumed")
     if not assignee:
         die(f"{task_id} has no assignee")
     events = d["events"]
