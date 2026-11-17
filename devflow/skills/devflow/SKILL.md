@@ -66,6 +66,13 @@ metadata:
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
 
+## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
+你負責的卡 block 成 `needs_input` / `capability` 時，dispatcher tick 會把通知送到**你的 Bot Chat** 並喚醒你；Hermes 主頁只留一行提醒指到這裡。
+1. 被喚醒或使用者在這裡回覆時：`terminal: devflow pending <你的 profile 名>`，列出 `ask_in` 是你的卡（board、task、question）。
+2. 先用 `clarify` 問：question 開頭寫卡號與 board，choices 是 reason 第一行的選項（建議的放第一個）。`clarify` 被拒（喚醒時沒人在看）就留一則訊息：「需要你決定（<board> <task>）：<問題>\n1. <選項>（建議）\n2. <選項>\n直接回覆編號或你的想法」，結束這一輪。
+3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow resume <board> <task> --note "使用者回覆（<你的 profile> 頁面）：..."`，回一句「已交回繼續執行」。
+卡片已不在 `devflow pending` 裡（已回答過）就不要再問。
+
 ## 身分與憑證
 - GitHub：reviewer 用自己的帳號；其他 Bot 共用 builder 帳號（`GH_CONFIG_DIR` 已設定）。`git push` 走 `gh auth git-credential`。
 - 不輸出 token、`.env`、`auth.json`、cookie、私鑰。應用程式秘密放 GitHub Secrets。
@@ -87,7 +94,8 @@ metadata:
 | `devflow check acceptance SLUG EPIC --pr N... [--review] [--evidence FILE] [--json]` | 向 GitHub 核對 PR CI／base／部署／整合 run 的身分與情境結果，再每條 AC 一次 Decisions 判定 PASS/FAIL（API 無法使用時 `UNJUDGED`，exit 3）；`--review` 只檢查開著的 PR（reviewer 用） |
 | `devflow runner request OWNER/REPO` | 為 repo 註冊 Oracle VM self-hosted runner（需 repo admin） |
 | `devflow runner status OWNER/REPO` | 查 runner 狀態 |
-| `devflow resume SLUG TASK [--note TEXT]` | 只限 Hermes 聊天：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |
+| `devflow resume SLUG TASK [--note TEXT]` | 只限聊天（不是 worker）：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |
+| `devflow pending [PROFILE]` | 等使用者回答的卡（board、task、question）與在哪個 Bot Chat 問（`ask_in`：有 Bot Chat 的負責 bot，否則 `default`） |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能

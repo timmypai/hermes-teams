@@ -1319,9 +1319,9 @@ def epic_chat(tid: str, tasks: dict[str, dict], subs: dict[str, list], children:
     return None
 
 
-def subscribe(board: str, tid: str, chat: dict) -> None:
+def subscribe(board: str, tid: str, chat: dict, profile: str = "default") -> None:
     args = ["notify-subscribe", tid, "--platform", chat["platform"], "--chat-id", chat["chat_id"],
-            "--notifier-profile", "default", "--delivery-mode", "notify+wake"]
+            "--notifier-profile", profile, "--delivery-mode", "notify+wake"]
     for flag, k in (("--thread-id", "thread_id"), ("--user-id", "user_id"), ("--user-id-alt", "user_id_alt"),
                     ("--chat-type", "chat_type")):
         if chat.get(k):
@@ -1352,7 +1352,7 @@ def block_event(board: str, tid: str) -> int | None:
 def route_questions(board: str, st: dict) -> None:
     asked = st.setdefault("asked", [])
     # block_kind, not the event payload: Hermes re-kinds a dependency block with no open parent.
-    tasks = {t["id"]: t for t in board_rows(board, "SELECT id, title, body, status, block_kind FROM tasks")}
+    tasks = {t["id"]: t for t in board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks")}
     subs: dict[str, list] = {}
     for s in board_rows(board, "SELECT * FROM kanban_notify_subs ORDER BY created_at"):
         subs.setdefault(s["task_id"], []).append(s)
@@ -1390,6 +1390,81 @@ def route_questions(board: str, st: dict) -> None:
             continue
         asked.append(key)
     del asked[:-1000]
+    ask_assignees(board, tasks, subs, st)
+
+
+# --- the question goes to the Bot Chat of the card's assignee -----------------------------------
+# Hermes' main chat (above) gets the blocked event too, and only points there (devflow skill). The
+# assignee bot is woken on its own Bot Chat (multiplexed gateway, notifier profile = assignee), asks,
+# and writes the answer back with `devflow resume`. The subscription ends once the card is unblocked,
+# so completions do not wake that bot.
+
+ASKED = ("needs_input", "capability")
+
+
+def profile_bot_chat(profile: str) -> dict | None:
+    """The profile's own Bot Chat (local), or None for default / a profile without one."""
+    db = DATA / "profiles" / profile / "state.db"
+    if profile == "default" or not db.exists():
+        return None
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+        row = c.execute("SELECT origin_json FROM sessions WHERE title = ? AND origin_json IS NOT NULL "
+                        "ORDER BY last_activity_at DESC LIMIT 1", (BOT_CHAT,)).fetchone()
+    o = json.loads(row[0]) if row else {}
+    return {f: o.get(f) for f in CHAT_FIELDS} if o.get("platform") and o.get("chat_id") else None
+
+
+def waiting(t: dict) -> bool:
+    return t["status"] in ("blocked", "triage") and t["block_kind"] in ASKED
+
+
+def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st: dict) -> None:
+    asked, routed = st.setdefault("asked_bot", []), st.setdefault("bot_subs", {})
+    for key, r in list(routed.items()):
+        b, tid = key.split("/", 1)
+        if b == board and not (tid in tasks and waiting(tasks[tid])):
+            kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
+            del routed[key]
+    for tid, t in tasks.items():
+        chat = waiting(t) and profile_bot_chat(t.get("assignee") or "default")
+        ev = chat and block_event(board, tid)
+        if not ev or f"{board}/{tid}/{ev}" in asked:
+            continue
+        same = lambda s: (s["platform"], s["chat_id"]) == (chat["platform"], chat["chat_id"])  # noqa: E731
+        sub = next((s for s in subs.get(tid, []) if same(s)), None)
+        if sub is None:
+            subscribe(board, tid, chat, t["assignee"])
+            routed[f"{board}/{tid}"] = {"platform": chat["platform"], "chat_id": chat["chat_id"], "profile": t["assignee"]}
+            sub = next((s for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+                        if same(s)), None)
+            if sub is None:
+                continue
+        if (sub["last_ping_event_id"] or 0) < ev and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+            continue
+        asked.append(f"{board}/{tid}/{ev}")
+    del asked[:-1000]
+
+
+def pending(profile: str | None = None) -> list[dict]:
+    """Cards waiting on the user, with the Bot Chat that asks (the assignee's, else Hermes')."""
+    out = []
+    for db in sorted(BOARDS.glob("*/kanban.db")):
+        board = db.parent.name
+        for t in board_rows(board, "SELECT id, title, status, block_kind, assignee FROM tasks"):
+            if not waiting(t):
+                continue
+            ev = board_rows(board, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+                                   "ORDER BY id DESC LIMIT 1", (t["id"],))
+            reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
+            ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
+            if profile is None or ask_in == profile:
+                out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
+                            "kind": t["block_kind"], "question": reason, "ask_in": ask_in})
+    return out
+
+
+def cmd_pending(a) -> None:
+    print(json.dumps(pending(a.profile), ensure_ascii=False, indent=1))
 
 
 def cmd_inbox(a) -> None:
@@ -2325,6 +2400,9 @@ def main() -> None:
     p.add_argument("action", nargs="?", default="show", choices=("show", "list", "set", "unset"))
     p.add_argument("chat", nargs="?", help="for set: PLATFORM:CHAT_ID or CHAT_ID from `devflow inbox list`")
     p.set_defaults(fn=cmd_inbox)
+    p = sub.add_parser("pending", help="cards waiting on the user's answer, and which Bot Chat asks (ask_in)")
+    p.add_argument("profile", nargs="?", help="only cards asked in this profile's Bot Chat")
+    p.set_defaults(fn=cmd_pending)
     a = ap.parse_args()
     a.fn(a)
 

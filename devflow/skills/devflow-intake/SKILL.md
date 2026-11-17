@@ -49,7 +49,7 @@ metadata:
 - 你在聊天中（不是 worker）要重跑卡片時，用 `devflow resume <slug> <task> [--note "..."]`，不要直接 `kanban_unblock`：已開過 PR 的卡，Hermes dispatcher 會擋 24 小時不重派，`resume` 會做原生的交接動作解除，並重設失敗計數。
 
 ## 3. 被卡住的卡片
-`kanban_show(task)` 讀 block reason / 最後事件，依類型處理：
+`kanban_show(task)` 讀 block reason / 最後事件，依類型處理。needs_input / capability 先跑 `terminal: devflow pending`：這張卡的 `ask_in` 不是 `default`，問題已送到那個 bot 的 Bot Chat，你只回一行「需要你決定：<task>（<board>）在 <ask_in> 頁面等你回答」，不要自己問；`ask_in` 是 `default` 才照下面問：
 - **needs_input**（要使用者決定）：reason 第一行是 `問題：…？選項：A / B（建議 A）`，細節在後面。
   1. 用 `clarify` 問：一題，choices 是選項（建議的放第一個），question 開頭寫卡號與一句背景，例如「t_xxxx（devflow-smoke）：要不要公開網域？」。
   2. `clarify` 回報無法使用或被拒（被通知喚醒時沒人在看這個聊天）：改成在聊天留一則訊息，「需要你決定（<board> <task>）：<問題>\n1. <選項>（建議）\n2. <選項>\n直接回覆編號或你的想法」，然後結束這一輪。使用者之後在這個聊天回覆，就是這張卡的答案。
