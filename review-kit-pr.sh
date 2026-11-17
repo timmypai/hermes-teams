@@ -18,7 +18,15 @@ DOCKER="sudo -n -H -u '#$RUNTIME_UID' -- /usr/bin/docker --host unix:///run/user
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
 echo "waiting for CI on $repo#$pr"
-gh pr checks "$pr" -R "$repo" --watch --interval 20 >/dev/null || { echo "CI failed: not sending to review" >&2; exit 1; }
+# Poll check buckets instead of `gh pr checks --watch`: --watch exits 1 on a network error too,
+# which read as "CI failed". A query error is retried; only a fail/cancel bucket is a failure.
+for ((i = 0; ; i++)); do
+  (( i < 180 )) || { echo "CI still pending after 60 min: not sending to review" >&2; exit 1; }
+  buckets=$(gh pr checks "$pr" -R "$repo" 2>/dev/null | cut -f2)
+  grep -qxE 'fail|cancel' <<<"$buckets" && { echo "CI failed: not sending to review" >&2; exit 1; }
+  [[ -n $buckets ]] && ! grep -qx pending <<<"$buckets" && break
+  sleep 20
+done
 head=$(gh pr view "$pr" -R "$repo" --json headRefOid -q .headRefOid)
 [[ $head =~ ^[0-9a-f]{40}$ ]] || { echo "no head SHA for #$pr" >&2; exit 1; }
 
