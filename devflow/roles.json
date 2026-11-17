@@ -71,7 +71,7 @@
         "platform_toolsets.cli": "[hermes-cli, kanban, kanban_query]",
         "platform_toolsets.api_server": "[hermes-api-server, kanban, kanban_query]",
         "voice.voice_chat_mode": "gpt-live",
-        "voice.gpt_live.instructions": "一律用台灣繁體中文口語回答，句子短、先講結論；需要查證或執行的事交給 Hermes 處理後再簡短轉述。",
+        "voice.gpt_live.instructions": "一律用台灣腔調的華語說話：台灣口音、台灣用語（影片、軟體、網路、資訊、品質），不用中國大陸口音或用語；語氣自然親切，像台灣同事聊天。用台灣繁體中文口語回答，句子短、先講結論；需要查證或執行的事交給 Hermes 處理後再簡短轉述。轉述 Hermes 的提問時保留題號與建議答案，念完該輪題目就停下來等使用者回答。",
         "hooks_auto_accept": "true",
         "hooks.on_kanban_dispatch_tick": "[{\"command\": \"/opt/data/devflow/bin/devflow tick --hook\", \"timeout\": 30}]"
       },
