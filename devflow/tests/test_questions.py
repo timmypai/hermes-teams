@@ -229,12 +229,14 @@ class RouteQuestions(unittest.TestCase):
         self.assertNotIn("20261110_bot", known)
         self.assertNotIn("local-oneshot", known)
 
-    def test_a_card_subscribed_only_to_bot_chat_is_routed_to_the_app_chat(self):
+    def test_a_card_asked_only_in_bot_chat_is_asked_again_in_the_app_chat(self):
         self.board.card("t_old", "[DEV] subscribed to Bot Chat before this change")
         self.board.subscribe("t_old", BOT_CHAT)
         ev = self.board.block("t_old")
+        self.st["asked"] = [f"b/t_old/{ev}"]   # an older tick "asked" it in Bot Chat, which never delivered
         self.tick()
-        self.assertIn(("t_old", ev, "local-inbox"), self.board.sent)
+        self.tick()
+        self.assertEqual([s for s in self.board.sent if s[2] == "local-inbox"], [("t_old", ev, "local-inbox")])
 
     def test_question_is_asked_once_in_the_assignee_bot_chat_and_hermes_also_hears(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")

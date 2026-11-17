@@ -1379,11 +1379,15 @@ def route_questions(board: str, st: dict) -> None:
         if t["status"] not in ("blocked", "triage") or t["block_kind"] not in ("needs_input", "capability"):
             continue
         ev = block_event(board, tid)
-        key = f"{board}/{tid}/{ev}"
         mine = [s for s in subs[tid] if readable(s)]
-        if ev is None or key in asked or not mine or any((s["last_ping_event_id"] or 0) >= ev for s in mine):
+        if ev is None or not mine or any((s["last_ping_event_id"] or 0) >= ev for s in mine):
             continue
         sub = next((s for s in mine if s["delivery_mode"] == "notify+wake"), mine[0])
+        # Keyed by destination too: a block asked in a chat that is no longer readable (Hermes' Bot
+        # Chat) is asked again in the chat that replaced it.
+        key = f"{board}/{tid}/{ev}/{sub['platform']}:{sub['chat_id']}"
+        if key in asked:
+            continue
         # A cursor still before the block means the notifier has not reached it yet: nothing to do.
         if sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
             continue
