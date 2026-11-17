@@ -26,5 +26,7 @@ jobs:
           ./actionlint -config-file /tmp/actionlint.yaml devflow/templates/repo/.github/workflows/*.yml .github/workflows/devflow-kit.yml
       - name: unit tests
         run: python3 -m unittest discover -s devflow/tests -v
+      - name: review-kit-pr merges only the approved head
+        run: bash devflow/tests/review_kit_pr.sh
       - name: deploy scenarios (success, build fail, health fail, verify fail)
         run: bash devflow/tests/deploy_scenarios.sh

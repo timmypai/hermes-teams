@@ -1102,10 +1102,11 @@ ACCEPTANCE_QUESTIONS = [
     ("met", "Does the evidence show that this acceptance criterion is met by the delivered system: every scenario "
      "passed on the integrated build, its steps exercise what the criterion describes, and the screenshots (if any) "
      "show the expected result? A claim without supporting evidence counts as not met."),
+    # Whether the base failed on the behaviour is not asked: the model cannot tell "control not added yet"
+    # from "wrong selector" reliably. base_verdict() requires RED in When/Then; the reviewer reads the reason.
     ("assertions_sufficient", "Do the scenarios' assertions (the Given precondition check and the Then check in the "
      "source code) actually verify what the criterion and each Then text require, rather than something weaker (only "
-     "a status code, only that an element exists, a check that passes whatever the behaviour), and did each failure "
-     "on the base (pre-change) code happen on that behaviour rather than on an unrelated error?"),
+     "a status code, only that an element exists, a check that passes whatever the behaviour)?"),
 ]
 MANUAL_QUESTIONS = [
     ("met", "This criterion is marked [manual]: no automated scenario covers it. Do the card handoffs (claims) "
@@ -1253,24 +1254,30 @@ def scenario_steps(rep: dict | None, sid: str) -> list[dict] | None:
 
 
 def source_excerpts(root: Path | None, ids: list[str], budget: int = 40_000) -> list[dict]:
-    """Lines around each scenario id in the report's copied scenario sources (`sources/`)."""
+    """The report's copied scenario sources (`sources/`) that mention a scenario id: the whole file
+    when it fits the budget (data-driven specs keep ids in a table far from the shared assertions),
+    else the lines around each id."""
     if root is None or not (root / "sources").is_dir():
         return []
     pat = re.compile("|".join(re.escape(x) + r"(?!\d)" for x in ids))
     parts = []
     for p in sorted(f for f in (root / "sources").rglob("*") if f.is_file()):
-        lines = p.read_text(errors="replace").splitlines()
-        spans: list[list[int]] = []
-        for i, line in enumerate(lines):
-            if pat.search(line):
-                lo, hi = max(0, i - 30), min(len(lines), i + 40)  # shell phase functions sit above the id
-                if spans and lo <= spans[-1][1]:
-                    spans[-1][1] = max(spans[-1][1], hi)
-                else:
-                    spans.append([lo, hi])
-        if not spans:
+        whole = p.read_text(errors="replace")
+        if not pat.search(whole):
             continue
-        text = "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)[:budget]
+        if len(whole) <= budget:
+            text = whole
+        else:
+            lines = whole.splitlines()
+            spans: list[list[int]] = []
+            for i, line in enumerate(lines):
+                if pat.search(line):
+                    lo, hi = max(0, i - 30), min(len(lines), i + 40)  # shell phase functions sit above the id
+                    if spans and lo <= spans[-1][1]:
+                        spans[-1][1] = max(spans[-1][1], hi)
+                    else:
+                        spans.append([lo, hi])
+            text = "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)[:budget]
         parts.append({"type": "input_text", "text": f"--- source {p.relative_to(root / 'sources')} ---\n{text}"})
         budget -= len(text)
         if budget <= 0:

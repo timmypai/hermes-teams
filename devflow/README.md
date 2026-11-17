@@ -63,7 +63,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | D0 `devflow check ac` | intake 建 EPIC 前（使用者還在對話中） | 每條 AC 是否太模糊；使用者原話有沒有 AC 沒覆蓋 | 不建卡，問使用者 | 照樣建卡，「提示」註明 D0 未判定 |
 | D1 `devflow check plan` | tick：EPIC 等子卡且計畫有變動 | 改 Hermes、漏 AC、範圍外工作、不可回復操作 | 建 `[ADV]`；不可回復時 `[ADV]` 擋 `[SHIP]` | 四題全部交 `[ADV]` 代答，並擋 `[SHIP]` |
 | D2 `devflow check pr` / `ship merge` | tick：PR 卡在 review；合併前再一次 | `unlabeled_fix`、`weak_exemption`、`lesson_mismatch` | `[ADV]` 判 ok 才給 `devflow-judgment` success | 題目交 `[ADV]` 代答；結果照樣綁 fingerprint |
-| D3 `devflow check acceptance` | orchestrator 最終驗收（確定性檢查全過才問） | 證據是否顯示達成、斷言是否足夠 | 該 AC FAIL，補卡 | `UNJUDGED`（exit 3）：不補卡，`needs_input` 告知使用者 |
+| D3 `devflow check acceptance` | orchestrator 最終驗收（確定性檢查全過才問） | 證據是否顯示達成、斷言是否足夠（base 紅燈是否落在該行為上不問模型，由 reviewer 看 base 證據判斷） | 該 AC FAIL，補卡 | `UNJUDGED`（exit 3）：不補卡，`needs_input` 告知使用者 |
 
 - 每次呼叫失敗（網路、429、5xx）先等 5 秒重試一次；4xx 直接算失敗。沒回答的題目一律視為無法判斷。
 - `[ADV]` 用 Opus 5.5（不同家模型），所以「Decisions 無法判斷」改由另一個模型判斷，不是放行，也不是卡住。
@@ -84,7 +84,7 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 - 紅綠證明：`verify-base` 在 PR base 上用 head 的 `.devflow/` 只跑 `Covers:` 的情境。RED = 健康檢查與 Given 通過、第一個失敗在 When/Then；base 也通過（GREEN）只有 `Already-met:`、Given/環境失敗（INVALID）只有 `Base-unverifiable:` 才放行，兩種理由都由 `devflow-judgment` 與 reviewer 判斷。
 - 身分：`devflow check acceptance` 不信卡片與報告自述，由 GitHub API 找 PR head 的 `ci.yml` run（`pull_request`、最新 attempt、成功）、最新成功部署 run（SHA = D）與 D 上的整合 run（`workflow_dispatch`），核對 workflow 路徑、事件、`head_sha`、attempt、artifact 歸屬與 `acceptance.json` 的身分欄位，並確認每個 PR 的合併 commit 是 D 的祖先。情境 id 帶 EPIC，步驟文字要和目前 EPIC 一致。
 - 整合：部署後只跑唯讀 smoke；完整情境在 D 上的一次性 CI 環境重跑，沒有這份證據 EPIC 不能完成。
-- 判斷：確定性檢查有任何不符，該 AC 直接 FAIL；全過才每條 AC 呼叫一次 Decisions（只給該 AC 的情境結果、步驟、base 判定、情境原始碼與截圖），問「證據是否顯示達成」與「斷言是否足以證明」。
+- 判斷：確定性檢查有任何不符，該 AC 直接 FAIL；全過才每條 AC 呼叫一次 Decisions（只給該 AC 的情境結果、步驟、base 判定、情境原始檔（放得下就整檔，資料驅動的情境 id 表與斷言常相隔很遠）與截圖），問「證據是否顯示達成」與「斷言是否足以證明」。base 紅燈是否失敗在該行為上（例如要新增的按鈕真的不存在，而不是選擇器打錯）模型判不穩，改由 reviewer 看 base 截圖或 page snapshot 判斷。
 - 限制：PR 可以改自己的 `ci.yml`、`verify.sh`、`acceptance.py`，所以身分核對擋得住用錯 run、舊版本、別的 EPIC 的報告，擋不住刻意偽造；防偽需要驗收程式改由 default branch 或 Hermes 端提供（見「信任邊界」）。
 
 **規則與教訓（用檢查取代 prompt）**：同樣的錯誤不再寫進 skill 提醒，而是變成 `check` job 的檢查。
@@ -137,3 +137,5 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | `state/repos.json` | 已接入 repo 與埠 |
 
 主機端：`host/setup-host.sh`、`host/runner-host.sh`（本機 repo），由 `deploy-kit.sh --host` 安裝。只改 skills/CLI/templates 時用 `deploy-kit.sh --kit-only`；改 `roles.json`、SOUL 後用 `deploy-kit.sh` 並重啟 gateway（`s6-svc -r /run/hermes-service/gateway-default`）。
+
+kit 本身的 PR（本 repo）：開 PR 後跑 `./review-kit-pr.sh <PR>`。它等 `ci` 綠燈，在 VM 用 reviewer profile（GitHub `paulpai0412`，不是 PR 作者）跑一次 Hermes chat，依 `devflow-review` 第 4 節審查：通過就 approve 並合併，否則 request changes（exit 4）。`.github/CODEOWNERS` 列的 gate 路徑（`bin/`、`skills/`、`templates/`、`roles.json`、`install.py`、`.github/`）另外要 code owner 核准，合併會等它（exit 3）：Bot 不能自己核准判斷自己工作的規則。
