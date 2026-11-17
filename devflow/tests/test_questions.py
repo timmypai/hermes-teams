@@ -20,13 +20,14 @@ from test_judgment import KIT
 INBOX_CHAT = {"platform": "local", "chat_id": "local-inbox", "user_id": "uid:1", "chat_type": "dm"}
 EPIC_CHAT = {"platform": "local", "chat_id": "local-epic", "user_id": "uid:1", "chat_type": "dm"}
 ONESHOT_CHAT = {**INBOX_CHAT, "chat_id": "local-oneshot"}
+DEVOPS_CHAT = {"platform": "local", "chat_id": "local-devops", "user_id": "uid:1", "chat_type": "dm"}
 
 
 class Board:
     def __init__(self, path: Path):
         self.db = sqlite3.connect(path)
         self.db.executescript("""
-            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT);
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
             CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
             CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT);
             CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,
@@ -35,8 +36,8 @@ class Board:
         self.sent: list[tuple[str, int, str]] = []   # (task, event id, chat) the notifier delivered
         self.clock = 0
 
-    def card(self, tid: str, title: str, *, body: str = "", status: str = "todo") -> None:
-        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,NULL)", (tid, title, body, status))
+    def card(self, tid: str, title: str, *, body: str = "", status: str = "todo", assignee: str = "default") -> None:
+        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,NULL,?)", (tid, title, body, status, assignee))
         self.event(tid, "created")
 
     def event(self, tid: str, kind: str, payload: dict | None = None) -> int:
@@ -104,12 +105,28 @@ class RouteQuestions(unittest.TestCase):
                 ("app chat", "api_server", json.dumps({**INBOX_CHAT, "chat_id": "run_app"}), 150),
                 ("Epic chat", "desktop", json.dumps(EPIC_CHAT), 50)])
             s.commit()
+        # devops has its own Bot Chat with terminal; researcher's has no terminal; developer has none.
+        for p, tools in (("devops", "terminal\n    - clarify"), ("orchestrator", "terminal"), ("researcher", "file\n    - web")):
+            (root / "data" / "profiles" / p).mkdir(parents=True)
+            (root / "data" / "profiles" / p / "config.yaml").write_text(
+                f"model: x\nplatform_toolsets:\n  cli:\n    - {tools}\n  api_server:\n    - terminal\nkanban:\n  a: 1\n")
+            with closing(sqlite3.connect(root / "data" / "profiles" / p / "state.db")) as s:
+                s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
+                s.execute("INSERT INTO sessions VALUES (?,?,?,?)",
+                          ("Bot Chat", "gui", json.dumps({**DEVOPS_CHAT, "chat_id": f"local-{p}"}), 10))
+                s.commit()
+        self.profiles: list[tuple] = []
 
     def kanban(self, board, cmd, tid, *args):
-        assert cmd == "notify-subscribe", cmd
         opts = dict(zip(args[::2], args[1::2]))
+        if cmd == "notify-unsubscribe":
+            self.board.db.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND chat_id=?", (tid, opts["--chat-id"]))
+            self.board.db.commit()
+            return ""
+        assert cmd == "notify-subscribe", cmd
         self.board.subscribe(tid, {"platform": opts["--platform"], "chat_id": opts["--chat-id"],
                                    "user_id": opts.get("--user-id"), "chat_type": opts.get("--chat-type")})
+        self.profiles.append((tid, opts["--chat-id"], opts["--notifier-profile"]))
         return ""
 
     def replay_from(self, board, sub, event_id):
@@ -207,6 +224,47 @@ class RouteQuestions(unittest.TestCase):
         chat, source = self.df.inbox()
         self.assertEqual((chat["chat_id"], source), ("local-inbox", "bot-chat"))
         self.assertNotIn("local-oneshot", [c["chat_id"] for c in self.df.known_chats()])
+
+    def test_question_is_asked_once_in_the_assignee_bot_chat_and_hermes_also_hears(self):
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        ev = self.board.block("t_ship", "capability")
+        self.tick()
+        self.tick()
+        self.assertEqual(sorted(self.board.sent), [("t_ship", ev, "local-devops"), ("t_ship", ev, "local-inbox")])
+        self.assertIn(("t_ship", "local-devops", "devops"), self.profiles)
+        self.assertEqual([(p["task"], p["ask_in"]) for p in self.df.pending("devops")], [("t_ship", "devops")])
+
+    def test_assignee_chat_is_unsubscribed_after_the_answer(self):
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        self.board.block("t_ship")
+        self.tick()
+        self.board.unblock("t_ship")
+        self.tick()
+        chats = [c for (c,) in self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_ship'")]
+        self.assertEqual(chats, ["local-inbox"])
+        self.assertEqual(self.df.pending("devops"), [])
+
+    def test_reassigned_blocked_card_moves_its_question_to_the_new_bot(self):
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        ev = self.board.block("t_ship")
+        self.tick()
+        self.board.db.execute("UPDATE tasks SET assignee='orchestrator' WHERE id='t_ship'")
+        self.board.db.commit()
+        self.tick()
+        self.tick()
+        self.assertEqual(sorted(self.board.sent), [("t_ship", ev, "local-devops"), ("t_ship", ev, "local-inbox"),
+                                                   ("t_ship", ev, "local-orchestrator")])
+        chats = sorted(c for (c,) in self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_ship'"))
+        self.assertEqual(chats, ["local-inbox", "local-orchestrator"])
+        self.assertEqual([p["ask_in"] for p in self.df.pending()], ["orchestrator"])
+
+    def test_assignee_without_a_usable_bot_chat_is_asked_in_hermes_chat(self):
+        self.board.card("t_dev", "[DEV] x", assignee="developer")    # no Bot Chat
+        self.board.card("t_res", "[RES] y", assignee="researcher")   # Bot Chat without terminal
+        ev_dev, ev_res = self.board.block("t_dev"), self.board.block("t_res")
+        self.tick()
+        self.assertEqual(sorted(self.board.sent), [("t_dev", ev_dev, "local-inbox"), ("t_res", ev_res, "local-inbox")])
+        self.assertEqual([p["ask_in"] for p in self.df.pending()], ["default", "default"])
 
 
 if __name__ == "__main__":
