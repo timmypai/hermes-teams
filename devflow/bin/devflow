@@ -1062,8 +1062,154 @@ def tick_board(board: str, st: dict) -> None:
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
+    route_questions(board, st)
     del applied[:-1000]
     del settled[:-1000]
+
+
+# --- needs_input reaches a person --------------------------------------------------------------
+# Hermes notifies only a card's subscribed chats. A card made outside a chat (CLI, voice background
+# agent) has none, and a subscription added later starts after every existing event, so the block
+# that already happened is never sent. Every tick: subscribe open cards that have no chat (their
+# EPIC's chat, else the inbox), and for a needs_input block no chat was pinged about, move that
+# chat's cursor back to just before the block so Hermes' own notifier sends it and wakes Hermes.
+
+INBOX = ROOT / "state" / "inbox.json"
+OPEN = ("todo", "ready", "running", "blocked", "review", "scheduled", "triage")
+CHAT_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "user_id_alt", "chat_type")
+EPIC_REF = re.compile(r"\bEPIC:\s*(t_[0-9a-f]+)")
+
+
+def board_rows(board: str, sql: str, args: tuple = ()) -> list[dict]:
+    with closing(sqlite3.connect(f"file:{BOARDS / board / 'kanban.db'}?mode=ro", uri=True)) as c:
+        c.row_factory = sqlite3.Row
+        return [dict(r) for r in c.execute(sql, args)]
+
+
+def known_chats() -> list[dict]:
+    """Chats the default profile follows devflow cards in (cards created there), newest first."""
+    seen: dict[tuple, dict] = {}
+    for board in load_state():
+        if not (BOARDS / board / "kanban.db").exists():
+            continue
+        for s in board_rows(board, "SELECT s.*, t.title FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+                                   "WHERE COALESCE(s.notifier_profile, '') IN ('', 'default') "
+                                   "AND s.delivery_mode = 'notify+wake'"):
+            k = (s["platform"], s["chat_id"], s["thread_id"] or "")
+            if k not in seen or s["created_at"] > seen[k]["created_at"]:
+                seen[k] = {**{f: s[f] for f in CHAT_FIELDS}, "created_at": s["created_at"], "board": board,
+                           "title": s["title"]}
+    return sorted(seen.values(), key=lambda c: -c["created_at"])
+
+
+def inbox() -> tuple[dict | None, str]:
+    """(chat, source): the chat set with `devflow inbox set`, else the newest chat cards were made in."""
+    if INBOX.exists():
+        return json.loads(INBOX.read_text()), "set"
+    chats = known_chats()
+    return (chats[0], "latest") if chats else (None, "none")
+
+
+def epic_chat(tid: str, tasks: dict[str, dict], subs: dict[str, list], children: dict[str, list]) -> dict | None:
+    """The chat of the card's EPIC: devflow links each path's leaf card as the EPIC's parent, and
+    [ADJ]/[ADV] bodies name it (`EPIC: t_x`)."""
+    seen, stack = set(), [tid]
+    while stack:
+        t = stack.pop()
+        if t in seen:
+            continue
+        seen.add(t)
+        refs = EPIC_REF.findall(tasks.get(t, {}).get("body") or "")
+        for c in [*children.get(t, []), *refs]:
+            if (tasks.get(c, {}).get("title") or "").startswith("[EPIC]") and subs.get(c):
+                return subs[c][0]
+            stack.append(c)
+    return None
+
+
+def subscribe(board: str, tid: str, chat: dict) -> None:
+    args = ["notify-subscribe", tid, "--platform", chat["platform"], "--chat-id", chat["chat_id"],
+            "--notifier-profile", "default", "--delivery-mode", "notify+wake"]
+    for flag, k in (("--thread-id", "thread_id"), ("--user-id", "user_id"), ("--user-id-alt", "user_id_alt"),
+                    ("--chat-type", "chat_type")):
+        if chat.get(k):
+            args += [flag, chat[k]]
+    kanban(board, *args)
+
+
+def replay_from(board: str, sub: dict, event_id: int) -> bool:
+    """Move one subscription's cursor back to just before `event_id` (Hermes' own compare-and-set
+    writer); False when the notifier moved it meanwhile (the next tick retries)."""
+    p = run([HERMES_PY, "-c", "import sys; from pathlib import Path; "
+             "from hermes_cli import kanban_db_connect as k, kanban_db_notify as n; "
+             "c = k.connect(Path(sys.argv[1])); "
+             "print(int(n.rewind_notify_cursor(c, task_id=sys.argv[2], platform=sys.argv[3], chat_id=sys.argv[4], "
+             "thread_id=sys.argv[5] or None, claimed_cursor=int(sys.argv[6]), old_cursor=int(sys.argv[7])))); c.close()",
+             str(BOARDS / board / "kanban.db"), sub["task_id"], sub["platform"], sub["chat_id"], sub["thread_id"] or "",
+             str(sub["last_event_id"]), str(event_id - 1)])
+    return p.stdout.strip() == "1"
+
+
+def block_event(board: str, tid: str) -> int | None:
+    """Id of the block event the card still waits on (none after an unblock)."""
+    rows = board_rows(board, "SELECT id, kind FROM task_events WHERE task_id = ? AND kind IN "
+                             "('blocked', 'block_loop_detected', 'unblocked') ORDER BY id DESC LIMIT 1", (tid,))
+    return rows[0]["id"] if rows and rows[0]["kind"] != "unblocked" else None
+
+
+def route_questions(board: str, st: dict) -> None:
+    asked = st.setdefault("asked", [])
+    # block_kind, not the event payload: Hermes re-kinds a dependency block with no open parent.
+    tasks = {t["id"]: t for t in board_rows(board, "SELECT id, title, body, status, block_kind FROM tasks")}
+    subs: dict[str, list] = {}
+    for s in board_rows(board, "SELECT * FROM kanban_notify_subs ORDER BY created_at"):
+        subs.setdefault(s["task_id"], []).append(s)
+    children: dict[str, list] = {}
+    for link in board_rows(board, "SELECT parent_id, child_id FROM task_links"):
+        children.setdefault(link["parent_id"], []).append(link["child_id"])
+    box, _ = inbox()
+    for tid, t in tasks.items():
+        if t["status"] not in OPEN:
+            continue
+        if not subs.get(tid):
+            chat = epic_chat(tid, tasks, subs, children) or box
+            if chat is None:
+                continue
+            subscribe(board, tid, chat)
+            subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+        if t["status"] not in ("blocked", "triage") or t["block_kind"] != "needs_input":
+            continue
+        ev = block_event(board, tid)
+        key = f"{board}/{tid}/{ev}"
+        if ev is None or key in asked or any((s["last_ping_event_id"] or 0) >= ev for s in subs[tid]):
+            continue
+        sub = next((s for s in subs[tid] if s["delivery_mode"] == "notify+wake"), subs[tid][0])
+        # A cursor still before the block means the notifier has not reached it yet: nothing to do.
+        if sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+            continue
+        asked.append(key)
+    del asked[:-1000]
+
+
+def cmd_inbox(a) -> None:
+    if a.action == "list":
+        current, _ = inbox()
+        for c in known_chats():
+            mark = "*" if current and (c["platform"], c["chat_id"]) == (current["platform"], current["chat_id"]) else " "
+            print(f"{mark} {c['platform']}:{c['chat_id']}  {time.strftime('%F %R', time.localtime(c['created_at']))}  "
+                  f"{c['board']}  {c['title'][:50]}")
+        return
+    if a.action == "set":
+        chat = next((c for c in known_chats() if f"{c['platform']}:{c['chat_id']}" == a.chat
+                     or c["chat_id"] == a.chat), None)
+        if chat is None:
+            die(f"{a.chat!r} 不在 `devflow inbox list`：先在那個聊天建過一張卡")
+        INBOX.parent.mkdir(parents=True, exist_ok=True)
+        INBOX.write_text(json.dumps({f: chat[f] for f in CHAT_FIELDS}, ensure_ascii=False) + "\n")
+    elif a.action == "unset":
+        INBOX.unlink(missing_ok=True)
+    chat, source = inbox()
+    print(json.dumps({"inbox": chat and f"{chat['platform']}:{chat['chat_id']}", "source": source}, ensure_ascii=False))
 
 
 def cmd_tick(a) -> None:
@@ -1965,6 +2111,10 @@ def main() -> None:
     p.add_argument("board", nargs="?"); p.add_argument("--hook", action="store_true",
                                                        help="Hermes on_kanban_dispatch_tick payload on stdin")
     p.set_defaults(fn=cmd_tick)
+    p = sub.add_parser("inbox", help="chat that gets questions (needs_input) of cards made outside a chat")
+    p.add_argument("action", nargs="?", default="show", choices=("show", "list", "set", "unset"))
+    p.add_argument("chat", nargs="?", help="for set: PLATFORM:CHAT_ID or CHAT_ID from `devflow inbox list`")
+    p.set_defaults(fn=cmd_inbox)
     a = ap.parse_args()
     a.fn(a)
 
