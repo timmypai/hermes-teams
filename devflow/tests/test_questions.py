@@ -187,6 +187,12 @@ class RouteQuestions(unittest.TestCase):
         subs = self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_cli'").fetchall()
         self.assertEqual(subs, [("local-inbox",)])
 
+    def test_a_missing_permission_is_asked_like_a_question(self):
+        self.board.card("t_ship", "[SHIP] needs a host runner")
+        ev = self.board.block("t_ship", "capability")
+        self.tick()
+        self.assertEqual(self.board.sent, [("t_ship", ev, "local-inbox")])
+
     def test_a_lost_compare_and_set_is_retried_next_tick(self):
         self.board.card("t_cli", "[DEV] made from the CLI")
         ev = self.board.block("t_cli")
