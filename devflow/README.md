@@ -53,7 +53,8 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 
 ## 語音入口（Hermes Talk）
 - `hermes-talk` plug-in 用 OpenAI Realtime 做雙向語音。語音 session 的提示只有 `SOUL.md`（`PERSONA`，上限 4,000 字）、記憶與 skill 目錄摘要，**看不到 skill 內容**；能直接執行的只有少數唯讀工具，其他工作委派給背景 Hermes agent，結果回來時由語音念出。
-- 所以語音端的收需求步驟寫在 `souls/default.md`：釐清、整理成帶類型的 AC、念一次確認，再委派「用 devflow-intake skill 建 EPIC」並附上全部資訊；背景 agent 跑 D0（`devflow check ac`），需要使用者回答時不建卡、把問題回傳給語音。
+- 所以語音端的收需求步驟寫在 `souls/default.md`：用 mattpocock `grilling` 的語音版逐輪釐清（一輪最多 2 題、每題附建議答案、事實自己查、決定交給使用者；說「拷問我」「grill me」時對任何計畫或決定都這樣問），整理成帶類型的 AC、念一次確認，再委派「用 devflow-intake skill 建 EPIC」並附上全部資訊；背景 agent 跑 D0（`devflow check ac`），需要使用者回答時不建卡、把問題回傳給語音。
+- 語調：SOUL 開頭規定台灣腔調華語與台灣用語（hermes-talk 的 `PERSONA` 第一段）；Hermes 原生 GPT-Live 模式用 `roles.json` 的 `voice.gpt_live.instructions` 寫同一規則。
 - 限制：背景結果只送回發起它的語音 session；Kanban 的進度與完成通知走 gateway 聊天平台，不會進語音。語音中問進度時，由 Hermes 委派背景 agent 讀看板。
 
 ## Decisions API 判斷點

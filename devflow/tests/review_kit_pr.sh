@@ -15,7 +15,7 @@ cat >"$t/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
   "repo view") echo o/r ;;
-  "pr checks") ;;
+  "pr checks") printf 'ci\tpass\t1s\thttps://example\n' ;;   # non-tty: name, state, ...
   "pr view") echo "$HEAD" ;;
   "api repos/o/r/pulls/7/reviews?per_page=100") echo "$REVIEW" ;;
   "pr merge") echo "$*" >>"$LOG" ;;
