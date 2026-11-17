@@ -40,7 +40,7 @@ metadata:
      idempotency_key="epic:<slug>:<目標關鍵字>",
      body="## 目標\n...\n## 驗收\n- AC-1 [ui] ...\n- AC-2 [api] ...\n## 提示\n- 需要部署：是/否\n- 限制/偏好：...\n- 使用者原話：...\n- 來源：Hermes <日期>")
    ```
-   建立後這個對話會自動收到 EPIC 與所有子卡的通知（語音委派時通知送到 gateway 的聊天平台，不是語音 session）。
+   建立後這個對話會自動收到 EPIC 與所有子卡的通知（語音委派時通知送到 gateway 的聊天平台，不是語音 session）。沒有對話的卡（語音委派、CLI 建立）由 dispatcher tick 訂閱到收件聊天（`devflow inbox`：`set` 指定的聊天，沒指定就是 Hermes 的 Bot Chat），已經卡住的 needs_input 也會補送一次。
 8. **回覆**：一句話：「已建立 t_xxxx，orchestrator 接手了，需要你決定的事我會問你。」
 
 ## 2. 回報進度
@@ -50,7 +50,11 @@ metadata:
 
 ## 3. 被卡住的卡片
 `kanban_show(task)` 讀 block reason / 最後事件，依類型處理：
-- **needs_input**（要使用者決定）：用一句話問使用者，附上建議選項；拿到答案 → `devflow resume <slug> <task> --note "使用者回覆：..."`。
+- **needs_input**（要使用者決定）：reason 第一行是 `問題：…？選項：A / B（建議 A）`，細節在後面。
+  1. 用 `clarify` 問：一題，choices 是選項（建議的放第一個），question 開頭寫卡號與一句背景，例如「t_xxxx（devflow-smoke）：要不要公開網域？」。
+  2. `clarify` 回報無法使用或被拒（被通知喚醒時沒人在看這個聊天）：改成在聊天留一則訊息，「需要你決定（<board> <task>）：<問題>\n1. <選項>（建議）\n2. <選項>\n直接回覆編號或你的想法」，然後結束這一輪。使用者之後在這個聊天回覆，就是這張卡的答案。
+  3. 拿到答案 → `devflow resume <slug> <task> --note "使用者回覆：..."`，回一句「已交回 <assignee> 繼續」。
+  問題可能出現在收件聊天，不是建 EPIC 的聊天；照樣處理。同一張卡已經回覆過、卡片不再 blocked 時不要再問。
 - **gave_up / crashed / timed_out / capability**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="<task id>、失敗原因摘要、EPIC id")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。
 
 ## 4. Advisor（`[ADV]` 卡固定用 Opus 5.5：Copilot `claude-opus-5.5`，與其他 Bot 的 GPT 不同家，專門找盲點）
