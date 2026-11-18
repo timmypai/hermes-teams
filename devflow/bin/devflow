@@ -1474,7 +1474,9 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
 def pending(profile: str | None = None) -> list[dict]:
     """Cards waiting on the user, with the Bot Chat that asks (the assignee's, else Hermes'). `question`
     is the whole block reason (line 1 the question, then background); `card` is the card body, so the
-    asking bot can say what the card is for without another lookup."""
+    asking bot can say what the card is for without another lookup. `sent_to` is each subscribed chat
+    and whether Hermes' notifier has delivered this block there yet (it wakes bots one at a time, so a
+    second chat can lag a minute): say "queued", never "not delivered", while it is false."""
     out = []
     for db in sorted(BOARDS.glob("*/kanban.db")):
         board = db.parent.name
@@ -1485,15 +1487,44 @@ def pending(profile: str | None = None) -> list[dict]:
                                    "ORDER BY id DESC LIMIT 1", (t["id"],))
             reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
             ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
+            bev = block_event(board, t["id"]) or 0
+            sent = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",
+                     "delivered": (s["last_ping_event_id"] or 0) >= bev}
+                    for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (t["id"],))]
             if profile is None or ask_in == profile:
                 out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
                             "kind": t["block_kind"], "question": reason, "card": (t["body"] or "")[:1500],
-                            "ask_in": ask_in})
+                            "ask_in": ask_in, "block_event": bev, "sent_to": sent})
     return out
 
 
 def cmd_pending(a) -> None:
     print(json.dumps(pending(a.profile), ensure_ascii=False, indent=1))
+
+
+def answer(board: str, task_id: str, block_ev: int, text: str, where: str) -> str:
+    """Hand the user's answer to the question raised by block event `block_ev`, once. The same question
+    sits in two chats (the assignee's Bot Chat and the App chat): under a per-card lock, a card no
+    longer waiting on exactly that block (answered elsewhere, re-blocked with a new question, closed)
+    is refused with what happened since, instead of `resume`, which would re-run a ready card with a
+    second, conflicting note."""
+    with locked(f"answer-{board}-{task_id}"):
+        rows = board_rows(board, "SELECT id, status, block_kind FROM tasks WHERE id = ?", (task_id,))
+        now = block_event(board, task_id) if rows and waiting(rows[0]) else None
+        if now != block_ev:
+            since = [e["kind"] for e in board_rows(board, "SELECT kind FROM task_events WHERE task_id = ? AND id > ? "
+                                                          "ORDER BY id", (task_id, block_ev))]
+            state = rows[0]["status"] if rows else "deleted"
+            die(f"not applied: {task_id} no longer waits on question event {block_ev} "
+                f"(status {state}; events since: {', '.join(since) or 'none'}"
+                f"{f'; it now waits on question event {now}' if now else ''})")
+        return resume(board, task_id, f"使用者回覆（{where}，問題事件 {block_ev}）：{text}")
+
+
+def cmd_answer(a) -> None:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("answer runs from a chat, not inside a kanban worker")
+    print(answer(a.slug, a.task, a.event, a.text, a.where))
 
 
 def cmd_inbox(a) -> None:
@@ -2421,6 +2452,12 @@ def main() -> None:
     p = sub.add_parser("resume", help="re-run a blocked/held card (Hermes chat only)")
     p.add_argument("slug"); p.add_argument("task"); p.add_argument("--note", help="comment added before resuming")
     p.set_defaults(fn=cmd_resume)
+    p = sub.add_parser("answer", help="give the user's answer to the question a card waits on (once per question)")
+    p.add_argument("slug"); p.add_argument("task")
+    p.add_argument("--event", type=int, required=True, help="block_event from `devflow pending`")
+    p.add_argument("--where", required=True, help="where the user answered, e.g. 'devops 頁面' or 'App 對話'")
+    p.add_argument("text", help="the user's answer")
+    p.set_defaults(fn=cmd_answer)
     p = sub.add_parser("tick", help="board automation: plan checks, [ADV], orchestrator board_ops")
     p.add_argument("board", nargs="?"); p.add_argument("--hook", action="store_true",
                                                        help="Hermes on_kanban_dispatch_tick payload on stdin")
