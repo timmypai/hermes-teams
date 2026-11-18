@@ -93,6 +93,32 @@ class Plan(unittest.TestCase):
                     if "本卡完成" not in line and "已交 review" not in line:
                         self.assertIn(line, fixed)
 
+    def test_tick_drops_acs_copied_from_the_epic_and_keeps_the_ids(self):
+        epic = "## 目標\ng\n## 驗收\n- AC-1 [cli] 部署成功且健康檢查通過\n  - S1 x\n- AC-2 [ui] 看到登入畫面"
+        own = "- 本卡另需：診斷輸出保留錯誤原文"
+        dev = (f"## 目標\nd\n{self.done}## 驗收\n- AC-1 [cli] 部署成功且健康檢查通過\n"
+               f"- **AC-2**：[ui] 看到登入畫面\n- AC-2 [ui] 看到登入畫面，另加條件\n{own}\nEPIC: {EPIC}")
+        self.cards[EPIC] = ("[EPIC] e", epic, [SHIP], [], None)
+        self.cards[DEV] = ("[DEV] d", dev, [], [SHIP], None)
+        self.board({DEV})
+        edits = []
+        self.df.kanban = lambda b, cmd, *a: edits.append(a) if cmd == "edit" else self.show(b, cmd, *a)
+        self.assertEqual(self.df.repair_bodies("b", EPIC, self.df.plan_cards("b", EPIC)), [DEV])
+        body = edits[0][2]
+        self.assertIn("覆蓋：AC-1, AC-2", body)
+        self.assertNotIn("部署成功且健康檢查通過", body)
+        self.assertIn("看到登入畫面，另加條件", body)             # changed wording is the card's own check
+        self.assertIn(own, body)
+        self.assertIsNone(self.df.done_problem("[DEV] d", body))
+        self.assertEqual(self.df.strip_copied_acs(body, self.df.epic_acs(epic)), body)   # idempotent
+
+    def test_a_long_body_is_a_finding_but_an_epics_acceptance_is_not_counted(self):
+        history = "PR #1 head 4927c1a、run 44306911907、review 5957244689 已核對。" * 40
+        self.cards[SHIP] = ("[SHIP] s", f"## 目標\n部署\n## 提示\n{history}\nEPIC: {EPIC}", [DEV], [EPIC], None)
+        self.cards[EPIC] = ("[EPIC] e", "## 目標\ng\n## 驗收\n- AC-1 x\n" + "  - S1 Given 很長的情境\n" * 200, [SHIP], [], None)
+        self.board({DEV})
+        self.assertEqual([f.split(":")[0] for f in self.findings("上限")], [SHIP])
+
     def test_a_done_section_past_the_judges_2000_characters_is_a_finding(self):
         body = f"## 目標\n{'很長的限制。' * 400}\n{self.done}## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}"
         self.cards[DEV] = ("[DEV] d", body, [], [SHIP], None)

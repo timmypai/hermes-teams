@@ -867,15 +867,65 @@ def repaired_done(body: str) -> str:
     return (head + "\n\n" if head else "") + f"{DONE_HEADING}\n{DONE_TEXT}\n" + ("\n" + tail if tail else "")
 
 
-def repair_done_sections(board: str, cards: dict[str, dict]) -> list[str]:
-    """Put the fixed `## 本卡完成` back on pending [DEV]/[OPS] cards whose text drifted (an [ADJ] or the
-    orchestrator rewrote it); a card whose `## 目標` is too long to fit stays a plan finding."""
+# A card body is a spec: goal, the fixed done text, which ACs it covers plus its own checks, pointers.
+# teams-transcription cards grew to 5-6k characters: every AC copied from the EPIC, PR/run/review ids
+# and SHAs of each attempt, and the same prohibitions on every card, rewritten by each [ADJ] (one card
+# was edited 11 times). Workers then read the history as requirements. Progress belongs in comments.
+CARD_CHARS = 1500
+
+
+def epic_acs(epic_body: str) -> dict[str, str]:
+    return {m.group(1): norm(m.group(2)) for m in AC_RE.finditer(epic_body or "")}
+
+
+def strip_copied_acs(body: str, acs: dict[str, str]) -> str:
+    """`body` without lines that repeat an EPIC AC word for word; the AC ids stay in a `覆蓋：` line."""
+    dropped: list[str] = []
+
+    def keep(line: str) -> bool:
+        m = AC_RE.match(line)
+        if m and acs.get(m.group(1)) == norm(m.group(2)):
+            dropped.append(m.group(1))
+            return False
+        return True
+    lines = [ln for ln in (body or "").split("\n") if keep(ln)]
+    if not dropped:
+        return body
+    out = "\n".join(lines)
+    missing = [a for a in dict.fromkeys(dropped) if not re.search(rf"覆蓋[：:][^\n]*\b{a}\b", out)]
+    if missing:
+        cover = f"覆蓋：{', '.join(missing)}（全文見 EPIC）"
+        m = re.search(r"^## 驗收[ \t]*\n", out, re.M)
+        out = out[:m.end()] + cover + "\n" + out[m.end():] if m else out.rstrip("\n") + "\n\n## 驗收\n" + cover
+    return out
+
+
+def body_problem(kind: str, title: str, body: str) -> str | None:
+    text = body or ""
+    if kind == "EPIC":  # its ACs and scenarios, and the user's own words, may be long; the rest may not
+        text = re.sub(r"^## (驗收|使用者原話)[ \t]*\n.*?(?=^## |\Z)", "", text, flags=re.M | re.S)
+    elif kind == "ADV" or title.startswith(PR_ADVISOR_TITLE):
+        return None  # written by devflow itself
+    if len(text) <= CARD_CHARS:
+        return None
+    return (f"body {len(text)} 字（上限 {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
+            "AC 只寫編號；PR、run、review、SHA 與每輪經過寫留言，不寫進 body；共通規則已在 skill，不要每張卡抄")
+
+
+def repair_bodies(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
+    """On pending cards: drop ACs copied from the EPIC (the ids stay), and put the fixed `## 本卡完成`
+    back on [DEV]/[OPS] whose text drifted. A card still too long stays a plan finding."""
+    acs = epic_acs(cards[epic]["body"])
     fixed = []
     for tid, c in cards.items():
-        if card_type(c["title"]) not in ("DEV", "OPS") or c["status"] == "done" or not done_problem(c["title"], c["body"]):
+        kind = card_type(c["title"])
+        if tid == epic or kind in ("EPIC", "ADV", None) or c["status"] == "done":
             continue
-        body = repaired_done(c["body"])
-        if done_problem(c["title"], body) is None:
+        body = strip_copied_acs(c["body"], acs)
+        if kind in ("DEV", "OPS") and done_problem(c["title"], body):
+            repaired = repaired_done(body)
+            body = repaired if done_problem(c["title"], repaired) is None else body
+        if body != c["body"]:
             kanban(board, "edit", tid, "--body", body)
             fixed.append(tid)
     return fixed
@@ -916,6 +966,8 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue
         if c["status"] == "done":
             continue  # history; only pending work can still go wrong
+        if (why := body_problem(kind, c["title"], c["body"])):
+            found.append(f"{tid}: {why}")
         want = CARDS[kind]
         # PR cards move to the reviewer while in the review column.
         if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
@@ -1308,9 +1360,9 @@ def tick_board(board: str, st: dict) -> None:
         #    (dependency block parks the EPIC in todo until its parents finish).
         if kind == "EPIC" and t["status"] in ("todo", "blocked", "scheduled") and d["parents"]:
             cards = plan_cards(board, tid)
-            if fixed := repair_done_sections(board, cards):
-                kanban(board, "comment", tid, f"devflow：已把 {'、'.join(fixed)} 的 `{DONE_HEADING}` 改回固定文字"
-                                              f"「{DONE_TEXT}」（goal judge 只接受送審前就存在的條件）")
+            if fixed := repair_bodies(board, tid, cards):
+                kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)} 的 body：照抄的 EPIC AC 改成只寫編號，"
+                                              f"`{DONE_HEADING}` 改回固定文字「{DONE_TEXT}」（goal judge 只接受送審前就存在的條件）")
                 cards = plan_cards(board, tid)
             fp = plan_fingerprint(tid, cards, repo)
             if plans.get(tid) != fp:

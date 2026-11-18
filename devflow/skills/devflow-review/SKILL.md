@@ -20,7 +20,7 @@ metadata:
 
 ## 2. 驗
 - 跑 `.devflow/test.sh`（或 repo 慣用測試）。
-- 獨立探測（不提交）：依卡片的 AC 原文、不看 diff 決定要測什麼，自己寫一次性腳本或指令驗證關鍵行為與邊界；放在 worktree 外（`/tmp/review-<task>`），跑完刪掉，`git status` 必須乾淨。結果寫進結論 metadata 的 `probes`。
+- 獨立探測（不提交）：依卡片覆蓋的 AC（原文在 EPIC：`kanban_show(<EPIC>)`）、不看 diff 決定要測什麼，自己寫一次性腳本或指令驗證關鍵行為與邊界；放在 worktree 外（`/tmp/review-<task>`），跑完刪掉，`git status` 必須乾淨。結果寫進結論 metadata 的 `probes`。
 - 看 CI 結果；`ci.yml`（`devflow-ci`）紅燈 = 退件（除非 handoff 已說明是 runner 問題且你確認與程式碼無關）。`quality.yml` 失敗或數字差不算 CI 紅燈。
 - 情境與證據：`devflow check acceptance <slug> <EPIC> --pr <pr> --review --json`（EPIC 在卡片 body 的 `EPIC:`）。它向 GitHub 找這個 PR head 的 `ci.yml` run（最新 attempt），核對 `acceptance.json` 身分、`Covers:` 每個情境在 head 通過、步驟文字和 EPIC 一致、base 判定為紅燈（或帶豁免）。非 0 結束 = 退件，`reasons` 照抄進退件理由。
 - 再自己看證據：`gh run download <CI run> -D /tmp/review-<task>/evidence`，讀 `acceptance-matrix.md`，對每個情境：
@@ -30,7 +30,7 @@ metadata:
 - 檢查（`code-review` 的 Standards + Spec 兩軸）：
   1. 卡片覆蓋的每條 AC，EPIC 的每個情境都有對應實作、`Covers:`、通過的情境與證據；`[smoke]` 情境不寫資料。缺情境、斷言太弱或證據不足 → 退件，寫明哪個情境 id、要斷言什麼；由 developer 改 PR，你審新的 head。你不改 PR。
   2. 正確性與邊界條件；錯誤處理；讀者負擔（`pstack:principle-minimize-reader-load`）：一個概念散在多處、要跳很多檔案才看得懂、命名誤導 → 指出具體位置，影響正確理解才退件。
-  3. 安全：秘密進 repo、注入、權限、`deploy/compose.yml` 對外綁定（應只綁 `127.0.0.1`）。
+  3. 安全：秘密進 repo、注入、權限、`deploy/compose.yml` 對外綁定（應只綁 `127.0.0.1`）。部署腳本失敗時要能看到原因：取代或包裝 devflow 範本 `deploy.sh` 的程式，若把 build/up 的錯誤輸出整段丟掉（只留錯誤代碼、位元組數）→ 退件，要求遮秘密後保留 stderr 尾段（範本的 `capture.sh`/`redact.py` 做法）。看不到錯誤，下次部署失敗就只能猜。
   4. 回歸與影響範圍（`pstack:blast-radius`）；測試是否測行為而非實作。
   5. `ub-mode`（developer 在 Codex 用的同一份規則）的 Make it Right：根因修正而非遮蔽、測試測行為（「每個函式回傳空值測試還會過嗎？」）、重複與死碼。這些由你讀程式判斷。CI `quality` artifact（`devflow-quality-<sha>`：`crap.txt` / `dry.txt` / `mutate.txt`）目前**只供參考、不卡**：不因 CRAP、重複分數或存活 mutant 退件；值得處理的寫進結論 metadata 的 `followups`（或 approve 留言），由 orchestrator 決定是否另開卡。
   6. 規則與教訓（`check` job 已驗證格式、自測、ref 存在，並在 PR 上證明新教訓抓得到修正前的程式；你判斷內容）：新增或修改的規則，它的 `expect = "fail"` 範例要真的代表這次的錯誤；PR 刪除或放寬既有規則、`baseline.json` 增加條目、新增 `devflow: allow` 豁免，卡片沒有明確授權就退件，寫明要還原哪一處。PR 說明的 `No-lesson:`／`No-proof:` 理由不成立（同類錯誤顯然會再犯、錯誤其實就在這個 PR 修）→ 退件；修 bug 卻不用 `fix:` 標題來避開 lesson gate → 退件。

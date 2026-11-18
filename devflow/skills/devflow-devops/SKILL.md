@@ -90,7 +90,8 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 | runner offline / 主機 Docker 問題 | `devflow repo doctor <slug>` 看 `runner-online`／`runner-request` 的 `detail`；沒有 runner 就 `devflow runner request`。修好後部署最新版：`gh workflow run deploy.yml --ref <default>`（不要 `gh run rerun` 舊 run：期間有新合併時，它在 `default branch tip only` 失敗，不會部署）。容器內修不了（主機沒處理申請、runner 服務停了）→ `kanban_block(kind="capability")`，問題寫成誰在 VM 做什麼；不建卡、不設計其他部署方式 |
 | 部署 run 在 `default branch tip only` 失敗 | 不是程式問題：這個 SHA 已不是 default branch 最新版。追最新 commit 的部署 run（沒有就用上一列的 `gh workflow run`）；要回到舊版用 revert PR |
 | 部署 health、verify 或 up 失敗 | deploy.sh 已先採證再回滾。`gh run view <id> --log-failed` 看哪一步、哪個情境；`gh run download <id> -n devflow-diagnostics-deploy-<sha> -D /tmp/diag-<id>` 讀 `candidate/`（失敗版本的 `state.jsonl`、`logs/`、`health.json`、`host.txt`）與 `rollback/`（回滾後狀態）。判定是程式問題 → 照第一列建修正卡，body 附 run URL 與關鍵證據（不貼整段 log）；主機資源或 runner 問題 → 照第二列 |
-| build 失敗 | 執行中版本不受影響（`build-failed/` 記錄當下狀態）；看 `--log-failed` 的建置輸出，照第一列處理 |
+| build 失敗 | 執行中版本不受影響（`build-failed/` 記錄當下狀態）；看 `--log-failed` 的建置輸出，照第一列處理。`docker` exit 125 是 docker 指令本身的錯（例如 `unknown command: docker buildx`、未知參數、連不到 daemon），多半是主機缺元件 → 照第二列 |
+| log 看不到錯誤原文（repo 自訂的部署腳本只留錯誤代碼或位元組數） | 不要開「補診斷」PR 輪（teams-transcription 為此繞了兩輪仍不知原因，實際是主機沒裝 buildx）。用 exit code 與失敗步驟縮小範圍；能判定是主機問題 → 照第二列 block，問題寫成「請在 VM 以 runner 帳號執行 <唯讀指令>，回報輸出」；是 repo 問題 → 一張小 `[DEV]`：失敗時把該步驟的 stderr 尾段（遮秘密後）印進 log，同時改回 devflow 範本 `deploy.sh` 的採證方式 |
 | 需要使用者決定（公開網域、付費、刪資料） | 才 `kanban_block(kind="needs_input")` |
 | 同一類失敗第二次出現（不同卡、同一原因） | 除了照上面處理，把教訓放進結構而不是只寫提醒（`pstack:principle-encode-lessons-in-structure`）：該 repo 的問題 → 修正卡改 `.devflow/` 腳本或 CI；所有 repo 都會遇到 → summary `followups` 寫明要改 devflow 範本或 `devflow` CLI 的哪裡 |
 

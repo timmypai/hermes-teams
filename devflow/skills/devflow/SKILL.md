@@ -48,7 +48,7 @@ metadata:
 | `[ADJ]` | orchestrator | `dir` | 依 advisor 建議或失敗卡調整計畫 |
 
 ## 交接規則
-- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收寫「覆蓋：AC-n」。
+- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠，整份 ≤ 1500 字（`check plan` 檢查）。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收只寫「覆蓋：AC-n」，不抄原文（原文讀 EPIC）。PR 號、SHA、run、review id、每一輪的經過寫在留言或 summary，不寫進 body。
 - 證據：每個情境在 repo 是一個 Given/When/Then 可執行情境（`[ui]`/`[api]` 用 `.devflow/ui` 的 Playwright `scenario`，`[cli]`/`[lib]` 用 `.devflow/verify.sh` 的 `scenario`），測試標題以完整 id `<EPIC>/AC-n.Sm` 開頭、步驟文字與 EPIC 一字不差。PR CI（head + base 紅綠證明）、部署後（smoke）、整合驗收（部署 SHA 全部情境）各產生 `acceptance.json`，存 GitHub Actions artifact；卡片 metadata 只放 PR 號與 run URL，不貼長 log。證據身分（repo、SHA、workflow、run attempt）由 `devflow check acceptance` 向 GitHub 核對，不信卡片或報告自述。
 - 交付寫在 `kanban_complete`（或 `kanban_request_review`）：`summary` 1–3 句；`metadata` 放結構化事實（`pr_url`、`branch`、`head_sha`、`tests`、`decisions`、`findings`…）。下游卡自動在 context 看到 parent 的 summary/metadata。
 - 不寫額外交接文件；需要給人看的長內容用 `artifacts` 附檔。
