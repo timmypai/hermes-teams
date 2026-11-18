@@ -122,8 +122,10 @@ class RouteQuestions(unittest.TestCase):
     def kanban(self, board, cmd, tid, *args):
         opts = dict(zip(args[::2], args[1::2]))
         if cmd == "notify-unsubscribe":
-            self.board.db.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND chat_id=?", (tid, opts["--chat-id"]))
+            cur = self.board.db.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND chat_id=?", (tid, opts["--chat-id"]))
             self.board.db.commit()
+            if cur.rowcount == 0:   # Hermes: "(no such subscription)", exit 1 -> devflow run() dies
+                raise SystemExit("no such subscription")
             return ""
         assert cmd == "notify-subscribe", cmd
         self.board.subscribe(tid, {"platform": opts["--platform"], "chat_id": opts["--chat-id"],
@@ -246,6 +248,17 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(sorted(self.board.sent), [("t_ship", ev, "local-devops"), ("t_ship", ev, "local-inbox")])
         self.assertIn(("t_ship", "local-devops", "devops"), self.profiles)
         self.assertEqual([(p["task"], p["ask_in"]) for p in self.df.pending("devops")], [("t_ship", "devops")])
+
+    def test_an_archived_routed_card_does_not_stop_the_next_question(self):
+        self.board.card("t_old", "[SHIP] answered then archived", assignee="devops")
+        self.board.block("t_old")
+        self.tick()
+        self.board.db.execute("UPDATE tasks SET status='archived' WHERE id='t_old'")
+        self.board.db.execute("DELETE FROM kanban_notify_subs WHERE task_id='t_old'")   # Hermes archive drops them
+        self.board.card("t_new", "[SHIP] next question", assignee="devops")
+        ev = self.board.block("t_new")
+        self.tick()
+        self.assertIn(("t_new", ev, "local-devops"), self.board.sent)
 
     def test_assignee_chat_is_unsubscribed_after_the_answer(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")

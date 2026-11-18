@@ -1444,9 +1444,11 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
     for key, r in list(routed.items()):
         b, tid = key.split("/", 1)
         now = dest.get(tid) if b == board else r
-        # Answered, gone, or reassigned to another bot: the old bot must not be woken again.
+        # Answered, gone, or reassigned to another bot: the old bot must not be woken again. Archiving
+        # removes a card's subscriptions itself, and unsubscribing a missing one fails the whole tick.
         if not now or (now["platform"], now["chat_id"]) != (r["platform"], r["chat_id"]):
-            kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
+            if any((s["platform"], s["chat_id"]) == (r["platform"], r["chat_id"]) for s in subs.get(tid, [])):
+                kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
             del routed[key]
     for tid, t in tasks.items():
         chat = dest[tid]
