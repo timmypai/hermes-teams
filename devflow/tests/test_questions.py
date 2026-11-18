@@ -318,6 +318,13 @@ class RouteQuestions(unittest.TestCase):
         self.df.decide, self.df.run = decide, run
         return judged, created
 
+    def test_an_idle_board_is_ticked_again_after_a_kit_update(self):
+        key = self.df.tick_key("b")
+        self.assertEqual(self.df.tick_key("b"), key)                     # idle board, same kit: skipped
+        roles = self.df.ROOT / "roles.json"
+        roles.write_text(roles.read_text() + "\n")                        # deploy-kit.sh copied a new kit
+        self.assertNotEqual(self.df.tick_key("b"), key)
+
     def test_a_failed_adj_create_asks_the_user_and_routing_goes_on(self):
         self._ops_card()
         self._flow(0.05, create_ok=False)

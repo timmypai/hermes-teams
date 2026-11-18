@@ -1132,8 +1132,14 @@ TICK = ROOT / "state" / "tick.json"
 BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
 
 
-def board_mtime(board: str) -> float:
-    return max((p.stat().st_mtime for p in (BOARDS / board).glob("kanban.db*")), default=0.0)
+def tick_key(board: str) -> str:
+    """What a tick depends on: the board's files and the kit's own rules. A board idle since the last
+    tick is skipped, but not after a kit update: new rules (e.g. the fixed `## 本卡完成`) must reach the
+    stalled boards they were written for."""
+    import hashlib
+    board_mtime = max((p.stat().st_mtime for p in (BOARDS / board).glob("kanban.db*")), default=0.0)
+    kit = hashlib.sha1(Path(__file__).resolve().read_bytes() + (ROOT / "roles.json").read_bytes()).hexdigest()[:12]
+    return f"{board_mtime}:{kit}"
 
 
 def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
@@ -1746,7 +1752,7 @@ def cmd_tick(a) -> None:
         try:
             board = (json.loads(sys.stdin.read() or "{}").get("extra") or {}).get("board")
             st = json.loads(TICK.read_text()) if TICK.exists() else {}
-            if board in load_state() and st.get("mtime", {}).get(board) != board_mtime(board):
+            if board in load_state() and st.get("mtime", {}).get(board) != tick_key(board):
                 log = open(ROOT / "state" / "tick.log", "a")
                 subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "tick", board], stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -1761,7 +1767,7 @@ def cmd_tick(a) -> None:
     except BlockingIOError:
         return  # a tick is already running; the next dispatcher tick retries
     st = json.loads(TICK.read_text()) if TICK.exists() else {}
-    mtime = board_mtime(a.board)
+    mtime = tick_key(a.board)
     try:
         tick_board(a.board, st)
     except SystemExit:
