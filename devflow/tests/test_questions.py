@@ -35,7 +35,8 @@ class Board:
         self.db.executescript("""
             CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
             CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
-            CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT,
+              created_at INTEGER);
             CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,
               user_id TEXT, user_id_alt TEXT, chat_type TEXT, notifier_profile TEXT, delivery_mode TEXT,
               created_at INTEGER, last_event_id INTEGER, last_ping_event_id INTEGER);""")
@@ -47,8 +48,8 @@ class Board:
         self.event(tid, "created")
 
     def event(self, tid: str, kind: str, payload: dict | None = None) -> int:
-        cur = self.db.execute("INSERT INTO task_events (task_id, kind, payload) VALUES (?,?,?)",
-                              (tid, kind, json.dumps(payload or {})))
+        cur = self.db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                              (tid, kind, json.dumps(payload or {}), int(time.time())))
         self.db.commit()
         return int(cur.lastrowid or 0)
 
@@ -60,13 +61,13 @@ class Board:
         self.db.execute("UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (tid,))
         self.event(tid, "unblocked")
 
-    def subscribe(self, tid: str, chat: dict) -> None:
+    def subscribe(self, tid: str, chat: dict, profile: str = "default") -> None:
         """Hermes add_notify_sub: the cursor starts after every existing event."""
         self.clock += 1
         top = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
         self.db.execute("INSERT INTO kanban_notify_subs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (tid, chat["platform"], chat["chat_id"], chat.get("thread_id"), chat.get("user_id"), None,
-                         chat.get("chat_type"), "default", "notify+wake", self.clock, top, 0))
+                         chat.get("chat_type"), profile, "notify+wake", self.clock, top, 0))
         self.db.commit()
 
     def notify(self) -> None:
@@ -105,6 +106,7 @@ class RouteQuestions(unittest.TestCase):
         # The default profile's chats: Bot Chat is the inbox even when an automated oneshot run is newer.
         with closing(sqlite3.connect(root / "data" / "state.db")) as s:
             s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
+            s.execute("CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
             s.executemany("INSERT INTO sessions VALUES (?,?,?,?)", [
                 ("Bot Chat", "tui", json.dumps(BOT_CHAT), 300),
                 ("建立 EPIC", "oneshot", json.dumps(ONESHOT_CHAT), 200),
@@ -118,10 +120,12 @@ class RouteQuestions(unittest.TestCase):
                 f"model: x\nplatform_toolsets:\n  cli:\n    - {tools}\n  api_server:\n    - terminal\nkanban:\n  a: 1\n")
             with closing(sqlite3.connect(root / "data" / "profiles" / p / "state.db")) as s:
                 s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
+                s.execute("CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
                 s.execute("INSERT INTO sessions VALUES (?,?,?,?)",
                           ("Bot Chat", "gui", json.dumps({**DEVOPS_CHAT, "chat_id": f"local-{p}"}), 10))
                 s.commit()
         self.profiles: list[tuple] = []
+        self.data = root / "data"
 
     def kanban(self, board, cmd, tid, *args):
         opts = dict(zip(args[::2], args[1::2]))
@@ -133,7 +137,8 @@ class RouteQuestions(unittest.TestCase):
             return ""
         assert cmd == "notify-subscribe", cmd
         self.board.subscribe(tid, {"platform": opts["--platform"], "chat_id": opts["--chat-id"],
-                                   "user_id": opts.get("--user-id"), "chat_type": opts.get("--chat-type")})
+                                   "user_id": opts.get("--user-id"), "chat_type": opts.get("--chat-type")},
+                             opts["--notifier-profile"])
         self.profiles.append((tid, opts["--chat-id"], opts["--notifier-profile"]))
         return ""
 
@@ -264,14 +269,25 @@ class RouteQuestions(unittest.TestCase):
         self.tick()
         self.assertIn(("t_new", ev, "local-devops"), self.board.sent)
 
-    def test_pending_says_which_chats_got_the_question(self):
+    def _say(self, profile: str, chat_id: str, role: str, content: str) -> None:
+        db = self.data / ("state.db" if profile == "default" else f"profiles/{profile}/state.db")
+        with closing(sqlite3.connect(db)) as s:
+            s.execute("CREATE TABLE IF NOT EXISTS messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
+            s.execute("INSERT INTO messages VALUES (?,?,?,?)", (chat_id, role, content, time.time()))
+            s.commit()
+
+    def test_pending_reports_what_each_chat_transcript_shows_not_the_ping_cursor(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
         self.board.block("t_ship")
-        self.df.route_questions("b", self.st)          # subscribed and rewound, notifier not run yet
-        self.assertEqual({s["chat"]: s["delivered"] for s in self.df.pending()[0]["sent_to"]},
-                         {"api_server:local-inbox": False, "local:local-devops": False})
-        self.board.notify()
-        self.assertTrue(all(s["delivered"] for s in self.df.pending()[0]["sent_to"]))
+        self.tick()                                     # notifier ran: pings recorded, cursors advanced
+        def seen():
+            return {c["chat"]: (c["woken"], c["replied"]) for c in self.df.pending()[0]["chats"]}
+        self.assertEqual(seen(), {"api_server:local-inbox": (False, False), "local:local-devops": (False, False)})
+        self._say("default", "local-inbox", "user", "[kanban] Task t_ship blocked; needs attention.")
+        self._say("devops", "local-devops", "user", "[kanban] Task t_ship blocked; needs attention.")
+        self.assertEqual(seen(), {"api_server:local-inbox": (True, False), "local:local-devops": (True, False)})
+        self._say("devops", "local-devops", "assistant", "需要你決定（b t_ship）…")
+        self.assertEqual(seen()["local:local-devops"], (True, True))
 
     def _resume_like_hermes(self):
         """devflow resume, reduced to its effect: a note, then the card unblocks (slowly, to overlap)."""
