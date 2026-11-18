@@ -17,7 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
 os.umask(0o022)
@@ -1137,7 +1137,10 @@ def tick_key(board: str) -> str:
     tick is skipped, but not after a kit update: new rules (e.g. the fixed `## 本卡完成`) must reach the
     stalled boards they were written for."""
     import hashlib
-    board_mtime = max((p.stat().st_mtime for p in (BOARDS / board).glob("kanban.db*")), default=0.0)
+    board_mtime = 0.0
+    for p in (BOARDS / board).glob("kanban.db*"):
+        with suppress(FileNotFoundError):  # SQLite removes -wal/-shm between glob and stat
+            board_mtime = max(board_mtime, p.stat().st_mtime)
     kit = hashlib.sha1(Path(__file__).resolve().read_bytes() + (ROOT / "roles.json").read_bytes()).hexdigest()[:12]
     return f"{board_mtime}:{kit}"
 
@@ -1761,11 +1764,16 @@ def cmd_tick(a) -> None:
         return
     if not a.board:
         die("usage: devflow tick BOARD  (or --hook)")
-    lock = open(ROOT / "state" / "tick.lock", "w")
+    # One waiting tick per board; ticks of different boards wait for each other (they share tick.json).
+    # Skipping on the shared lock starved boards: a board whose own tick writes to it (devflow-smoke)
+    # changed every time and always held the lock when the next board's hook fired (2026-11-18).
+    mine = open(ROOT / "state" / f"tick-{a.board}.lock", "w")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(mine, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        return  # a tick is already running; the next dispatcher tick retries
+        return  # this board's tick is already running or waiting; it reads the board when it runs
+    lock = open(ROOT / "state" / "tick.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     st = json.loads(TICK.read_text()) if TICK.exists() else {}
     mtime = tick_key(a.board)
     try:
