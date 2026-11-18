@@ -81,6 +81,18 @@ class Plan(unittest.TestCase):
         self.assertIn("## 驗收\n覆蓋：AC-1\n- AC-1 x\nEPIC: t_epic", fixed)
         self.assertNotIn("reviewer 批准", fixed)
 
+    def test_repair_never_folds_the_following_lines_into_the_done_section(self):
+        for body in ("EPIC: t_e01\n## 本卡完成\n已交 review\n## 驗收\n覆蓋：AC-1",   # no `## 目標`
+                     "EPIC: t_e01\n覆蓋：AC-1",                                     # no heading at all
+                     "## 驗收\n- AC-1 x\n## 目標\n做 x\n## 提示\n- y"):              # 目標 not first
+            with self.subTest(body=body):
+                fixed = self.df.repaired_done(body)
+                self.assertIsNone(self.df.done_problem("[DEV] d", fixed), fixed)
+                self.assertNotIn("已交 review", fixed)
+                for line in body.splitlines():
+                    if "本卡完成" not in line and "已交 review" not in line:
+                        self.assertIn(line, fixed)
+
     def test_a_done_section_past_the_judges_2000_characters_is_a_finding(self):
         body = f"## 目標\n{'很長的限制。' * 400}\n{self.done}## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}"
         self.cards[DEV] = ("[DEV] d", body, [], [SHIP], None)

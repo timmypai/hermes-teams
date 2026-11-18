@@ -856,12 +856,15 @@ def done_problem(title: str, body: str) -> str | None:
 
 
 def repaired_done(body: str) -> str:
-    """`body` with devflow's own `## 本卡完成` right after `## 目標` (else first), any other version removed."""
+    """`body` with devflow's own `## 本卡完成` right after `## 目標` (else before the first `##` heading,
+    else at the end: text after the section would read as part of it), any other version removed."""
     rest = re.sub(r"\n{3,}", "\n\n", DONE_RE.sub("", body or "")).strip("\n")
-    section = f"{DONE_HEADING}\n{DONE_TEXT}\n\n"
-    heads = [m.start() for m in re.finditer(r"^## ", rest, re.M)]
-    at = (heads[1] if len(heads) > 1 else len(rest)) if rest.startswith("## 目標") else 0
-    return (rest[:at].rstrip("\n") + "\n\n" if at else "") + section + rest[at:].lstrip("\n")
+    heads = [(m.start(), m.group(1)) for m in re.finditer(r"^## (.*)$", rest, re.M)]
+    goal = next((i for i, (_, h) in enumerate(heads) if h.strip() == "目標"), None)
+    at = (heads[goal + 1][0] if goal + 1 < len(heads) else len(rest)) if goal is not None else (
+        heads[0][0] if heads else len(rest))
+    head, tail = rest[:at].rstrip("\n"), rest[at:].lstrip("\n")
+    return (head + "\n\n" if head else "") + f"{DONE_HEADING}\n{DONE_TEXT}\n" + ("\n" + tail if tail else "")
 
 
 def repair_done_sections(board: str, cards: dict[str, dict]) -> list[str]:
@@ -1598,8 +1601,9 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
             earlier = sum(1 for k, v in flow.items() if k.startswith(f"{board}/{tid}/") and v != "user")
             question = block_reason(board, ev)
             p = None if earlier >= FLOW_ADJ_LIMIT else user_must_answer(t, question)
-            flow[key] = "user" if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
+            adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
                 board, tid, t, ev, question, next(owning_epics(tid, tasks, children), None), p)
+            flow[key] = adj or "user"
         if flow[key] != "user":
             handled[tid] = flow[key]
     for k in list(flow)[:-1000]:
@@ -1607,7 +1611,9 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
     return handled
 
 
-def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: str | None, p: float) -> str:
+def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: str | None, p: float) -> str | None:
+    """The new [ADJ]'s id; None when Hermes refused the create (the user is asked instead: one failing
+    create must not stop question routing for the whole board)."""
     body = ((f"EPIC: {epic}\n\n" if epic else "") +
             f"## 目標\n{tid}（{t['title']}）停在流程問題，不是要使用者決定的事（Decisions：只有使用者能回答的機率 {p:.2f}）。"
             "找出根因修掉，讓它繼續。\n\n"
@@ -1615,10 +1621,14 @@ def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: s
             "## 做法\n照 devflow-orchestrate「C. 調整」：讀卡片 runs 與留言找根因；用 devflow-ops 改卡片、改派或 `resume`"
             "（note 寫明改了什麼、worker 下一步做什麼）。根因是 Hermes 原生限制時照 README「Hermes 原生限制與對應」，"
             "不建修 Hermes 的卡。真的需要使用者決定時，才在本卡 kanban_block(kind=\"needs_input\") 問他。")
-    out = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
-               "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"flow-{tid}-{ev}",
-               "--created-by", "devflow-tick"]).stdout
-    return re.search(r"t_[0-9a-f]{8}", out).group(0)
+    res = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
+              "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"flow-{tid}-{ev}",
+              "--created-by", "devflow-tick"], check=False)
+    m = re.search(r"t_[0-9a-f]{8}", res.stdout) if res.returncode == 0 else None
+    if m is None:
+        print(f"devflow: [ADJ] for {board}/{tid} not created, asking the user: {(res.stderr or res.stdout).strip()[-300:]}",
+              file=sys.stderr)
+    return m.group(0) if m else None
 
 
 def chat_receipt(profile: str, chat_id: str, tid: str, since: float) -> dict:
