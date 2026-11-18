@@ -300,7 +300,7 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(seen()["local:local-devops"], (True, True))
 
     # --- workflow questions go to an [ADJ], not to the user ---------------------------------------
-    def _flow(self, p: float | None) -> tuple[list, list]:
+    def _flow(self, p: float | None, create_ok: bool = True) -> tuple[list, list]:
         """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded."""
         judged, created = [], []
 
@@ -312,9 +312,21 @@ class RouteQuestions(unittest.TestCase):
 
         def run(cmd, **kw):
             created.append(cmd)
-            return types.SimpleNamespace(stdout=f"Created t_ad{len(created):06x}\n")
+            if not create_ok:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="database is locked")
+            return types.SimpleNamespace(returncode=0, stdout=f"Created t_ad{len(created):06x}\n", stderr="")
         self.df.decide, self.df.run = decide, run
         return judged, created
+
+    def test_a_failed_adj_create_asks_the_user_and_routing_goes_on(self):
+        self._ops_card()
+        self._flow(0.05, create_ok=False)
+        self.board.card("t_ship", "[SHIP] another question", assignee="devops")
+        evs = {tid: self.board.block(tid) for tid in ("t_ops", "t_ship")}
+        with redirect_stderr(io.StringIO()):
+            self.tick()
+        self.assertIn(("t_ops", evs["t_ops"], "local-devops"), self.board.sent)
+        self.assertIn(("t_ship", evs["t_ship"], "local-devops"), self.board.sent)
 
     def _ops_card(self) -> str:
         epic = "t_e04c0ffe"
