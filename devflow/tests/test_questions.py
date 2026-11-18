@@ -6,6 +6,7 @@ compare-and-set on the cursor.
 """
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -324,6 +325,23 @@ class RouteQuestions(unittest.TestCase):
         roles = self.df.ROOT / "roles.json"
         roles.write_text(roles.read_text() + "\n")                        # deploy-kit.sh copied a new kit
         self.assertNotEqual(self.df.tick_key("b"), key)
+
+    def test_a_tick_waits_for_another_boards_tick_instead_of_skipping(self):
+        """devflow-smoke's tick held the shared lock whenever teams-transcription's hook fired (2026-11-18)."""
+        ran = []
+        self.df.tick_board = lambda board, st: ran.append(board)
+        other = open(self.df.ROOT / "state" / "tick.lock", "w")        # another board's tick is running
+        fcntl.flock(other, fcntl.LOCK_EX)
+        waiting = threading.Thread(target=self.df.cmd_tick, args=(types.SimpleNamespace(hook=False, board="b"),))
+        waiting.start()
+        time.sleep(0.3)
+        self.df.cmd_tick(types.SimpleNamespace(hook=False, board="b"))  # a second hook for b: one waiter is enough
+        self.assertEqual(ran, [])
+        fcntl.flock(other, fcntl.LOCK_UN)
+        other.close()
+        waiting.join(5)
+        self.assertEqual(ran, ["b"])
+        self.assertEqual(json.loads(self.df.TICK.read_text())["mtime"]["b"], self.df.tick_key("b"))
 
     def test_a_failed_adj_create_asks_the_user_and_routing_goes_on(self):
         self._ops_card()
