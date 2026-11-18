@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import types
 import unittest
 from contextlib import closing, redirect_stderr
 from pathlib import Path
@@ -39,7 +40,9 @@ class Board:
               created_at INTEGER);
             CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,
               user_id TEXT, user_id_alt TEXT, chat_type TEXT, notifier_profile TEXT, delivery_mode TEXT,
-              created_at INTEGER, last_event_id INTEGER, last_ping_event_id INTEGER);""")
+              created_at INTEGER, last_event_id INTEGER, last_ping_event_id INTEGER);
+            CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, author TEXT, body TEXT,
+              created_at INTEGER);""")
         self.sent: list[tuple[str, int, str]] = []   # (task, event id, chat) the notifier delivered
         self.clock = 0
 
@@ -53,9 +56,14 @@ class Board:
         self.db.commit()
         return int(cur.lastrowid or 0)
 
-    def block(self, tid: str, kind: str = "needs_input") -> int:
+    def block(self, tid: str, kind: str = "needs_input", reason: str = "問題：要不要公開？") -> int:
         self.db.execute("UPDATE tasks SET status='blocked', block_kind=? WHERE id=?", (kind, tid))
-        return self.event(tid, "blocked", {"kind": kind, "reason": "問題：要不要公開？"})
+        return self.event(tid, "blocked", {"kind": kind, "reason": reason})
+
+    def comment(self, tid: str, author: str, body: str) -> None:
+        self.db.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                        (tid, author, body, int(time.time())))
+        self.db.commit()
 
     def unblock(self, tid: str) -> None:
         self.db.execute("UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (tid,))
@@ -95,7 +103,7 @@ class RouteQuestions(unittest.TestCase):
         from test_judgment import load_devflow
         shutil.copy(KIT / "roles.json", root / "roles.json")
         (root / "state").mkdir()
-        (root / "state" / "repos.json").write_text(json.dumps({"b": {"slug": "b", "repo": "o/r"}}))
+        (root / "state" / "repos.json").write_text(json.dumps({"b": {"slug": "b", "repo": "o/r", "path": str(root / "repo")}}))
         self.df = load_devflow(root)
         (root / "data" / "kanban" / "boards" / "b").mkdir(parents=True)
         self.board = Board(root / "data" / "kanban" / "boards" / "b" / "kanban.db")
@@ -103,6 +111,8 @@ class RouteQuestions(unittest.TestCase):
         self.df.kanban = self.kanban
         self.df.replay_from = self.replay_from
         self.st: dict = {}
+        # Decisions says "only the user can answer" unless a test says otherwise: no network in tests.
+        self.df.decide = lambda content, questions: {"user_decision": {"probability": 0.9}}
         # The default profile's chats: Bot Chat is the inbox even when an automated oneshot run is newer.
         with closing(sqlite3.connect(root / "data" / "state.db")) as s:
             s.execute("CREATE TABLE sessions (title TEXT, source TEXT, origin_json TEXT, last_activity_at REAL)")
@@ -288,6 +298,85 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(seen(), {"api_server:local-inbox": (True, False), "local:local-devops": (True, False)})
         self._say("devops", "local-devops", "assistant", "需要你決定（b t_ship）…")
         self.assertEqual(seen()["local:local-devops"], (True, True))
+
+    # --- workflow questions go to an [ADJ], not to the user ---------------------------------------
+    def _flow(self, p: float | None) -> tuple[list, list]:
+        """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded."""
+        judged, created = [], []
+
+        def decide(content, questions):
+            judged.append(content)
+            if p is None:
+                raise self.df.DecisionsError("no key")
+            return {"user_decision": {"probability": p}}
+
+        def run(cmd, **kw):
+            created.append(cmd)
+            return types.SimpleNamespace(stdout=f"Created t_ad{len(created):06x}\n")
+        self.df.decide, self.df.run = decide, run
+        return judged, created
+
+    def _ops_card(self) -> str:
+        epic = "t_e04c0ffe"
+        self.board.card(epic, "[EPIC] goal")
+        self.board.subscribe(epic, EPIC_CHAT)
+        self.board.card("t_ops", "[OPS] step", assignee="devops")
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_ops', ?)", (epic,))
+        return epic
+
+    def test_a_workflow_question_opens_one_adj_and_does_not_wake_the_assignee(self):
+        epic = self._ops_card()
+        judged, created = self._flow(0.05)
+        ev = self.board.block("t_ops", reason="問題：請 Hermes 管理端排除 goal judge 循環？選項：A / B")
+        self.tick()
+        self.tick()
+        self.assertEqual(len(judged), 1)
+        self.assertEqual(len(created), 1)
+        cmd = created[0]
+        self.assertEqual(cmd[cmd.index("--assignee") + 1], "orchestrator")
+        self.assertIn(f"EPIC: {epic}", cmd[cmd.index("--body") + 1])
+        self.assertIn("goal judge 循環", cmd[cmd.index("--body") + 1])
+        self.assertEqual(cmd[cmd.index("--idempotency-key") + 1], f"flow-t_ops-{ev}")
+        # Hermes' own notifier still pings the EPIC chat; Hermes answers it from `handled_by` (intake skill).
+        self.assertNotIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertEqual(self.df.pending()[0]["handled_by"], "t_ad000001")
+
+    def test_a_card_blocked_a_third_time_asks_the_user(self):
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        evs = []
+        for i in range(3):
+            if i:
+                self.board.unblock("t_ops")      # the [ADJ] resumed it; the worker blocked again
+            evs.append(self.board.block("t_ops"))
+            self.tick()
+        self.assertEqual(len(created), 2)
+        self.assertEqual(len(judged), 2)
+        self.assertEqual([e for _, e, chat in self.board.sent if chat == "local-devops"], [evs[2]])
+
+    def test_unsure_or_unavailable_decisions_asks_the_user(self):
+        self._ops_card()
+        for p, tid in ((0.5, "t_ops"), (None, "t_ops2")):
+            with self.subTest(p=p):
+                if tid != "t_ops":
+                    self.board.card(tid, "[OPS] step 2", assignee="devops")
+                    self.board.db.execute("INSERT INTO task_links VALUES (?, 't_e04c0ffe')", (tid,))
+                _, created = self._flow(p)
+                ev = self.board.block(tid)
+                self.tick()
+                self.assertEqual(created, [])
+                self.assertIn((tid, ev, "local-devops"), self.board.sent)
+
+    def test_comments_after_the_question_are_listed_except_the_assignees_own(self):
+        self.board.card("t_res", "[RES] find the source", assignee="researcher")
+        self.board.comment("t_res", "default", "提問前的留言")
+        time.sleep(1.1)                            # comments are timed in whole seconds
+        self.board.block("t_res", kind="capability")
+        self.board.comment("t_res", "researcher", "我自己的進度")
+        self.board.comment("t_res", "default", "使用者提供：上游 commit 0f50ec6c")
+        self.assertEqual([(c["author"], c["text"]) for c in self.df.pending()[0]["comments_since"]],
+                         [("default", "使用者提供：上游 commit 0f50ec6c")])
 
     def _resume_like_hermes(self):
         """devflow resume, reduced to its effect: a note, then the card unblocks (slowly, to overlap)."""
