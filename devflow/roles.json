@@ -103,7 +103,7 @@
                  "principle-exhaust-the-design-space", "principle-attack-the-premise", "unslop"],
       "gh": "builder",
       "git_name": "hermes-researcher",
-      "config": {}
+      "config": {"platform_toolsets.cli": "[terminal, file, code_execution, skills, web, browser, vision]"}
     },
     "architect": {
       "title": "architect",

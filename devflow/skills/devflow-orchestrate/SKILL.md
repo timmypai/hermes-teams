@@ -65,10 +65,13 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 4. 建卡：
    ```
    kanban_create(title="[DEV] ...", assignee="developer", workspace_kind="worktree", goal_mode=true,
-                 parents=[...], body="## 目標\n...\n## 本卡完成\nPR 已開、exact-head CI 綠、已交 review；合併與部署由 [SHIP] 負責。\n## 驗收\n- ...\n## 提示\n- 相關檔案...\n- EPIC: t_xxxx",
+                 parents=[...], body="## 目標\n...\n## 本卡完成\nPR 已開、exact-head CI 綠。交 review 是完成後的下一步，不是完成條件；合併與部署由 [SHIP] 負責。\n## 驗收\n- ...\n## 提示\n- 相關檔案...\n- EPIC: t_xxxx",
                  skills=[選用，例如 "tdd"])
    ```
-   `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。goal judge 用 title+body 判斷能否交 review，所以 body 一定要有上面的 `## 本卡完成`，否則會因「還沒部署」擋下 review。goal_mode 建卡後改不了，漏加只能作廢重建。
+   `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。送審時 Hermes 的 goal judge 只讀 title+body 的前 2000 字，判斷「本卡完成」是否已達成。所以：
+   - `## 本卡完成` 一字不改照抄上面那句，緊接在 `## 目標` 後面。不要加「已交 review」「reviewer 已接手」「已批准」「已部署」：這些在送審後才會發生，judge 會永遠拒絕送審（teams-transcription t_6d121ad4）。改過的文字 dispatcher tick 會自動改回，並在 EPIC 留言。
+   - body 寫短：`## 目標` 幾句話，限制只寫這張卡特有的；共通規則（不自審、不直接部署、安全限制）已在 skill 與 EPIC，不要整段複製。不要寫「使用者已同意…不代表…不得…」這類條文。
+   goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。
 5. 把每條路徑的最後一張卡（通常是 `[SHIP]`）連成 EPIC 的 parent：`kanban_link(parent_id=<leaf>, child_id=<EPIC>)`。
 6. 自查：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`findings` 裡的規則問題（assignee、workspace、contract、缺 `[SHIP]`、AC 沒人負責、AC 沒類型、缺情境或 Given/When/Then、沒接到 EPIC）自己修掉再跑一次；`[manual]` 的提醒是給 advisor 判斷的，不用自己處理；`Decisions …` 開頭的是風險判斷，不用自己處理。
@@ -92,7 +95,8 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 - 接受建議：新卡照 A.4 建並 `kanban_link` 到 EPIC；要作廢、改寫、換人或解除依賴的舊卡，用 `devflow-ops`（見「看板操作」）。卡型只有 `[RES]` `[ARCH]` `[DEV]` `[OPS]` `[SHIP]`，review 是 `[DEV]`/`[OPS]` 的 review 欄，不建 review 卡。
 - `[ADJ]` 卡不要跟要修的卡 link（不論 parent 或 child），否則互等。
 - 執行失敗（gave_up / crash）：找出根因並修掉（設定、卡片 body、換 assignee、拆小）；能用一次真實小測試證明修好就做。
-- 根因是 Hermes 原生限制時：照 README「Hermes 原生限制與對應」處理；沒有對應就 `kanban_complete` 寫明限制與建議，不建修 Hermes 程式或 image 的卡。
+- 根因是 Hermes 原生限制時：照 README「Hermes 原生限制與對應」處理；沒有對應就 `kanban_complete` 寫明限制與建議，不建修 Hermes 程式或 image 的卡，也不在 `/opt/data/projects/<slug>` 以外建工作區（`check plan` 會列為問題）。使用者同意「處理這個問題」不等於同意改 Hermes。
+- 標題 `[ADJ] 流程阻塞 t_x` 是 dispatcher tick 自動建的：worker 用 needs_input/capability 問了不是使用者能決定的事（工具、權限、卡片寫法、交接卡住）。照上面找根因修掉，最後用 `devflow-ops` 的 `resume`（note 寫改了什麼、worker 下一步做什麼）。真的要使用者決定時才在本卡 `kanban_block(kind="needs_input")`；同一張卡第三次被擋時 tick 會直接問使用者。
 - 卡片本身卡死（例如在不能設 required checks 的 repo 上設了 PR `completion_contract`，完成被 Hermes gate 拒絕；這類設定建立後不能改）：建替代卡（同 assignee、同 `workspace_kind`，worktree 用 `workspace_path`=舊卡 worktree，不設 contract），body 寫「接續 t_old：已完成什麼、剩什麼」；用 `devflow-ops`：對舊卡每個 child `link <新卡> <child>`、`unlink <舊卡> <child>`，最後 `archive <舊卡>`。
 - 要重跑的卡：`devflow-ops` 的 `resume`。不要為此 `kanban_block`。
 - 同一類根因已在之前的 `[ADJ]` 出現過（看 EPIC 留言與舊 `[ADJ]` 的 `root_cause`）：把修正放進結構，不只改這張卡（`pstack:principle-encode-lessons-in-structure`）。repo 層面 → 建 `[DEV]`/`[OPS]` 改 `.devflow/` 或 CI；devflow 本身（skill、範本、`devflow` CLI）→ 寫進 `followups`，由使用者決定是否改 kit。

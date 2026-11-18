@@ -65,10 +65,13 @@ metadata:
 - 有 contract 的卡，`kanban_request_review` / `kanban_complete` 的 metadata 一定帶 `published_pr`（PR URL）。
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
+- worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：dispatcher tick 會判斷是流程問題，自動建 `[ADJ]` 交 orchestrator。
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
 你負責的卡 block 成 `needs_input` / `capability` 時，dispatcher tick 會把通知送到**你的 Bot Chat** 並喚醒你；Hermes 主頁只留一行提醒指到這裡。
 1. 被喚醒或使用者在這裡回覆時：`terminal: devflow pending <你的 profile 名>`，列出 `ask_in` 是你的卡：`question` 是完整 block reason（第一行問題，之後背景與選項說明），`card` 是卡片 body（目標、驗收）。
+   - `handled_by` 有值（`[ADJ]` 卡號）：這題是流程問題，已交 orchestrator 處理，不要問使用者，只說一行「<task> 卡在流程問題，已交 <handled_by> 處理，不用你回答」。
+   - `comments_since` 是提問之後別人的留言（例如 Hermes 轉述的資訊）。它們**不是答案**，可能是追問、暫停或回答舊題。問題訊息裡加一行「提問後還有這些留言：…，要當成這題的回答嗎？」；使用者明確確認或明確回答這題，才照第 3 點用 `devflow answer` 交。
 2. 問題訊息一定要讓使用者不用再查就能回答，格式：
    ```
    需要你決定（<board> <task>）：<卡片標題>
