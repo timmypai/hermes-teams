@@ -6,13 +6,16 @@ compare-and-set on the cursor.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 
 from test_judgment import KIT
@@ -27,6 +30,7 @@ DEVOPS_CHAT = {"platform": "local", "chat_id": "local-devops", "user_id": "uid:1
 
 class Board:
     def __init__(self, path: Path):
+        self.path = path
         self.db = sqlite3.connect(path)
         self.db.executescript("""
             CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
@@ -268,6 +272,57 @@ class RouteQuestions(unittest.TestCase):
                          {"api_server:local-inbox": False, "local:local-devops": False})
         self.board.notify()
         self.assertTrue(all(s["delivered"] for s in self.df.pending()[0]["sent_to"]))
+
+    def _resume_like_hermes(self):
+        """devflow resume, reduced to its effect: a note, then the card unblocks (slowly, to overlap)."""
+        path, notes = self.board.path, []
+
+        def resume(board, tid, note):
+            time.sleep(0.2)
+            with closing(sqlite3.connect(path)) as c:
+                c.execute("UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (tid,))
+                c.execute("INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'unblocked', '{}')", (tid,))
+                c.commit()
+            notes.append(note)
+            return f"resumed {tid}"
+        self.df.resume = resume
+        return notes
+
+    def test_two_answers_to_one_question_apply_once_even_at_the_same_time(self):
+        notes = self._resume_like_hermes()
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        ev = self.board.block("t_ship")
+        refused: list[int] = []
+
+        def reply(where, text):
+            try:
+                self.df.answer("b", "t_ship", ev, text, where)
+            except SystemExit as e:
+                refused.append(e.code)
+        threads = [threading.Thread(target=reply, args=a) for a in (("devops 頁面", "A"), ("App 對話", "B"))]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(refused, [1])
+        self.assertIn("events since: unblocked", err.getvalue())
+
+    def test_an_answer_to_an_older_question_is_not_applied_to_the_new_one(self):
+        notes = self._resume_like_hermes()
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        first = self.board.block("t_ship")
+        self.board.unblock("t_ship")
+        second = self.board.block("t_ship")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self.df.answer("b", "t_ship", first, "A", "devops 頁面")
+        self.assertIn(f"now waits on question event {second}", err.getvalue())
+        self.assertEqual(notes, [])
+        self.df.answer("b", "t_ship", second, "B", "devops 頁面")
+        self.assertEqual(len(notes), 1)
 
     def test_assignee_chat_is_unsubscribed_after_the_answer(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")

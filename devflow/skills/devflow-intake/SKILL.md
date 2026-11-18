@@ -49,11 +49,11 @@ metadata:
 - 你在聊天中（不是 worker）要重跑卡片時，用 `devflow resume <slug> <task> [--note "..."]`，不要直接 `kanban_unblock`：已開過 PR 的卡，Hermes dispatcher 會擋 24 小時不重派，`resume` 會做原生的交接動作解除，並重設失敗計數。
 
 ## 3. 被卡住的卡片
-`kanban_show(task)` 讀 block reason / 最後事件，依類型處理。needs_input / capability 先跑 `terminal: devflow pending`：這張卡的 `ask_in` 不是 `default`，完整問題已送到那個 bot 的 Bot Chat，你不要自己問，只回三行：「需要你決定：<task>（<board>）<卡片標題>\n問題：<question 第一行>\n請到 <ask_in> 的 Bot Chat 回答（那裡有背景與選項說明），在這裡直接回也可以」。使用者在這裡回答也照收：`devflow resume <slug> <task> --note "使用者回覆（App 對話）：..."`；resume 失敗表示已在別處回答或卡片已關閉，照 `devflow` skill「在自己的 Bot Chat 回答卡片問題」第 4、5 點說明。`ask_in` 是 `default` 才照下面問，訊息內容同該節第 2 點的格式：
+`kanban_show(task)` 讀 block reason / 最後事件，依類型處理。needs_input / capability 先跑 `terminal: devflow pending`：這張卡的 `ask_in` 不是 `default`，完整問題已送到那個 bot 的 Bot Chat，你不要自己問，只回三行：「需要你決定：<task>（<board>）<卡片標題>\n問題：<question 第一行>\n請到 <ask_in> 的 Bot Chat 回答（那裡有背景與選項說明），在這裡直接回也可以」。使用者在這裡回答也照收：`devflow answer <slug> <task> --event <block_event> --where "App 對話" "<回答>"`；回 `not applied` 時照 `devflow` skill「在自己的 Bot Chat 回答卡片問題」第 4、5 點說明。`ask_in` 是 `default` 才照下面問，訊息內容同該節第 2 點的格式：
 - **needs_input**（要使用者決定）：reason 第一行是 `問題：…？選項：A / B（建議 A）`，細節在後面。
   1. 用 `clarify` 問：一題，choices 是選項（建議的放第一個），question 是上面格式的整段（卡號、在做什麼、卡在哪、問題、各選項後果）。
   2. `clarify` 回報無法使用或被拒（被通知喚醒時沒人在看這個聊天）：把同一整段留成訊息，然後結束這一輪。使用者之後在這個聊天回覆，就是這張卡的答案。
-  3. 拿到答案 → `devflow resume <slug> <task> --note "使用者回覆：..."`，回一句「已交回 <assignee> 繼續」。
+  3. 拿到答案 → `devflow answer <slug> <task> --event <block_event> --where "App 對話" "<回答>"`，回一句「已交回 <assignee> 繼續」。
   問題可能出現在收件聊天，不是建 EPIC 的聊天；照樣處理。同一張卡已經回覆過、卡片不再 blocked 時不要再問。
 - **capability**（缺權限或資源，只有人給得了：主機管理權、帳號、金鑰、付費服務）：從 block reason 找出「缺什麼、誰能給」，照 needs_input 的 1–3 問使用者。問題寫成一個具體動作，例如「t_xxxx（teams-transcription）：缺主機上的部署 runner，要我用 devflow 共用 runner 註冊嗎？」；選項至少有「同意，由 <誰> 做」和「先不要」。不建 `[ADJ]`；使用者回覆要改計畫時才建。
 - **gave_up / crashed / timed_out**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="<task id>、失敗原因摘要、EPIC id")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。
