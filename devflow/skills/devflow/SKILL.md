@@ -57,7 +57,7 @@ metadata:
 ## 推進規則（不設卡控）
 - 可逆的事自己決定並記在 summary，不停下來問。
 - review 退件用 `kanban_request_changes`，不是 block；沒有次數上限。同一原因再失敗時換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
-- 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason 寫成使用者能直接回答的一句話。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句話>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。背景與證據寫在第二行以後。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
+- 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason 寫成使用者能直接回答的一句話。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句話>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後必寫，使用者只看這段就能決定：`背景：` 在做什麼、卡在哪（1–3 句，含檔案/錯誤/網址等證據）；`A：` / `B：` 各選項會發生什麼、代價與風險；`建議：` 為什麼選它。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。
 - 長時間操作（CI、部署）期間呼叫 `kanban_heartbeat`。
 - 每次 run 結束前一定要呼叫一個終結工具（complete / request_review / request_changes / block）。
@@ -68,8 +68,18 @@ metadata:
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
 你負責的卡 block 成 `needs_input` / `capability` 時，dispatcher tick 會把通知送到**你的 Bot Chat** 並喚醒你；Hermes 主頁只留一行提醒指到這裡。
-1. 被喚醒或使用者在這裡回覆時：`terminal: devflow pending <你的 profile 名>`，列出 `ask_in` 是你的卡（board、task、question）。
-2. 先用 `clarify` 問：question 開頭寫卡號與 board，choices 是 reason 第一行的選項（建議的放第一個）。`clarify` 被拒（喚醒時沒人在看）就留一則訊息：「需要你決定（<board> <task>）：<問題>\n1. <選項>（建議）\n2. <選項>\n直接回覆編號或你的想法」，結束這一輪。
+1. 被喚醒或使用者在這裡回覆時：`terminal: devflow pending <你的 profile 名>`，列出 `ask_in` 是你的卡：`question` 是完整 block reason（第一行問題，之後背景與選項說明），`card` 是卡片 body（目標、驗收）。
+2. 問題訊息一定要讓使用者不用再查就能回答，格式：
+   ```
+   需要你決定（<board> <task>）：<卡片標題>
+   在做什麼：<依 card 的目標一句話>
+   卡在哪：<依 question 背景 1–3 句，附關鍵證據>
+   問題：<question 第一行的問題>
+   1. <選項 A>：<會發生什麼、代價>（建議，理由：…）
+   2. <選項 B>：<會發生什麼、代價>
+   直接回覆編號或你的想法。
+   ```
+   reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
 3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow resume <board> <task> --note "使用者回覆（<你的 profile> 頁面）：..."`，回一句「已交回繼續執行」。
 卡片已不在 `devflow pending` 裡（已回答過）就不要再問。
 
