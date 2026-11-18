@@ -1471,12 +1471,29 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
     del asked[:-1000]
 
 
+def chat_receipt(profile: str, chat_id: str, tid: str, since: float) -> dict:
+    """What the destination chat's own transcript shows for this card since `since` (the block): the
+    notifier's wake turn (a user message naming the card, e.g. `[kanban] Task t_x blocked`) and a bot
+    reply after it. The subscription cursor and `last_ping_event_id` are not receipts: the ping is
+    recorded before the wake, a refused wake rewinds the cursor, and wake-only delivery records none."""
+    db = SESSIONS_DB if profile == "default" else DATA / "profiles" / profile / "state.db"
+    if not db.exists():
+        return {"woken": False, "replied": False}
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+        woke = c.execute("SELECT MIN(timestamp) FROM messages WHERE session_id = ? AND role = 'user' "
+                         "AND timestamp >= ? AND content LIKE ?", (chat_id, since, f"%[kanban]%{tid}%")).fetchone()[0]
+        replied = woke is not None and c.execute(
+            "SELECT 1 FROM messages WHERE session_id = ? AND role = 'assistant' AND timestamp > ? AND content != '' "
+            "LIMIT 1", (chat_id, woke)).fetchone() is not None
+    return {"woken": woke is not None, "replied": replied}
+
+
 def pending(profile: str | None = None) -> list[dict]:
     """Cards waiting on the user, with the Bot Chat that asks (the assignee's, else Hermes'). `question`
     is the whole block reason (line 1 the question, then background); `card` is the card body, so the
-    asking bot can say what the card is for without another lookup. `sent_to` is each subscribed chat
-    and whether Hermes' notifier has delivered this block there yet (it wakes bots one at a time, so a
-    second chat can lag a minute): say "queued", never "not delivered", while it is false."""
+    asking bot can say what the card is for without another lookup. `chats` is each subscribed chat
+    with what its transcript shows (`chat_receipt`): Hermes wakes bots one at a time, so a second chat
+    can lag a minute; until `woken` is true say "not seen there yet", never "not delivered"."""
     out = []
     for db in sorted(BOARDS.glob("*/kanban.db")):
         board = db.parent.name
@@ -1488,13 +1505,14 @@ def pending(profile: str | None = None) -> list[dict]:
             reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
             ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
             bev = block_event(board, t["id"]) or 0
-            sent = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",
-                     "delivered": (s["last_ping_event_id"] or 0) >= bev}
-                    for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (t["id"],))]
+            at = (board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (bev,)) or [{"created_at": 0}])[0]
+            chats = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",
+                      **chat_receipt(s["notifier_profile"] or "default", s["chat_id"], t["id"], at["created_at"] or 0)}
+                     for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (t["id"],))]
             if profile is None or ask_in == profile:
                 out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
                             "kind": t["block_kind"], "question": reason, "card": (t["body"] or "")[:1500],
-                            "ask_in": ask_in, "block_event": bev, "sent_to": sent})
+                            "ask_in": ask_in, "block_event": bev, "chats": chats})
     return out
 
 

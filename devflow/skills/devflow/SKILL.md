@@ -82,7 +82,7 @@ metadata:
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
 3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
-5. 說「有沒有送到」以 `devflow pending` 的 `sent_to[].delivered` 為準：false 是排隊中（Hermes 一次叫醒一個 bot，第二個頁面常晚約 1 分鐘），說「排隊中」，不要說「未送達」。
+5. 說「有沒有送到」只看 `devflow pending` 的 `chats[]`，它讀的是那個對話自己的紀錄：`woken` = 通知已進入那個對話，`replied` = 那個 bot 之後有回話。`woken` 為 false 時說「那邊還沒看到這則通知（Hermes 一次叫醒一個 bot，常晚約 1 分鐘）」，不要說「未送達」；超過 10 分鐘仍為 false 才說「那邊沒收到」，並請使用者在這裡直接回答。
 
 ## 身分與憑證
 - GitHub：reviewer 用自己的帳號；其他 Bot 共用 builder 帳號（`GH_CONFIG_DIR` 已設定）。`git push` 走 `gh auth git-credential`。
@@ -106,7 +106,7 @@ metadata:
 | `devflow runner request OWNER/REPO` | 為 repo 註冊 Oracle VM self-hosted runner（需 repo admin） |
 | `devflow runner status OWNER/REPO` | 查 runner 狀態 |
 | `devflow resume SLUG TASK [--note TEXT]` | 只限聊天（不是 worker）：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |
-| `devflow pending [PROFILE]` | 等使用者回答的卡（board、task、question、card、`block_event`）、在哪個 Bot Chat 問（`ask_in`）、各聊天是否已送達（`sent_to`） |
+| `devflow pending [PROFILE]` | 等使用者回答的卡（board、task、question、card、`block_event`）、在哪個 Bot Chat 問（`ask_in`）、各對話紀錄是否已有通知與回覆（`chats[].woken`/`replied`） |
 | `devflow answer SLUG TASK --event N --where WHERE TEXT` | 交使用者對問題事件 N 的回答（一題只收一次；卡已不在等這題時回 `not applied` 與原因），再照 `resume` 重跑 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
