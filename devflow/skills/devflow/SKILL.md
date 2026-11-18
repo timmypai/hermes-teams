@@ -81,7 +81,8 @@ metadata:
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
 3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow resume <board> <task> --note "使用者回覆（<你的 profile> 頁面）：..."`，回一句「已交回繼續執行」。
-卡片已不在 `devflow pending` 裡（已回答過）就不要再問。
+4. 回覆對不上 `devflow pending` 的任何卡（卡已回答、恢復、封存或刪除）：不要套到別張卡。`terminal: hermes kanban --board <board> show <task>` 查這張卡現在的狀態與最後事件（誰、何時：已在別的頁面回答、已封存…），照實告訴使用者「你的回覆沒有套用，因為 …」，再列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。`devflow resume` 只接受仍在等待的卡，同一題在兩個頁面各答一次時，第二次會失敗，照上面說明即可。
+5. 說「有沒有送到」以 `devflow pending` 的 `sent_to[].delivered` 為準：false 是排隊中（Hermes 一次叫醒一個 bot，第二個頁面常晚約 1 分鐘），說「排隊中」，不要說「未送達」。
 
 ## 身分與憑證
 - GitHub：reviewer 用自己的帳號；其他 Bot 共用 builder 帳號（`GH_CONFIG_DIR` 已設定）。`git push` 走 `gh auth git-credential`。

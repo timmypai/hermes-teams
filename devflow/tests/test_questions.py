@@ -260,6 +260,15 @@ class RouteQuestions(unittest.TestCase):
         self.tick()
         self.assertIn(("t_new", ev, "local-devops"), self.board.sent)
 
+    def test_pending_says_which_chats_got_the_question(self):
+        self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
+        self.board.block("t_ship")
+        self.df.route_questions("b", self.st)          # subscribed and rewound, notifier not run yet
+        self.assertEqual({s["chat"]: s["delivered"] for s in self.df.pending()[0]["sent_to"]},
+                         {"api_server:local-inbox": False, "local:local-devops": False})
+        self.board.notify()
+        self.assertTrue(all(s["delivered"] for s in self.df.pending()[0]["sent_to"]))
+
     def test_assignee_chat_is_unsubscribed_after_the_answer(self):
         self.board.card("t_ship", "[SHIP] needs a runner", assignee="devops")
         self.board.block("t_ship")

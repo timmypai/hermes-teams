@@ -1474,7 +1474,9 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
 def pending(profile: str | None = None) -> list[dict]:
     """Cards waiting on the user, with the Bot Chat that asks (the assignee's, else Hermes'). `question`
     is the whole block reason (line 1 the question, then background); `card` is the card body, so the
-    asking bot can say what the card is for without another lookup."""
+    asking bot can say what the card is for without another lookup. `sent_to` is each subscribed chat
+    and whether Hermes' notifier has delivered this block there yet (it wakes bots one at a time, so a
+    second chat can lag a minute): say "queued", never "not delivered", while it is false."""
     out = []
     for db in sorted(BOARDS.glob("*/kanban.db")):
         board = db.parent.name
@@ -1485,10 +1487,14 @@ def pending(profile: str | None = None) -> list[dict]:
                                    "ORDER BY id DESC LIMIT 1", (t["id"],))
             reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
             ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
+            bev = block_event(board, t["id"]) or 0
+            sent = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",
+                     "delivered": (s["last_ping_event_id"] or 0) >= bev}
+                    for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (t["id"],))]
             if profile is None or ask_in == profile:
                 out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
                             "kind": t["block_kind"], "question": reason, "card": (t["body"] or "")[:1500],
-                            "ask_in": ask_in})
+                            "ask_in": ask_in, "sent_to": sent})
     return out
 
 
