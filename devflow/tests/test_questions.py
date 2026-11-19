@@ -448,6 +448,30 @@ class RouteQuestions(unittest.TestCase):
         self.df.TICK.write_text(json.dumps(self.st))
         self.assertIsNone(self.df.pending()[0]["handled_by"])
 
+    def test_a_card_held_by_active_pr_after_its_parents_finished_is_resumed_once(self):
+        """[SHIP] t_3b14e30d: promoted after PR #5 was approved, then skipped every minute (2026-11-19)."""
+        resumed = []
+        self.df.resume = lambda board, tid, note=None: resumed.append(tid) or f"resumed {tid}"
+        guard = {"reason": "active_pr"}
+        self.board.card("t_ship", "[SHIP] s", status="ready", assignee="devops")
+        self.board.event("t_ship", "respawn_guarded", guard)        # before the promotion: not this case
+        self.board.event("t_ship", "promoted")
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, [])                                # promoted, not held yet
+        self.board.card("t_run", "[DEV] d", status="ready", assignee="developer")
+        self.board.event("t_run", "promoted")
+        self.board.event("t_run", "claimed")                         # it ran: its own hold is the worker's
+        for tid in ("t_ship", "t_run"):
+            self.board.event(tid, "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.board.event("t_ship", "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, ["t_ship"])
+        self.board.event("t_ship", "promoted")                       # promoted again later: one more resume
+        self.board.event("t_ship", "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, ["t_ship", "t_ship"])
+
     def test_an_open_adj_that_only_cites_the_card_does_not_take_its_question(self):
         self._ops_card()
         judged, created = self._flow(0.05)

@@ -1447,9 +1447,42 @@ def tick_board(board: str, st: dict) -> None:
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
+    release_held(board, st)
     route_questions(board, st)
     del applied[:-1000]
     del settled[:-1000]
+
+
+# Hermes holds a card for 24h once a comment carries a PR URL and no assignee handoff follows
+# (`respawn_guarded` active_pr). Meant for a worker that published a PR and stopped, it also holds a
+# card whose parents just finished: teams-transcription [SHIP] t_3b14e30d, promoted 13:51 after PR #5
+# was approved, then skipped every minute while nobody looked (2026-11-19). A card held after its
+# latest promotion, never claimed since, gets one `resume` (the native handoff) per promotion.
+
+def held_after_promotion(board: str) -> list[tuple[str, int]]:
+    return [(r["task_id"], r["promoted"]) for r in board_rows(board, """
+        SELECT p.task_id, p.promoted FROM tasks t JOIN (
+          SELECT task_id, MAX(id) AS promoted FROM task_events WHERE kind = 'promoted' GROUP BY task_id) p
+          ON p.task_id = t.id
+        WHERE t.status = 'ready' AND t.assignee IS NOT NULL
+          AND EXISTS (SELECT 1 FROM task_events g WHERE g.task_id = t.id AND g.id > p.promoted
+                      AND g.kind = 'respawn_guarded' AND json_extract(g.payload, '$.reason') = 'active_pr')
+          AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = t.id AND c.id > p.promoted
+                          AND c.kind = 'claimed')""")]
+
+
+def release_held(board: str, st: dict) -> None:
+    released = st.setdefault("released", [])
+    for tid, ev in held_after_promotion(board):
+        key = f"{board}/{tid}/{ev}"
+        if key in released:
+            continue
+        released.append(key)  # once per promotion, failed or not: a failing resume must not loop
+        try:
+            resume(board, tid, "devflow tick：parent 都完成後，Hermes 因留言含 PR 網址扣住本卡（active_pr），已交接重派。")
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - one card must not stop the tick
+            print(f"devflow: {board}/{tid} held by active_pr, resume failed: {err}", file=sys.stderr)
+    del released[:-1000]
 
 
 # --- needs_input reaches a person --------------------------------------------------------------
