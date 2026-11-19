@@ -1576,6 +1576,22 @@ def subscribe(board: str, tid: str, chat: dict, profile: str = "default") -> Non
     kanban(board, *args)
 
 
+def move_to_inbox(board: str, tid: str, subs: dict[str, list], box: dict, readable) -> None:
+    """With an inbox set, a card notifies only there among the chats a person reads: Hermes subscribes
+    the chat a card was made in, and a gateway wake-up there races the person typing in it (the Desktop
+    prompt is refused SESSION_NOT_OWNED when the wake is admitted between its two ownership checks,
+    tui_gateway prompt_turn.py `_admit_prompt_turn`, Hermes; 2026-11-17..19: 9 times). Mitigation, not
+    a fix. Bot Chats of other profiles (`ask_assignees`) are not people's chats here and stay."""
+    mine = subs.get(tid, [])
+    at = (box["platform"], box["chat_id"])
+    if not any((s["platform"], s["chat_id"]) == at for s in mine):
+        subscribe(board, tid, box)
+    for s in mine:
+        if (s["platform"], s["chat_id"]) != at and readable(s) and (s["notifier_profile"] or "default") == "default":
+            kanban(board, "notify-unsubscribe", tid, "--platform", s["platform"], "--chat-id", s["chat_id"])
+    subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+
+
 def replay_from(board: str, sub: dict, event_id: int) -> bool:
     """Move one subscription's cursor back to just before `event_id` (Hermes' own compare-and-set
     writer); False when the notifier moved it meanwhile (the next tick retries)."""
@@ -1606,7 +1622,7 @@ def route_questions(board: str, st: dict) -> None:
     children: dict[str, list] = {}
     for link in board_rows(board, "SELECT parent_id, child_id FROM task_links"):
         children.setdefault(link["parent_id"], []).append(link["child_id"])
-    box, _ = inbox()
+    box, source = inbox()
     # Only chats a person reads count as asking: a ping into a `hermes chat --oneshot` session (what
     # the existing subscriptions are) reaches nobody.
     people = {(c["platform"], c["chat_id"]) for c in known_chats()} | ({(box["platform"], box["chat_id"])} if box else set())
@@ -1618,12 +1634,16 @@ def route_questions(board: str, st: dict) -> None:
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
-        if not any(readable(s) for s in subs.get(tid, [])):
+        if source == "set":
+            move_to_inbox(board, tid, subs, box, readable)
+        elif not any(readable(s) for s in subs.get(tid, [])):
             chat = epic_chat(tid, tasks, subs, children, readable) or box
             if chat is None:
                 continue
             subscribe(board, tid, chat)
             subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+        if not subs.get(tid):
+            continue
         # Both go to blocked for a human (Hermes' typed blocks); the person has to be asked, unless the
         # question is a workflow problem an [ADJ] now handles.
         if t["status"] not in ("blocked", "triage") or t["block_kind"] not in ("needs_input", "capability") or tid in handled:

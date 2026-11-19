@@ -182,6 +182,25 @@ class RouteQuestions(unittest.TestCase):
         self.tick()
         self.assertEqual(sorted(self.board.sent), [("t_adj", ev_adj, "local-epic"), ("t_dev", ev_dev, "local-epic")])
 
+    def test_a_set_inbox_takes_every_cards_notices_from_the_chat_a_person_types_in(self):
+        """run_fa2a5faa: card wakes raced the user's Desktop prompts there (SESSION_NOT_OWNED, 2026-11-19)."""
+        self.df.INBOX.parent.mkdir(parents=True, exist_ok=True)
+        self.df.INBOX.write_text(json.dumps(INBOX_CHAT))
+        epic = "t_e03c0ffe"
+        self.board.card(epic, "[EPIC] goal")
+        self.board.subscribe(epic, EPIC_CHAT)                 # Hermes: the chat it was made in
+        self.board.card("t_ship", "[SHIP] s", assignee="devops")
+        self.board.subscribe("t_ship", EPIC_CHAT)
+        self.board.subscribe("t_ship", {**DEVOPS_CHAT, "chat_id": "local-devops"}, "devops")   # its Bot Chat stays
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_ship', ?)", (epic,))
+        ev = self.board.block("t_ship")
+        self.tick()
+        self.tick()
+        subs = sorted(self.board.db.execute("SELECT task_id, chat_id FROM kanban_notify_subs").fetchall())
+        self.assertEqual(subs, [(epic, "local-inbox"), ("t_ship", "local-devops"), ("t_ship", "local-inbox")])
+        self.assertNotIn(("t_ship", ev, "local-epic"), self.board.sent)
+        self.assertIn(("t_ship", ev, "local-inbox"), self.board.sent)
+
     def test_a_question_already_sent_is_not_sent_again(self):
         self.board.card("t_chat", "[DEV] made in a chat")
         self.board.subscribe("t_chat", EPIC_CHAT)
