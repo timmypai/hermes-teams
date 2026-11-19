@@ -72,7 +72,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    ```
    `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。送審時 Hermes 的 goal judge 只讀 title+body 的前 2000 字，判斷「本卡完成」是否已達成。所以：
    - `## 本卡完成` 一字不改照抄上面那句，緊接在 `## 目標` 後面。不要加「已交 review」「reviewer 已接手」「已批准」「已部署」，也不要寫送審工具名稱：judge 不知道是哪個工具在問，這些在送審時都還沒發生，會永遠拒絕送審（teams-transcription t_6d121ad4；2026-11-19 實測）。改過的文字 dispatcher tick 會自動改回，並在 EPIC 留言。
-   - body 寫短：整份 ≤ 1500 字（`check plan` 檢查；EPIC 不含 `## 驗收` 與「使用者原話」）。`## 目標` 1-3 句；限制只寫這張卡特有的；共通規則（不自審、不直接部署、不改 Hermes、秘密處理、fail closed）已在 skill，不要抄。不要寫「使用者已同意…不代表…不得…」這類條文，也不要寫實作設計（schema、欄位、步驟）：做法由 developer / devops 決定。
+   - body 寫短：整份 ≤ 1500 字（`check plan` 檢查，只在 EPIC 留言提醒、不建 `[ADV]`，看到就自己縮短；EPIC 不含 `## 驗收` 與「使用者原話」）。`## 目標` 1-3 句；限制只寫這張卡特有的；共通規則（不自審、不直接部署、不改 Hermes、秘密處理、fail closed）已在 skill，不要抄。不要寫「使用者已同意…不代表…不得…」這類條文，也不要寫實作設計（schema、欄位、步驟）：做法由 developer / devops 決定。
    - body 是規格，不是紀錄：PR 號、head SHA、run id、review id、每一輪試過什麼、誰接手，寫進 `kanban_comment`，body 最多放一行「經過見留言」。改卡（`[ADJ]` 或 `devflow-ops edit`）是**改寫**成目前的規格，不是在後面疊加新段落。
    goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。

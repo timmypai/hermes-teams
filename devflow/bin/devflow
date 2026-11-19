@@ -891,6 +891,7 @@ def repaired_done(body: str) -> str:
 # and SHAs of each attempt, and the same prohibitions on every card, rewritten by each [ADJ] (one card
 # was edited 11 times). Workers then read the history as requirements. Progress belongs in comments.
 CARD_CHARS = 1500
+BODY_LONG = "字（上限"  # marks the body-length finding: reminded on the EPIC, never sent to the advisor
 
 # Who may open an [ADJ] (Hermes `created_by`): the orchestrator, the dispatcher tick, and the
 # advisor / Hermes chat (profile default). teams-transcription 2026-11-18: the devops [SHIP] opened
@@ -957,7 +958,7 @@ def body_problem(kind: str, title: str, body: str) -> str | None:
         return None  # written by devflow itself
     if len(text) <= CARD_CHARS:
         return None
-    return (f"body {len(text)} 字（上限 {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
+    return (f"body {len(text)} {BODY_LONG} {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
             "AC 只寫編號；PR、run、review、SHA 與每輪經過寫留言，不寫進 body；共通規則已在 skill，不要每張卡抄")
 
 
@@ -1190,7 +1191,9 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         keys[f] = [f"{f} @ {s}" for s in pending_ships(cards)] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note,
               "advised": sorted({k for ks in keys.values() for k in ks})}
-    new = [f for f in findings if any(k not in advised for k in keys[f])]
+    # A long body is a writing issue the orchestrator fixes itself: the EPIC comment reminds it, an
+    # advisor run adds nothing (teams-transcription t_8f869670 / t_5ea4b8e4 2026-11-19 both said so).
+    new = [f for f in findings if BODY_LONG not in f and any(k not in advised for k in keys[f])]
     if new and advise:
         report["advisor_card"] = open_advisor_card(board, epic, cards, new, risky)
     return report
@@ -1443,7 +1446,7 @@ def tick_board(board: str, st: dict) -> None:
                 rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
                 advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 kanban(board, "comment", tid, "devflow check plan：" + (
-                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（皆已交 advisor 判斷過）")
+                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（未建 [ADV]：已交 advisor 判斷過，或只是 body 長度，請 orchestrator 自己縮短）")
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
