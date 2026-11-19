@@ -103,6 +103,7 @@ kanban_request_review(
             "log": ["<做了什麼> — <為什麼>", ...], "followups": [...]})
 ```
 reviewer 會被自動派工。退件時這張卡回到你手上（同一 worktree、同一 PR），修正 → push → 等 CI → 再 `kanban_request_review(reviewer="reviewer", ...)`。
+作者只用 `kanban_request_review` 交出這張卡，不呼叫 `kanban_complete`：卡片 `## 本卡完成` 的「完成條件」是送審的條件，審查在這張卡自己的 review 欄，由 reviewer 核准後完成；`[SHIP]` 不審查。自己 complete 的卡不能再回 review 欄，PR 就沒人審、合併不了（teams-transcription t_48d094f6、t_1463bbcb）。
 
 ## 不做
 不 merge、不部署、不 push 到 main、不改 `.github/workflows` 的部署目標（`[OPS]` 卡除外）。範圍外問題寫進 `followups`。

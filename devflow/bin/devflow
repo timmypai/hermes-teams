@@ -847,12 +847,16 @@ def repo_deploys(board: str) -> bool:
 
 
 # The goal judge (Hermes tools/kanban_tools.py `_goal_gate`) runs when a goal-mode worker calls
-# kanban_request_review: it reads `title\n\nbody` cut at 2000 characters and asks "is this done?".
-# A completion condition that only exists after the handoff (review requested, approved, merged,
-# deployed) can never be shown, so the handoff is refused every time (teams-transcription t_6d121ad4,
-# 2026-11-18: 2/2 refused as written, 2/2 passed with this text). devflow owns the text.
+# kanban_request_review or kanban_complete: it reads `title\n\nbody` cut at 2000 characters and asks
+# "is this done?", without knowing which tool called. A completion condition that only exists after
+# the handoff (review requested, approved, merged, deployed) can never be shown, so the handoff is
+# refused every time (teams-transcription t_6d121ad4, 2026-11-18). Naming the handoff tool in the
+# text is refused too (judge probe 2026-11-19: 3/3 continue). The earlier "交 review 是完成後的下一步"
+# passed the judge but read to devops as "complete the card, the [SHIP] reviews" (t_48d094f6,
+# t_1463bbcb closed with no review); this text passed 3/3 and puts review on the card itself.
+# Which tool hands off lives in the skills (devflow-develop §6), which the judge does not read.
 DONE_HEADING = "## 本卡完成"
-DONE_TEXT = "PR 已開、exact-head CI 綠。交 review 是完成後的下一步，不是完成條件；合併與部署由 [SHIP] 負責。"
+DONE_TEXT = "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。"
 JUDGE_CHARS = 2000
 DONE_RE = re.compile(rf"^{DONE_HEADING}[ \t]*\n(.*?)(?=^##?[ \t]|\Z)", re.M | re.S)  # its ### subsections too
 
@@ -892,6 +896,31 @@ CARD_CHARS = 1500
 # advisor / Hermes chat (profile default). teams-transcription 2026-11-18: the devops [SHIP] opened
 # four [ADJ] and a `[REVIEW]` card itself, each one a new process the skills never described.
 ADJ_CREATORS = {"orchestrator", "devflow-tick", "default"}
+
+# Which cards an [ADJ] repairs: only explicit marks, never every card id its body cites (bodies name
+# the EPIC, the original [SHIP], sources and history; counting those would hand an unrelated block
+# to an [ADJ] that merely quotes the card). Marks: the fixed titles `[ADJ] 流程阻塞 t_x` (tick) and
+# `[ADJ] 處理失敗卡 t_x` (Hermes), and a body line `處理：t_x[, t_y]` (tick, Hermes, advisor).
+ADJ_TITLE_TARGET = re.compile(r"^\[ADJ\]\s*(?:流程阻塞|處理失敗卡)\s*(t_[0-9A-Za-z]+)")
+ADJ_BODY_TARGET = re.compile(r"^處理[：:][ \t]*((?:t_[0-9A-Za-z]+[ \t]*[,，、]?[ \t]*)+)$", re.M)
+# At most this many [ADJ] repair one card; the next lap is the user's to choose (tick asks them; an
+# [ADJ] opened beyond it is a plan finding, and its orchestrator asks instead of opening another round).
+ADJ_PER_CARD = 2
+
+
+def adj_targets(title: str, body: str | None) -> set[str]:
+    ids = set()
+    if (m := ADJ_TITLE_TARGET.match(title or "")):
+        ids.add(m.group(1))
+    for m in ADJ_BODY_TARGET.finditer(body or ""):
+        ids.update(re.findall(r"t_[0-9A-Za-z]+", m.group(1)))
+    return ids
+
+
+def adjs_for(tid: str, tasks: dict[str, dict]) -> list[str]:
+    """Ids of the [ADJ] cards (archived ones excluded: cancelled duplicates) that explicitly repair `tid`."""
+    return [a for a, t in tasks.items() if card_type(t["title"]) == "ADJ" and t.get("status") != "archived"
+            and tid in adj_targets(t["title"], t.get("body"))]
 
 
 def epic_acs(epic_body: str) -> dict[str, str]:
@@ -988,6 +1017,9 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue  # history; only pending work can still go wrong
         if (why := body_problem(kind, c["title"], c["body"])):
             found.append(f"{tid}: {why}")
+        if kind not in ("EPIC", "ADJ", "ADV") and len(laps := adjs_for(tid, cards)) > ADJ_PER_CARD:
+            found.append(f"{tid}: 已有 {len(laps)} 張 [ADJ] 處理這張卡（{', '.join(sorted(laps))}）：不再開下一輪，照 devflow-orchestrate"
+                         "「C. 調整」把卡在哪、試過什麼、A/B 選項交給使用者選路")
         if kind == "ADJ" and c.get("created_by") and c["created_by"] not in ADJ_CREATORS:
             found.append(f"{tid}: [ADJ] 由 {c.get('created_by')} 建立；[ADJ] 只由 orchestrator、dispatcher tick、"
                          "advisor 建，其他角色照自己 skill 的失敗處理建卡或寫 followups（devflow skill「誰定流程」）")
@@ -1658,7 +1690,9 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
 # goal judge 循環", "請交給有 terminal 的 worker"); asked in a chat, they wait on the person until
 # someone notices (teams-transcription, 2026-11-18: the whole board idle for hours). Once per block,
 # Decisions judges whether only the user can answer; a confident "no" opens an [ADJ] for the
-# orchestrator instead, at most FLOW_ADJ_LIMIT times per card (then the user is asked after all).
+# orchestrator instead. A card an open [ADJ] already repairs (`adj_targets`) gets no second one: the
+# new question goes to that [ADJ] as a comment (2026-11-18: t_a4059a2e duplicated Hermes' t_0c2c0548).
+# Once ADJ_PER_CARD [ADJ] have repaired the card, whoever opened them, the user is asked instead.
 
 FLOW_QUESTION = (
     "A development worker stopped and asks the text in `question`. Is it asking the human user for something only "
@@ -1666,7 +1700,7 @@ FLOW_QUESTION = (
     "spending, credentials, or access the user owns? Answer no when it asks Hermes, an orchestrator, a maintainer, "
     "an 'admin side' or another worker to fix tooling, workflow, card wording, worker tools or permissions, or a "
     "stuck handoff, even when it is phrased as a question with options.")
-FLOW_ADJ_LIMIT = 2
+OPEN_ADJ = ("done", "archived")  # statuses of an [ADJ] that no longer handles anything
 
 
 def block_reason(board: str, ev: int) -> str:
@@ -1701,12 +1735,17 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
             continue
         key = f"{board}/{tid}/{ev}"
         if key not in flow:
-            earlier = sum(1 for k, v in flow.items() if k.startswith(f"{board}/{tid}/") and v != "user")
             question = block_reason(board, ev)
-            p = None if earlier >= FLOW_ADJ_LIMIT else user_must_answer(t, question)
-            adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
-                board, tid, t, ev, question, next(owning_epics(tid, tasks, children), None), p)
-            flow[key] = adj or "user"
+            laps = adjs_for(tid, tasks)
+            if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
+                run([HERMES, "kanban", "--board", board, "comment", live,
+                     f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"], check=False)
+                flow[key] = live
+            else:
+                p = None if len(laps) >= ADJ_PER_CARD else user_must_answer(t, question)
+                adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
+                    board, tid, t, ev, question, next(owning_epics(tid, tasks, children), None), p)
+                flow[key] = adj or "user"
         if flow[key] != "user":
             handled[tid] = flow[key]
     for k in list(flow)[:-1000]:
@@ -1717,7 +1756,7 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
 def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: str | None, p: float) -> str | None:
     """The new [ADJ]'s id; None when Hermes refused the create (the user is asked instead: one failing
     create must not stop question routing for the whole board)."""
-    body = ((f"EPIC: {epic}\n\n" if epic else "") +
+    body = ((f"EPIC: {epic}\n" if epic else "") + f"處理：{tid}\n\n" +
             f"## 目標\n{tid}（{t['title']}）停在流程問題，不是要使用者決定的事（Decisions：只有使用者能回答的機率 {p:.2f}）。"
             "找出根因修掉，讓它繼續。\n\n"
             f"## 問題（block 事件 {ev}）\n{question[:3000]}\n\n"

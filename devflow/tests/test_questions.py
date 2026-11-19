@@ -302,8 +302,10 @@ class RouteQuestions(unittest.TestCase):
 
     # --- workflow questions go to an [ADJ], not to the user ---------------------------------------
     def _flow(self, p: float | None, create_ok: bool = True) -> tuple[list, list]:
-        """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded."""
+        """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded and, like Hermes,
+        puts the [ADJ] on the board; `hermes kanban comment` goes to self.comments."""
         judged, created = [], []
+        self.comments: list[tuple[str, str]] = []
 
         def decide(content, questions):
             judged.append(content)
@@ -312,12 +314,21 @@ class RouteQuestions(unittest.TestCase):
             return {"user_decision": {"probability": p}}
 
         def run(cmd, **kw):
+            if cmd[4] == "comment":
+                self.comments.append((cmd[5], cmd[6]))
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
             created.append(cmd)
             if not create_ok:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="database is locked")
-            return types.SimpleNamespace(returncode=0, stdout=f"Created t_ad{len(created):06x}\n", stderr="")
+            tid = f"t_ad{len(created):06x}"
+            self.board.card(tid, cmd[5], body=cmd[cmd.index("--body") + 1], assignee="orchestrator")
+            return types.SimpleNamespace(returncode=0, stdout=f"Created {tid}\n", stderr="")
         self.df.decide, self.df.run = decide, run
         return judged, created
+
+    def _finish(self, tid: str) -> None:
+        self.board.db.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        self.board.db.commit()
 
     def test_an_idle_board_is_ticked_again_after_a_kit_update(self):
         key = self.df.tick_key("b")
@@ -385,12 +396,52 @@ class RouteQuestions(unittest.TestCase):
         evs = []
         for i in range(3):
             if i:
-                self.board.unblock("t_ops")      # the [ADJ] resumed it; the worker blocked again
+                self._finish(f"t_ad{i:06x}")     # the [ADJ] resumed it and finished; the worker blocked again
+                self.board.unblock("t_ops")
             evs.append(self.board.block("t_ops"))
             self.tick()
         self.assertEqual(len(created), 2)
         self.assertEqual(len(judged), 2)
         self.assertEqual([e for _, e, chat in self.board.sent if chat == "local-devops"], [evs[2]])
+
+    def test_adj_laps_count_every_creator_but_only_explicit_marks(self):
+        """t_3b14e30d had 8 [ADJ]; Hermes and devops opened most, so a tick-only count never stopped it.
+        An [ADJ] that only cites the card (as EPIC/history) is not a lap; an archived one is not either."""
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adh1", "[ADJ] 處理失敗卡 t_ops", status="done", assignee="orchestrator")
+        self.board.card("t_adh2", "[ADJ] 改 smoke", body="EPIC: t_e04c0ffe\n處理：t_ship, t_ops\n內文", status="done")
+        self.board.card("t_adh3", "[ADJ] 收斂", body="原 OPS t_ops、原 SHIP t_ship 的歷史", status="done")
+        self.board.card("t_adh4", "[ADJ] 流程阻塞 t_ops", status="archived")
+        ev = self.board.block("t_ops")
+        self.tick()
+        self.assertEqual((created, judged), ([], []))
+        self.assertIn(("t_ops", ev, "local-devops"), self.board.sent)
+
+    def test_a_card_an_open_adj_repairs_gets_no_second_adj_and_the_question_goes_there(self):
+        """2026-11-18: tick opened t_a4059a2e for the block Hermes' t_0c2c0548 was already handling."""
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adj0", "[ADJ] 收斂停止的卡", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="running")
+        ev = self.board.block("t_ops", reason="問題：請 orchestrator 重定義停止範圍？")
+        self.tick()
+        self.assertEqual((created, judged), ([], []))
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertIn("重定義停止範圍", self.comments[0][1])
+        self.assertNotIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertEqual(self.df.pending()[0]["handled_by"], "t_adj0")
+        self.tick()
+        self.assertEqual(len(self.comments), 1)   # once per block
+
+    def test_an_open_adj_that_only_cites_the_card_does_not_take_its_question(self):
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adj0", "[ADJ] 別的修正", body="EPIC: t_e04c0ffe\n處理：t_other\n參考 t_ops 的 run", status="running")
+        self.board.block("t_ops")
+        self.tick()
+        self.assertEqual((len(created), self.comments), (1, []))
+        self.assertIn("處理：t_ops", created[0][created[0].index("--body") + 1])
 
     def test_unsure_or_unavailable_decisions_asks_the_user(self):
         self._ops_card()

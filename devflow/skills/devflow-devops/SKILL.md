@@ -54,7 +54,7 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
 1. `devflow repo add OWNER/REPO`（若尚未）：建 board、clone、設定 squash/自動刪分支、讓 builder 與 reviewer 都有 push 權限、分配埠、自動申請 self-hosted runner。
 2. 在 worktree：`devflow contract <slug> .`，依專案調整 `test.sh`、`Dockerfile`、`compose.yml`（容器埠、volume）。既有 repo 第一次接入規則檢查：`bash .devflow/check.sh --write-baseline` 把現有違規記成舊債（之後只擋新增），commit `.devflow/rules/baseline.json`；不要用 baseline 收新寫的程式。專案自己的模組邊界規則照 `.devflow/rules/*.toml` 的格式加（附 `expect = "fail"` 與 `"pass"` 範例）。改部署相關腳本時，重跑一次或中途失敗後再跑都要得到同樣狀態（`pstack:principle-make-operations-idempotent`）。
 3. `devflow repo doctor <slug>` 讀回接入結果（`repo add` 的輸出也有同一份 `deploy`）：每個失敗項目照 `detail` 的修法處理；`contract-files`、`port` 由這張卡的 PR 修；`ci-required` 在契約合併後由 `[SHIP]` 跑 `devflow repo protect`；`runner-online` 沒有 runner → `devflow runner request <repo>`；`runner-request` 失敗（主機沒處理申請）→ `kanban_block(kind="capability")`，reason 第一行用 `問題：<repo> 的 runner 申請主機沒處理，要由你在 VM 檢查 devflow-runner-requests 服務後回覆嗎？選項：A 我檢查後回覆 / B 先不部署（建議 A）`。部署通道只有共用 runner + 契約 `deploy.yml`，不提出其他方式。
-4. 走 PR（同 `devflow-develop` §5–6，`reviewer="reviewer"`）。
+4. 走 PR（同 `devflow-develop` §5–6，`reviewer="reviewer"`）。`[OPS]` 卡只用 `kanban_request_review` 交出，不自己 `kanban_complete`：「本卡完成」的完成條件是送審的條件，審查在這張卡的 review 欄；`[SHIP]` 只合併已核准的 PR，不審查、不另建審查卡。
 
 ## 4. 出貨（`[SHIP]` 卡，workspace = 主 checkout）
 1. 從 parent 卡 metadata 取 `pr_url`／`pr_number`；body 找 `EPIC: t_xxx`。parent 有 `[ADV]` 且其 metadata `verdict` 是 `revise` → 不 merge，`kanban_complete(summary="未出貨：advisor 建議調整，見 <ADV> / <ADJ>", metadata={"shipped": false})`，由 orchestrator 依 `[ADJ]` 處理。沒有 PR parent 的 `[SHIP] 整合驗收` 卡：直接做第 5、6 步。
