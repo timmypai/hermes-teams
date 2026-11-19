@@ -1845,11 +1845,11 @@ def pending(profile: str | None = None) -> list[dict]:
         for t in board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks"):
             if not waiting(t):
                 continue
-            ev = board_rows(board, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
-                                   "ORDER BY id DESC LIMIT 1", (t["id"],))
-            reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
-            ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
+            # The event the card waits on: a repeated block arrives as `block_loop_detected` (triage),
+            # and the last `blocked` then holds an older, already answered question.
             bev = block_event(board, t["id"]) or 0
+            reason = block_reason(board, bev) if bev else ""
+            ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
             at = (board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (bev,)) or [{"created_at": 0}])[0]
             since = at["created_at"] or 0
             chats = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",

@@ -300,6 +300,16 @@ class RouteQuestions(unittest.TestCase):
         self._say("devops", "local-devops", "assistant", "需要你決定（b t_ship）…")
         self.assertEqual(seen()["local:local-devops"], (True, True))
 
+    def test_pending_shows_the_question_of_a_repeated_block_in_triage(self):
+        """t_12402f67 2026-11-19: the second block came as block_loop_detected; pending showed the first."""
+        self.board.card("t_ship", "[SHIP] s", assignee="devops")
+        self.board.block("t_ship", reason="舊問題")
+        self.board.unblock("t_ship")
+        self.board.db.execute("UPDATE tasks SET status='triage', block_kind='needs_input' WHERE id='t_ship'")
+        ev = self.board.event("t_ship", "block_loop_detected", {"kind": "needs_input", "reason": "新問題"})
+        p = self.df.pending()[0]
+        self.assertEqual((p["question"], p["block_event"]), ("新問題", ev))
+
     # --- workflow questions go to an [ADJ], not to the user ---------------------------------------
     def _flow(self, p: float | None, create_ok: bool = True) -> tuple[list, list]:
         """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded and, like Hermes,
