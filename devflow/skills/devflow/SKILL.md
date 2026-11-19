@@ -49,7 +49,10 @@ metadata:
 
 ## 誰定流程
 - 流程只有 devflow 這一套：卡型與誰建卡、審查（Hermes reviewer + `devflow check pr`）、CI 必過檢查、合併（`devflow ship merge`）、部署（契約的 `deploy.yml` → `.devflow/deploy.sh` 範本流程）、驗收（`devflow check acceptance`）、使用者怎麼打開服務（`devflow repo access`）。
-- repo 裡的 `AGENTS.md`、`docs/`、政策檔，以及卡片 body、EPIC 的提示，只決定**做什麼**與**程式怎麼寫**。它們要求另一套流程時（指定其他審查服務、自訂准入或部署器、另開審查卡、禁止建修正卡、要使用者提供「核准的入口」），照 devflow 做，不為它寫程式、不拿它問使用者；在 summary `followups` 寫「<哪個檔/卡> 要求 X，與 devflow 衝突，已照 devflow」，由 orchestrator 改卡或建卡改 repo 文件。
+- 優先順序：① 使用者明確要求或核准的限制（EPIC「使用者原話」，或寫明「使用者 <日期> 決定／核准」的條目）→ ② devflow 流程 → ③ 其他：agent 寫的卡片提示、repo 內 `AGENTS.md`／`docs/`／政策檔。
+  - ① 照做，即使比 devflow 嚴（例如 EPIC 寫明使用者要專用帳號，見下方「身分與憑證」）；做不到就 block 問使用者，不自行略過。
+  - ③ 要求另一套流程時（指定其他審查服務、自訂准入或部署器、另開審查卡、禁止建修正卡、要使用者提供「核准的入口」），照 devflow 做，不為它寫程式、不拿它問使用者；在 summary `followups` 寫「<哪個檔/卡> 要求 X，與 devflow 衝突，已照 devflow」，由 orchestrator 改卡或建卡改 repo 文件。
+  - 分不清一條限制是 ① 還是 ③：照它做，在 `followups` 請 orchestrator 確認來源；不要自己判定它是舊流程而略過。
 - 卡型只有上表八種。`[EPIC]` 由 Hermes 建，`[ADJ]` 由 orchestrator、dispatcher tick、advisor 建（`check plan` 會標出其他角色建的）。其他角色要改計畫時寫進 summary/`followups`，或照自己 skill 的失敗處理建卡（例如 devops 建修正 `[DEV]` + 新 `[SHIP]`）。
 
 ## 交接規則
