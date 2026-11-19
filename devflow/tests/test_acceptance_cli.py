@@ -513,6 +513,18 @@ class PlanUnjudged(Case):
         self.df.check_plan("b", EPIC, advise=True, cards=cards, advised=frozenset(findings))
         self.assertEqual(len(opened), 1)
 
+    def test_beyond_said_is_asked_only_when_the_epic_keeps_the_users_words(self) -> None:
+        asked = []
+        self.df.decide = lambda content, qs: asked.append([q["name"] for q in qs]) or {
+            q["name"]: {"probability": 0.9 if q["name"] == "beyond_said" else 0.0} for q in qs}
+        self.df.plan_rules = lambda board, epic, cards: []
+        card = {"title": "[EPIC] e", "status": "todo", "assignee": "orchestrator", "workspace_kind": "dir",
+                "parents": [], "children": []}
+        plain = self.df.check_plan("b", EPIC, advise=False, cards={EPIC: {**card, "body": BODY}})
+        said = self.df.check_plan("b", EPIC, advise=False, cards={EPIC: {**card, "body": f"{BODY}\n## 使用者原話\n部署並登入"}})
+        self.assertEqual(["beyond_said" in a for a in asked], [False, True])
+        self.assertEqual([any("beyond_said" in f for f in r["findings"]) for r in (plain, said)], [False, True])
+
 
 class PlanShipGate(Case):
     """An advisor's ok covers the [SHIP] cards it gated, not ones the plan gains later."""

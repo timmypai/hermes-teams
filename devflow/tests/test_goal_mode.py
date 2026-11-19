@@ -43,12 +43,14 @@ class Plan(unittest.TestCase):
             SHIP: ("[SHIP] s", f"EPIC: {EPIC}", [DEV], [EPIC], None),
         }
         self.df.kanban = self.show
+        self.creators: dict[str, str] = {}   # id -> Hermes created_by
 
     def show(self, board, cmd, tid, *args):
         title, body, parents, children, path = self.cards[tid]
         kind = title[1:title.index("]")]
         return json.dumps({"task": {"id": tid, "title": title, "body": body, "status": "todo", "assignee": ASSIGNEE[kind],
-                                    "workspace_kind": WORKSPACE[kind], "workspace_path": path, "completion_contract": None},
+                                    "workspace_kind": WORKSPACE[kind], "workspace_path": path, "completion_contract": None,
+                                    "created_by": self.creators.get(tid, "orchestrator")},
                            "parents": parents, "children": children, "runs": []})
 
     def board(self, goal: set[str]) -> None:
@@ -140,6 +142,14 @@ class Plan(unittest.TestCase):
         self.assertEqual(sorted(cards), sorted([EPIC, DEV, SHIP, "t_adj", "t_fix"]))
         outside = [f for f in self.df.plan_rules("b", EPIC, cards) if "不在本專案" in f]
         self.assertEqual([f.split(":")[0] for f in outside], ["t_fix"])
+
+    def test_an_adj_opened_by_a_worker_is_a_finding(self):
+        """teams-transcription 2026-11-18: the devops [SHIP] opened its own [ADJ] cards."""
+        for tid, who in (("t_adj1", "devops"), ("t_adj2", "devflow-tick"), ("t_adj3", "default")):
+            self.cards[tid] = (f"[ADJ] {who}", f"EPIC: {EPIC}\n## 目標\n調整", [], [], None)
+            self.creators[tid] = who
+        self.board({DEV})
+        self.assertEqual([f.split(":")[0] for f in self.findings("[ADJ] 由")], ["t_adj1"])
 
 
 if __name__ == "__main__":

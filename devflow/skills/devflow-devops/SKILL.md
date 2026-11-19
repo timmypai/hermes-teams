@@ -80,7 +80,7 @@ workflow_dispatch ──repro.yml (GitHub-hosted)：只跑指定情境、全程 
    gh run watch <id> -R <OWNER/REPO> --exit-status
    ```
    `headSha` 必須等於 default branch 最新 commit，而且那個 commit 最新的部署 run 成功（`gh run list --workflow deploy.yml --commit <headSha> -L 1 --json conclusion`）；不同（期間又有人合併）就等那次部署完成後再觸發一次。最終驗收只認 default branch 最新 commit 的部署：它失敗時，較舊的成功部署不算。整合 run 失敗 = 合併後有情境壞掉：照 §5 第一列建修正卡，body 附整合 run URL 與失敗情境 id。
-6. `devflow repo sync <slug>`；`devflow repo list` 顯示 `contract=no` 時跑 `devflow repo protect <slug>`（default branch 已有 `devflow-ci` 就會設成 required check，之後的 PR 卡改用 contract；GitHub Free 的 private repo 會回報不支援，維持 local-only，不要處理）。
+6. `devflow repo sync <slug>`。`devflow ship merge` 合併後會在 `contract=no` 時自動跑 `repo protect`（輸出 `protect`）：default branch 已有 `devflow-ci` 就設成 required check，之後的 PR 卡改用 contract；`contract_note` 是 GitHub Free private repo 不支援時，維持 local-only，不要處理；其他 `contract_note` 寫進 summary `followups`。
 7. `kanban_complete(summary="已合併並部署 <sha 前 7 碼>，部署後 smoke 與整合驗收通過", metadata={"merged_sha", "deploy_run_id", "deploy_run_url", "integration_run_url", "verify": "<smoke 與整合 run 各情境結果>", "evidence_artifact": "devflow-evidence-deploy-<sha>-<attempt>"})`。summary 裡的數字（耗時、回應時間、容量）要說明怎麼量的、和什麼比（`pstack:principle-explain-the-number`）。
 
 ## 5. 失敗處理（程式問題改建卡；只有人能修的主機或權限問題才 block）

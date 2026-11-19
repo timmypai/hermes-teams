@@ -417,6 +417,21 @@ def cmd_repo_path(a) -> None:
     print(entry(a.slug)["path"])
 
 
+# The one way a user opens a deployed service: services bind 127.0.0.1:<port> on the host (README),
+# so the entry is an SSH tunnel to that port. Fixed here so no card asks the user for "the approved
+# entry" (teams-transcription 2026-11-18 blocked 6h on that question) and no repo builds a public one.
+def repo_access(slug: str) -> dict:
+    e = entry(slug)
+    port = e["port"]
+    return {"slug": e["slug"], "tunnel": f"ssh -N -L {port}:127.0.0.1:{port} {ROLES['host']['ssh']}",
+            "url": f"http://127.0.0.1:{port}/",
+            "note": "使用者在自己的電腦執行 tunnel 指令，再用瀏覽器開 url；部署後的 smoke 在主機上連同一個位址"}
+
+
+def cmd_repo_access(a) -> None:
+    print(json.dumps(repo_access(a.slug), ensure_ascii=False, indent=2))
+
+
 def cmd_repo_sync(a) -> None:
     e = entry(a.slug)
     path, br = e["path"], e["default_branch"]
@@ -873,6 +888,11 @@ def repaired_done(body: str) -> str:
 # was edited 11 times). Workers then read the history as requirements. Progress belongs in comments.
 CARD_CHARS = 1500
 
+# Who may open an [ADJ] (Hermes `created_by`): the orchestrator, the dispatcher tick, and the
+# advisor / Hermes chat (profile default). teams-transcription 2026-11-18: the devops [SHIP] opened
+# four [ADJ] and a `[REVIEW]` card itself, each one a new process the skills never described.
+ADJ_CREATORS = {"orchestrator", "devflow-tick", "default"}
+
 
 def epic_acs(epic_body: str) -> dict[str, str]:
     return {m.group(1): norm(m.group(2)) for m in AC_RE.finditer(epic_body or "")}
@@ -968,6 +988,9 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue  # history; only pending work can still go wrong
         if (why := body_problem(kind, c["title"], c["body"])):
             found.append(f"{tid}: {why}")
+        if kind == "ADJ" and c.get("created_by") and c["created_by"] not in ADJ_CREATORS:
+            found.append(f"{tid}: [ADJ] 由 {c.get('created_by')} 建立；[ADJ] 只由 orchestrator、dispatcher tick、"
+                         "advisor 建，其他角色照自己 skill 的失敗處理建卡或寫 followups（devflow skill「誰定流程」）")
         want = CARDS[kind]
         # PR cards move to the reviewer while in the review column.
         if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
@@ -1017,20 +1040,38 @@ PLAN_QUESTIONS = [
 ]
 
 
-def plan_risks(epic: str, cards: dict[str, dict]) -> tuple[dict[str, float], str]:
+# Asked only when the EPIC keeps the user's own words. teams-transcription 2026-11-17: "deploy, do
+# not touch other services, test login" became allowlists, snapshots, admission and a custom
+# deployer in the EPIC's criteria and hints; scope_creep compares the plan with that EPIC, so it
+# could not see it. This question compares the EPIC itself with what the user said.
+BEYOND_SAID = ("beyond_said", "The EPIC body keeps the user's own words (section `使用者原話`, or a `使用者原話：` "
+               "line). Compared with those words, do the EPIC's acceptance criteria, scenarios or hints (提示) add "
+               "substantial requirements the user did not ask for: mechanisms such as audit logs, allowlists, "
+               "before/after snapshots, admission or approval gates, a custom review policy, dedicated accounts, "
+               "or a special access channel, rather than stating the requested outcomes more precisely? Turning "
+               "'do not touch other services' into one observable check does not count; requiring a system to "
+               "prove it does.")
+SAID_RE = re.compile(r"^##\s*使用者原話|使用者原話[:：]", re.M)
+
+
+def plan_questions(epic_body: str | None) -> list[tuple[str, str]]:
+    return PLAN_QUESTIONS + ([BEYOND_SAID] if SAID_RE.search(epic_body or "") else [])
+
+
+def plan_risks(epic: str, cards: dict[str, dict], questions: list[tuple[str, str]]) -> tuple[dict[str, float], str]:
     plan = [{"id": t, "title": c["title"], "assignee": c["assignee"], "status": c["status"],
              "parents": c["parents"], "body": (c["body"] or "")[:2500]} for t, c in cards.items() if t != epic]
     content = [{"type": "input_text", "text": "Judge this development plan against the EPIC (the user's goal)."},
                {"type": "input_json", "data": {"epic": {"title": cards[epic]["title"], "body": cards[epic]["body"]},
                                                "cards": plan}}]
     try:
-        answers = decide(content, [{"type": "predicate", "name": n, "instructions": q} for n, q in PLAN_QUESTIONS])
-        missing = [n for n, _ in PLAN_QUESTIONS if not isinstance((answers.get(n) or {}).get("probability"), (int, float))]
+        answers = decide(content, [{"type": "predicate", "name": n, "instructions": q} for n, q in questions])
+        missing = [n for n, _ in questions if not isinstance((answers.get(n) or {}).get("probability"), (int, float))]
         if missing:
             raise DecisionsError(f"no probability for {', '.join(missing)}")
     except DecisionsError as err:
         return {}, f"Decisions API 無法使用：{err}"
-    return {n: float(answers[n]["probability"]) for n, _ in PLAN_QUESTIONS}, ""
+    return {n: float(answers[n]["probability"]) for n, _ in questions}, ""
 
 
 SHIP_PENDING = ("todo", "ready", "triage", "scheduled")
@@ -1098,16 +1139,17 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
     findings = plan_rules(board, epic, cards) + readiness_rules(board, cards)
-    risks, note = plan_risks(epic, cards)
+    questions = plan_questions(cards[epic]["body"])
+    risks, note = plan_risks(epic, cards, questions)
     if note:
         # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
         # [SHIP] because an irreversible operation cannot be ruled out. Stable text (no error
         # message) so a later failure does not open another [ADV] for the same plan.
-        flagged = {n for n, _ in PLAN_QUESTIONS}
-        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in PLAN_QUESTIONS}
+        flagged = {n for n, _ in questions}
+        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
     else:
         flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
-        risk = {n: f"Decisions {n}：{q}" for n, q in PLAN_QUESTIONS if n in flagged}
+        risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
     findings += list(risk.values())
     risky = "irreversible" in flagged
     keys = {f: [f] for f in findings}
@@ -2336,7 +2378,12 @@ def cmd_check_acceptance(a) -> None:
 JUDGMENTS = ROOT / "state" / "pr-judgments.json"
 JUDGMENT_CHECK = "devflow-judgment"
 PR_ADVISOR_TITLE = "[ADV] PR 判斷 "
-GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)")
+# Delivery machinery every devflow repo shares (template). teams-transcription 2026-11-17 turned
+# .devflow/deploy.sh into a wrapper around a 27 KB project deployer that dropped build errors, so
+# two diagnostic PRs could not name a missing buildx. Changing these is judged, not only reviewed.
+DELIVERY_FILES = re.compile(r"^(\.devflow/(deploy\.sh|capture\.sh|redact\.py|up\.sh|playwright\.sh|acceptance\.py|"
+                            r"verify-base\.sh)|\.github/workflows/deploy\.yml)$")
+GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)|" + DELIVERY_FILES.pattern)
 FIX_TITLE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)   # same as the template check.py
 EXEMPTION = re.compile(r"^\s*(No-(lesson|proof)|Already-met|Base-unverifiable):\s*\S", re.M)
 # (name, asked when, question). The precondition is checked here, not left to the model: a
@@ -2361,6 +2408,14 @@ PR_QUESTIONS = [
      "This bug-fix PR adds or changes a lesson (`.devflow/lessons/L-NNNN.toml`). Does it fail to match the error "
      "this PR fixes: its root_cause describes something else, or its enforcement (the rule, test or scenario it "
      "names) would not catch this error if it came back?"),
+    ("replaces_standard", lambda pr, files: any(DELIVERY_FILES.match(f["filename"]) for f in files),
+     "This PR changes devflow's shared delivery machinery (`.devflow/deploy.sh`, `capture.sh`, `redact.py`, "
+     "`up.sh`, `playwright.sh`, `acceptance.py`, `verify-base.sh` or `.github/workflows/deploy.yml`). The standard "
+     "flow is: build, up, health check, run the smoke scenarios, and on failure capture diagnostics and roll back, "
+     "with each failing step's error output in the run log. Judging from the diff: does it replace or bypass those "
+     "steps (for example by handing the deploy to a project-specific script or another workflow), or keep a failing "
+     "step's error output (stderr, logs) out of the run log and the diagnostics artifact? Setting project values "
+     "(ports, service names, build arguments) or adding steps while keeping the standard ones does not count."),
 ]
 
 
@@ -2621,7 +2676,8 @@ def cmd_ship_merge(a) -> None:
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
     if pr["state"] == "MERGED":
-        print(json.dumps({"merged": True, "merged_sha": pr["mergeCommit"]["oid"], "note": "already merged"}))
+        print(json.dumps({"merged": True, "merged_sha": pr["mergeCommit"]["oid"], "note": "already merged",
+                          "protect": keep_protected(e)}, ensure_ascii=False))
         return
     if pr["state"] != "OPEN":
         die(f"PR #{a.pr} is {pr['state']}")
@@ -2655,8 +2711,15 @@ def cmd_ship_merge(a) -> None:
         die(f"未合併：gh pr merge 失敗：{(p.stderr or p.stdout).strip()[-400:]}")
     done = pr_meta(repo, a.pr)
     print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
-                      "fingerprint": pr["fingerprint"], "advisor": rec.get("advisor")}, ensure_ascii=False))
+                      "fingerprint": pr["fingerprint"], "advisor": rec.get("advisor"), "protect": keep_protected(e)},
+                     ensure_ascii=False))
 
+
+def keep_protected(e: dict) -> dict | None:
+    """After a merge, a repo still at contract=no gets `repo protect` (it only acts once the default
+    branch has the devflow-ci job). Was a manual [SHIP] step: teams-transcription merged three PRs
+    after main had devflow-ci and stayed contract=no, so no PR card was held to exact-head CI."""
+    return None if e.get("contract") else protect_repo(e["slug"])
 
 
 def main() -> None:
@@ -2669,6 +2732,8 @@ def main() -> None:
     p.set_defaults(fn=cmd_repo_add)
     repo.add_parser("list", aliases=["ls"]).set_defaults(fn=cmd_repo_list)
     p = repo.add_parser("path"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_path)
+    p = repo.add_parser("access", help="how the user opens the deployed service (SSH tunnel + URL)")
+    p.add_argument("slug"); p.set_defaults(fn=cmd_repo_access)
     p = repo.add_parser("sync"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_sync)
     p = repo.add_parser("protect", help="require devflow-ci on the default branch (enables PR completion_contract)")
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_protect)

@@ -172,6 +172,17 @@ class Judge(JudgmentCase):
         self.df.judge(self.f.pr, [*self.f.files, lesson])
         self.assertEqual(asked, ["unlabeled_fix", "weak_exemption", "lesson_mismatch"])
 
+    def test_delivery_machinery_is_a_gate_and_asks_whether_it_replaces_the_template(self) -> None:
+        asked = []
+        self.df.decide = lambda content, qs: asked.extend(q["name"] for q in qs) or {q["name"]: {"probability": 0} for q in qs}
+        self.f.pr.update(title="fix: x", body="Lesson: L-0001")
+        scenarios = {"filename": ".devflow/verify.sh", "status": "modified", "patch": "+scenario AC-2"}
+        self.assertEqual(self.df.judge(self.f.pr, [*self.f.files, scenarios])["gate_files"], [])
+        self.assertEqual(asked, [])   # adding scenarios is everyday work, not a change to the delivery path
+        deploy = {"filename": ".devflow/deploy.sh", "status": "modified", "patch": "-compose build\n+exec python3 x.py"}
+        self.assertEqual(self.df.judge(self.f.pr, [*self.f.files, deploy])["gate_files"], [".devflow/deploy.sh"])
+        self.assertEqual(asked, ["replaces_standard"])
+
     def test_cached_per_head_and_body_and_a_new_body_drops_the_advisor(self) -> None:
         self.df.judgment("b", REPO, 7)
         self.df.judgment("b", REPO, 7)
@@ -224,6 +235,17 @@ class ShipMerge(JudgmentCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.f.statuses, ["success"])
         self.assertIn("a" * 40, self.f.merges[0][self.f.merges[0].index("--match-head-commit") + 1])
+
+    def test_merge_turns_on_the_contract_once_and_only_while_it_is_off(self) -> None:
+        protected = []
+        self.df.protect_repo = lambda slug: protected.append(slug) or {"contract": True, "contract_note": ""}
+        code, out = self.ship()
+        self.assertEqual((code, json.loads(out)["protect"], protected), (0, {"contract": True, "contract_note": ""}, ["b"]))
+        state = json.loads((self.root / "state" / "repos.json").read_text())
+        state["b"]["contract"] = True
+        (self.root / "state" / "repos.json").write_text(json.dumps(state))
+        self.assertIsNone(json.loads(self.ship()[1])["protect"])   # already merged, contract already on
+        self.assertEqual(protected, ["b"])
 
     def test_down_deploy_channel_stops_before_judging_with_a_question(self) -> None:
         # A contract PR fixes contract-files; only the shared channel (runner, GitHub settings) stops a merge.
