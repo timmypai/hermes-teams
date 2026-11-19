@@ -1738,9 +1738,15 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
             question = block_reason(board, ev)
             laps = adjs_for(tid, tasks)
             if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
-                run([HERMES, "kanban", "--board", board, "comment", live,
-                     f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"], check=False)
-                flow[key] = live
+                # Handled only once the [ADJ] has the question; a failed comment asks the user, like a
+                # failed create (the question must reach someone this tick, not wait for a retry).
+                res = run([HERMES, "kanban", "--board", board, "comment", live,
+                           f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"],
+                          check=False)
+                if res.returncode != 0:
+                    print(f"devflow: question of {board}/{tid} not posted to {live}, asking the user: "
+                          f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
+                flow[key] = live if res.returncode == 0 else "user"
             else:
                 p = None if len(laps) >= ADJ_PER_CARD else user_must_answer(t, question)
                 adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(

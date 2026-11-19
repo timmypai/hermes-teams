@@ -315,6 +315,8 @@ class RouteQuestions(unittest.TestCase):
 
         def run(cmd, **kw):
             if cmd[4] == "comment":
+                if not create_ok:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="database is locked")
                 self.comments.append((cmd[5], cmd[6]))
                 return types.SimpleNamespace(returncode=0, stdout="", stderr="")
             created.append(cmd)
@@ -433,6 +435,18 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(self.df.pending()[0]["handled_by"], "t_adj0")
         self.tick()
         self.assertEqual(len(self.comments), 1)   # once per block
+
+    def test_a_question_the_open_adj_did_not_receive_is_asked_to_the_user(self):
+        self._ops_card()
+        judged, created = self._flow(0.05, create_ok=False)
+        self.board.card("t_adj0", "[ADJ] 收斂停止的卡", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="running")
+        ev = self.board.block("t_ops")
+        with redirect_stderr(io.StringIO()):
+            self.tick()
+        self.assertEqual((created, judged, self.comments), ([], [], []))
+        self.assertIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertIsNone(self.df.pending()[0]["handled_by"])
 
     def test_an_open_adj_that_only_cites_the_card_does_not_take_its_question(self):
         self._ops_card()
