@@ -47,13 +47,18 @@ class Board:
         self.sent: list[tuple[str, int, str]] = []   # (task, event id, chat) the notifier delivered
         self.clock = 0
 
+    def now(self) -> int:
+        """Whole seconds like Hermes, strictly increasing so call order is time order."""
+        self.clock = max(self.clock + 1, int(time.time()))
+        return self.clock
+
     def card(self, tid: str, title: str, *, body: str = "", status: str = "todo", assignee: str = "default") -> None:
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,NULL,?)", (tid, title, body, status, assignee))
         self.event(tid, "created")
 
     def event(self, tid: str, kind: str, payload: dict | None = None) -> int:
         cur = self.db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                              (tid, kind, json.dumps(payload or {}), int(time.time())))
+                              (tid, kind, json.dumps(payload or {}), self.now()))
         self.db.commit()
         return int(cur.lastrowid or 0)
 
@@ -63,7 +68,7 @@ class Board:
 
     def comment(self, tid: str, author: str, body: str) -> None:
         self.db.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                        (tid, author, body, int(time.time())))
+                        (tid, author, body, self.now()))
         self.db.commit()
 
     def unblock(self, tid: str) -> None:
@@ -72,23 +77,25 @@ class Board:
 
     def subscribe(self, tid: str, chat: dict, profile: str = "default") -> None:
         """Hermes add_notify_sub: the cursor starts after every existing event."""
-        self.clock += 1
         top = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
         self.db.execute("INSERT INTO kanban_notify_subs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (tid, chat["platform"], chat["chat_id"], chat.get("thread_id"), chat.get("user_id"), None,
-                         chat.get("chat_type"), profile, "notify+wake", self.clock, top, 0))
+                         chat.get("chat_type"), profile, "notify+wake", self.now(), top, 0))
         self.db.commit()
 
     def notify(self) -> None:
-        """Hermes notifier: send blocked events after each cursor, then advance it and record the ping."""
-        for tid, chat, cursor in self.db.execute(
-                "SELECT task_id, chat_id, last_event_id FROM kanban_notify_subs").fetchall():
+        """Hermes notifier: send blocked events after each cursor, then advance it. A push chat (Bot
+        Chat, `local`) records the ping; an app chat (`api_server`) is reached by the wake self-post,
+        which records none."""
+        for tid, platform, chat, cursor in self.db.execute(
+                "SELECT task_id, platform, chat_id, last_event_id FROM kanban_notify_subs").fetchall():
             rows = self.db.execute("SELECT id, kind FROM task_events WHERE task_id=? AND id>?", (tid, cursor)).fetchall()
             for eid, kind in rows:
                 if kind == "blocked":
                     self.sent.append((tid, eid, chat))
-                    self.db.execute("UPDATE kanban_notify_subs SET last_ping_event_id=? WHERE task_id=? AND chat_id=?",
-                                    (eid, tid, chat))
+                    if platform != "api_server":
+                        self.db.execute("UPDATE kanban_notify_subs SET last_ping_event_id=? WHERE task_id=? AND chat_id=?",
+                                        (eid, tid, chat))
             if rows:
                 self.db.execute("UPDATE kanban_notify_subs SET last_event_id=? WHERE task_id=? AND chat_id=?",
                                 (rows[-1][0], tid, chat))
@@ -303,7 +310,7 @@ class RouteQuestions(unittest.TestCase):
         db = self.data / ("state.db" if profile == "default" else f"profiles/{profile}/state.db")
         with closing(sqlite3.connect(db)) as s:
             s.execute("CREATE TABLE IF NOT EXISTS messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
-            s.execute("INSERT INTO messages VALUES (?,?,?,?)", (chat_id, role, content, time.time()))
+            s.execute("INSERT INTO messages VALUES (?,?,?,?)", (chat_id, role, content, self.board.now()))
             s.commit()
 
     def test_pending_reports_what_each_chat_transcript_shows_not_the_ping_cursor(self):

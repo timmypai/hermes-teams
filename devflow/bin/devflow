@@ -1592,6 +1592,17 @@ def move_to_inbox(board: str, tid: str, subs: dict[str, list], box: dict, readab
     subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
 
 
+def delivered(sub: dict, ev: int, ev_at: int) -> bool:
+    """Hermes' notifier already sent block event `ev` through `sub`. A push chat records the ping
+    (`last_ping_event_id`). An app (api_server) chat has no push channel: its delivery is the wake
+    self-post, which records no ping, and the cursor moves past an event only after that wake
+    succeeded (gateway/kanban_watchers_notifier.py `deliver`). A subscription made after the block
+    starts past it with nothing sent, hence its creation time. Counting only the ping replayed every
+    block to the app inbox once more (teams-transcription t_12402f67 event 2533, 2026-11-21)."""
+    return (sub["last_ping_event_id"] or 0) >= ev or (
+        sub["delivery_mode"] == "notify+wake" and sub["last_event_id"] >= ev and (sub["created_at"] or 0) < ev_at)
+
+
 def replay_from(board: str, sub: dict, event_id: int) -> bool:
     """Move one subscription's cursor back to just before `event_id` (Hermes' own compare-and-set
     writer); False when the notifier moved it meanwhile (the next tick retries)."""
@@ -1650,7 +1661,10 @@ def route_questions(board: str, st: dict) -> None:
             continue
         ev = block_event(board, tid)
         mine = [s for s in subs[tid] if readable(s)]
-        if ev is None or not mine or any((s["last_ping_event_id"] or 0) >= ev for s in mine):
+        if ev is None or not mine:
+            continue
+        at = board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (ev,))[0]["created_at"]
+        if any(delivered(s, ev, at) for s in mine):
             continue
         sub = next((s for s in mine if s["delivery_mode"] == "notify+wake"), mine[0])
         # Keyed by destination too: a block asked in a chat that is no longer readable (Hermes' Bot
@@ -1735,7 +1749,8 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
                         if same(s)), None)
             if sub is None:
                 continue
-        if (sub["last_ping_event_id"] or 0) < ev and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+        at = board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (ev,))[0]["created_at"]
+        if not delivered(sub, ev, at) and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
             continue
         asked.append(f"{board}/{tid}/{ev}/{chat['chat_id']}")
     del asked[:-1000]
