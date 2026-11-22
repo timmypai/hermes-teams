@@ -1392,8 +1392,12 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
             note = None
         leave_triage(board, task_id)
         d = json.loads(kanban(board, "show", task_id, "--json"))
-        if d["task"]["status"] in ("todo", "running"):
-            return f"{task_id} left triage: {d['task']['status']} ({d['task']['assignee']})"
+        status = d["task"]["status"]
+        if status == "triage":
+            die(f"{task_id} is still in triage after specify")
+        # Out of triage is the resume (todo/ready/running). Never block again here: Hermes counts
+        # blocks per reason without resetting on specify, so a re-block sends the card back to triage.
+        return f"{task_id} left triage: {status} ({d['task']['assignee']})"
     status, assignee = d["task"]["status"], d["task"]["assignee"]
     if status not in ("blocked", "scheduled", "ready"):
         die(f"{task_id} is {status}; only blocked/scheduled/ready/triage cards can be resumed")
