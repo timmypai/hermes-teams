@@ -501,6 +501,11 @@ def cmd_operate(a) -> None:
         if not sep or not k:
             die(f"--arg {kv!r}: want KEY=VALUE")
         args[k] = v
+    # Download target: a caller's --dir must be new or empty (never cleared: `--dir .` would wipe the
+    # checkout); the default is a fresh directory per call.
+    dest = Path(a.dir) if a.dir else None
+    if dest is not None and dest.exists() and (not dest.is_dir() or any(dest.iterdir())):
+        die(f"--dir {dest} exists and is not an empty directory; give a new or empty one")
     req = secrets.token_hex(6)
     run(["gh", "workflow", "run", "operate.yml", "-R", repo, "--ref", br, "-f", f"op={a.op}",
          "-f", f"args={json.dumps(args, ensure_ascii=False)}", "-f", f"request={req}"], gh="builder")
@@ -520,8 +525,11 @@ def cmd_operate(a) -> None:
         time.sleep(5)
         r = gh_json(["api", f"repos/{repo}/actions/runs/{r['id']}"]) or r
     art = f"devflow-operate-{r['id']}-{r.get('run_attempt')}"
-    dest = Path(a.dir or f"/tmp/devflow-operate/{e['slug']}-{a.op}-{r['id']}")
-    shutil.rmtree(dest, ignore_errors=True)
+    if dest is None:
+        import tempfile
+        base = Path("/tmp/devflow-operate")
+        base.mkdir(parents=True, exist_ok=True)
+        dest = Path(tempfile.mkdtemp(prefix=f"{e['slug']}-{a.op}-{r['id']}-", dir=base))
     p = run(["gh", "run", "download", str(r["id"]), "-R", repo, "-n", art, "-D", str(dest)], gh="builder", check=False)
     result, failures = None, []
     if (dest / "result.json").exists():
@@ -2927,7 +2935,7 @@ def main() -> None:
     p.add_argument("slug"); p.add_argument("op")
     p.add_argument("--arg", action="append", default=[], help="non-secret KEY=VALUE (repeatable)")
     p.add_argument("--args", help="non-secret args as a JSON object (merged before --arg)")
-    p.add_argument("--dir", help="download dir (default /tmp/devflow-operate/<slug>-<op>-<run>)")
+    p.add_argument("--dir", help="new or empty download dir (default: a fresh /tmp/devflow-operate/<slug>-<op>-<run>-*)")
     p.add_argument("--timeout", type=int, default=1500, help="seconds to wait for the run")
     p.set_defaults(fn=cmd_operate)
     check = sub.add_parser("check").add_subparsers(dest="sub", required=True)
