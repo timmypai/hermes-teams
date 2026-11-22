@@ -66,6 +66,7 @@ metadata:
 - 可逆的事自己決定並記在 summary，不停下來問。
 - review 退件用 `kanban_request_changes`，不是 block；沒有次數上限。同一原因再失敗時換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
 - 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason 寫成使用者能直接回答的一句話。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句話>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後必寫，使用者只看這段就能決定：`背景：` 在做什麼、卡在哪（1–3 句，含檔案/錯誤/網址等證據）；`A：` / `B：` 各選項會發生什麼、代價與風險；`建議：` 為什麼選它。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
+- 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後你重查仍缺、再 block 同一題，Hermes 會判定重複阻擋，把卡轉進 triage（teams-transcription t_12402f67 2026-11-22）。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。
 - 長時間操作（CI、部署）期間呼叫 `kanban_heartbeat`。
 - 每次 run 結束前一定要呼叫一個終結工具（complete / request_review / request_changes / block）。
@@ -92,7 +93,7 @@ metadata:
    直接回覆編號或你的想法。
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
-3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
+3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。題目要使用者自己動手（設 secret、OAuth、在主機執行指令）時，只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
 5. 說「有沒有送到」只看 `devflow pending` 的 `chats[]`，它讀的是那個對話自己的紀錄：`woken` = 通知已進入那個對話，`replied` = 那個 bot 之後有回話。`woken` 為 false 時說「那邊還沒看到這則通知（Hermes 一次叫醒一個 bot，常晚約 1 分鐘）」，不要說「未送達」；超過 10 分鐘仍為 false 才說「那邊沒收到」，並請使用者在這裡直接回答。
 

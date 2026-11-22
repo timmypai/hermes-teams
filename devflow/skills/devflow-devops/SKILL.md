@@ -93,7 +93,7 @@ devflow operate <slug> <op> --arg key=value       # repo 裡的 .devflow/ui/ops/
 ```
 - 輸出 JSON：`conclusion`、`result`（腳本寫的結果）、`images`（截圖路徑）、`failures`、`run`。用 `vision_analyze` 看截圖確認畫面真的是預期結果，不只看 `conclusion`。結束碼非 0 = 操作失敗：看 `failures` 與截圖。
 - 只跑 default branch 最新 commit 上的腳本。需要的操作還沒有腳本 → 建 `[DEV]`（developer 寫 `ops/<op>.spec.ts`，形狀照 `ops/look.spec.ts`，走 PR review），合併後再用；repo 還沒有 `operate.yml`／`operate.sh` → 同一張 `[DEV]` 跑 `devflow contract <slug> . --ui` 補上。
-- 秘密（管理密碼等）在 repo secret `DEVFLOW_OPS_ENV`（dotenv）。沒有設 → `kanban_block(kind="capability")`，問題寫成「請在 GitHub 為 <repo> 設 secret DEVFLOW_OPS_ENV（內容 `ADMIN_PASSWORD=...`）」，不要在聊天收密碼。`--arg` 會出現在 run 的 inputs，不放秘密。
+- 秘密（管理密碼等）在 repo secret `DEVFLOW_OPS_ENV`（dotenv）。先用 `gh secret list -R <repo>` 看名稱（不讀值）；沒有 → `kanban_block(kind="capability")`，第一行 `問題：請你在 GitHub 為 <repo> 設 secret DEVFLOW_OPS_ENV（一行 ADMIN_PASSWORD=<管理密碼>），做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`（使用者自己動手的題型，見 `devflow` 推進規則），不要在聊天收密碼。重跑後第一件事重查名稱；仍沒有就照實說明後再 block，題目寫明「上次回覆後仍未看到 DEVFLOW_OPS_ENV」。`--arg` 會出現在 run 的 inputs，不放秘密。
 - 會寫入正式資料的操作，照卡片與 EPIC 的授權做；不可回復的操作（刪資料等）仍先 `needs_input`。
 - 只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料（例如會議要排在哪一天）。問的時候說清楚其餘步驟由你做。
 
