@@ -486,6 +486,67 @@ def cmd_contract(a) -> None:
         print("note: no Dockerfile yet — write one, or set DEVFLOW_DEPLOY=false")
 
 
+def cmd_operate(a) -> None:
+    """Hermes operates the deployed service's UI itself: dispatch operate.yml (reviewed Playwright op
+    on the Oracle VM runner, the only machine that reaches the service), wait, download the result.
+    The worker containers cannot open the service: each rootless Docker runs --disable-host-loopback."""
+    import secrets
+    e = entry(a.slug)
+    repo, br = e["repo"], e["default_branch"]
+    args = json.loads(a.args) if a.args else {}
+    if not isinstance(args, dict):
+        die("--args must be a JSON object")
+    for kv in a.arg:
+        k, sep, v = kv.partition("=")
+        if not sep or not k:
+            die(f"--arg {kv!r}: want KEY=VALUE")
+        args[k] = v
+    req = secrets.token_hex(6)
+    run(["gh", "workflow", "run", "operate.yml", "-R", repo, "--ref", br, "-f", f"op={a.op}",
+         "-f", f"args={json.dumps(args, ensure_ascii=False)}", "-f", f"request={req}"], gh="builder")
+    r = None
+    for _ in range(30):                     # the run shows up a few seconds after dispatch
+        time.sleep(3)
+        runs = workflow_runs(repo, "operate.yml", event="workflow_dispatch", branch=br) or []
+        r = next((x for x in runs if (x.get("display_title") or "").split()[-1:] == [req]), None)
+        if r:
+            break
+    if r is None:
+        die(f"operate.yml run for request {req} not found in {repo} (is operate.yml on {br}? `devflow contract`)")
+    deadline = time.time() + a.timeout
+    while r.get("status") != "completed":
+        if time.time() > deadline:
+            die(f"run {r['html_url']} still {r.get('status')} after {a.timeout}s")
+        time.sleep(5)
+        r = gh_json(["api", f"repos/{repo}/actions/runs/{r['id']}"]) or r
+    art = f"devflow-operate-{r['id']}-{r.get('run_attempt')}"
+    dest = Path(a.dir or f"/tmp/devflow-operate/{e['slug']}-{a.op}-{r['id']}")
+    shutil.rmtree(dest, ignore_errors=True)
+    p = run(["gh", "run", "download", str(r["id"]), "-R", repo, "-n", art, "-D", str(dest)], gh="builder", check=False)
+    result, failures = None, []
+    if (dest / "result.json").exists():
+        result = json.loads((dest / "result.json").read_text())
+    if (dest / "playwright-report.json").exists():
+        def walk(s):
+            for spec in s.get("specs", []):
+                for t in spec.get("tests", []):
+                    for res in t.get("results", []):
+                        if res.get("error"):
+                            msg = re.sub(r"\x1b\[[0-9;]*m", "", res["error"].get("message", ""))
+                            failures.append(f"{spec.get('title')}: {msg[:600]}")
+            for child in s.get("suites", []):
+                walk(child)
+        for s in json.loads((dest / "playwright-report.json").read_text()).get("suites", []):
+            walk(s)
+    print(json.dumps({
+        "run": r["html_url"], "sha": r.get("head_sha"), "conclusion": r.get("conclusion"), "dir": str(dest),
+        "result": result, "images": sorted(str(x) for x in dest.rglob("*.png")), "failures": failures,
+        **({"download_error": (p.stderr or p.stdout).strip()[-300:]} if p.returncode else {}),
+    }, ensure_ascii=False, indent=2))
+    if r.get("conclusion") != "success":
+        sys.exit(1)
+
+
 def runner_key(repo: str) -> str:
     return repo.replace("/", "__")
 
@@ -2861,6 +2922,14 @@ def main() -> None:
     p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")
     p.add_argument("--ui", action="store_true", help="also add the Playwright UI scenario scaffold (.devflow/ui)")
     p.set_defaults(fn=cmd_contract)
+    p = sub.add_parser("operate", help="Hermes operates the deployed service UI: run reviewed op "
+                       ".devflow/ui/ops/<op>.spec.ts on the VM runner (operate.yml), print result + screenshots")
+    p.add_argument("slug"); p.add_argument("op")
+    p.add_argument("--arg", action="append", default=[], help="non-secret KEY=VALUE (repeatable)")
+    p.add_argument("--args", help="non-secret args as a JSON object (merged before --arg)")
+    p.add_argument("--dir", help="download dir (default /tmp/devflow-operate/<slug>-<op>-<run>)")
+    p.add_argument("--timeout", type=int, default=1500, help="seconds to wait for the run")
+    p.set_defaults(fn=cmd_operate)
     check = sub.add_parser("check").add_subparsers(dest="sub", required=True)
     p = check.add_parser("plan", help="rules + Decisions risk check of an EPIC plan (read-only unless --advise)")
     p.add_argument("board"); p.add_argument("epic")

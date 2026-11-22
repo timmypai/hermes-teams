@@ -74,6 +74,7 @@ metadata:
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
 - worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：dispatcher tick 會判斷是流程問題，自動建 `[ADJ]` 交 orchestrator。
+- 已部署服務的畫面操作（登入管理頁、建立或選擇資料、按按鈕、讀出 id 或畫面文字）由 Bot 自己做：`devflow operate <slug> <op>`（`devflow-devops` §5，經 VM runner 的 Playwright；Bot 的容器連不到服務），不要請使用者開瀏覽器代做。只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料。問的時候寫清楚其餘步驟由 Bot 做。
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
 你負責的卡 block 成 `needs_input` / `capability` 時，dispatcher tick 會把通知送到**你的 Bot Chat** 並喚醒你；Hermes 主頁只留一行提醒指到這裡。

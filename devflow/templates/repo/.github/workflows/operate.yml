@@ -1,0 +1,61 @@
+name: operate
+# Hermes 代替使用者操作正式服務的畫面：在 Oracle VM self-hosted runner 上用 Playwright 跑 repo 裡
+# 審查過的操作腳本 .devflow/ui/ops/<op>.spec.ts，截圖與結果存成 artifact `devflow-operate-<run>-<attempt>`。
+# 由 `devflow operate <slug> <op>` dispatch 並下載結果；不要直接 gh workflow run（找不到是哪一個 run）。
+# 只跑 default branch 最新 commit 上的腳本：對正式服務執行的程式都經過 PR review。
+# 秘密（例如管理密碼）放 repo secret DEVFLOW_OPS_ENV（dotenv 格式），只進 Playwright 容器的環境變數；
+# args 不放秘密（會出現在 run 的 inputs）。trace 不錄（會錄下輸入的密碼）。
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "操作名稱：.devflow/ui/ops/<op>.spec.ts"
+        type: string
+        required: true
+      args:
+        description: "非秘密參數，JSON 物件"
+        type: string
+        default: "{}"
+      request:
+        description: "devflow operate 產生的 id，用來找這個 run"
+        type: string
+        default: ""
+
+run-name: operate ${{ inputs.op }} ${{ inputs.request }}
+
+permissions:
+  contents: read
+
+# 對正式服務的操作一次一個，不取消進行中的操作。
+concurrency:
+  group: operate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    runs-on: [self-hosted, devflow]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: default branch tip only
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tip=$(git ls-remote origin "refs/heads/$DEFAULT_BRANCH" | cut -f1)
+          if [[ $GITHUB_REF != "refs/heads/$DEFAULT_BRANCH" || $GITHUB_SHA != "$tip" ]]; then
+            echo "::error::devflow: 只執行 $DEFAULT_BRANCH 最新 commit ${tip:0:12} 的操作腳本；這次是 $GITHUB_REF ${GITHUB_SHA:0:12}"
+            exit 1
+          fi
+      - name: operate
+        env:
+          DEVFLOW_OP: ${{ inputs.op }}
+          DEVFLOW_OP_ARGS: ${{ inputs.args }}
+          DEVFLOW_OPS_ENV: ${{ secrets.DEVFLOW_OPS_ENV }}
+        run: bash .devflow/operate.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: devflow-operate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .devflow/evidence/operate
+          retention-days: 7
+          if-no-files-found: ignore
