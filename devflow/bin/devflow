@@ -735,6 +735,9 @@ AC_TAG = re.compile(r"\[([A-Za-z]+)\]\s*")
 SCENARIO_LINE = re.compile(r"^\s*[-*]\s*\**(S\d+)\**\s*(\[smoke\])?\s*[:：.、)]?\s*(.*)$")
 STEP_LINE = re.compile(r"^\s*[-*]\s*(Given|When|Then)(?:[:：]?\s+|[:：]|$)(.*)$")
 SCENARIO_ID = re.compile(r"^(t_[0-9A-Za-z]+)/(AC-\d+)\.(S\d+)$")
+TASK_ID_RE = re.compile(r"\bt_[0-9A-Za-z]+\b")
+EPIC_REF = re.compile(r"\bEPIC[：:]\s*(t_[0-9A-Za-z]+)")
+COVER_LINE = re.compile(r"覆蓋[：:][^\n]*")
 PHASES = ("given", "when", "then")
 
 
@@ -857,17 +860,78 @@ def criteria(body: str) -> list[tuple[str, str]]:
     return [(a["ac"], a["text"]) for a in acceptance_spec("", body)]
 
 
+_PLAN_COLS = frozenset({
+    "id", "title", "body", "status", "assignee", "workspace_kind", "workspace_path",
+    "completion_contract", "created_by", "result", "goal_mode",
+})
+
+
+def _plan_cards_from_db(board: str, epic: str) -> dict[str, dict] | None:
+    """Fast path for `plan_cards`: load the entire board in one read-only SQLite connection instead of
+    spawning N `hermes kanban show` subprocesses. Returns None when kanban.db is missing or lacks full
+    Hermes tables/columns (minimal test fixtures), letting `plan_cards` fall back to `kanban show`."""
+    db = BOARDS / board / "kanban.db"
+    if not db.exists():
+        return None
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "tasks" not in tables or "task_links" not in tables:
+            return None
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        if not _PLAN_COLS.issubset(cols):
+            return None
+        all_tasks = {
+            r["id"]: dict(r) for r in conn.execute(
+                "SELECT id, title, body, status, assignee, workspace_kind, workspace_path, "
+                "completion_contract, created_by, result, goal_mode FROM tasks")
+        }
+        if epic not in all_tasks:
+            return None
+        parents_map: dict[str, list[str]] = {}
+        children_map: dict[str, list[str]] = {}
+        for link in conn.execute("SELECT parent_id, child_id FROM task_links"):
+            parents_map.setdefault(link["child_id"], []).append(link["parent_id"])
+            children_map.setdefault(link["parent_id"], []).append(link["child_id"])
+    shown: dict[str, dict] = {}
+    seen: set[str] = set()
+    todo = [epic, *[tid for tid, r in all_tasks.items() if tid != epic and epic in (r["body"] or "")]]
+    while todo:
+        tid = todo.pop()
+        if tid in seen or tid not in all_tasks:
+            continue
+        seen.add(tid)
+        t = all_tasks[tid]
+        if (t["title"] or "").startswith(PR_ADVISOR_TITLE) or t["status"] == "archived":
+            continue
+        body = t["body"] or ""
+        if tid != epic and (card_type(t["title"]) == "EPIC" or (EPIC_REF.search(body) and epic not in body)):
+            continue
+        parents = parents_map.get(tid, [])
+        children = children_map.get(tid, [])
+        shown[tid] = {**t, "parents": parents, "children": children, "runs": [], "goal_mode": bool(t["goal_mode"])}
+        todo.extend(parents)
+        if tid != epic:
+            todo.extend(children)
+    for c in shown.values():
+        c["parents"] = [p for p in c["parents"] if p in shown]
+        c["children"] = [p for p in c["children"] if p in shown]
+    return shown
+
+
 def plan_cards(board: str, epic: str) -> dict[str, dict]:
     """EPIC plus the cards of its plan: cards that name the EPIC id anywhere in their body ([ADJ]
     cards are not linked to it, and say `原 EPIC t_x` as often as `EPIC: t_x`), and every card linked
     to those, transitively, unless it belongs to another EPIC (`EPIC: t_other`, or is one). A card
     an [ADJ] spawns without naming the EPIC (a maintenance card, 2026-11-18) is still in the plan.
 
-    Read-only: `show` calls and a read-only board query. `kanban list` recomputes readiness (a write),
-    which Hermes refuses inside dispatched workers, and the orchestrator runs these checks there."""
+    Read-only: single read-only SQLite query on full Hermes boards, falling back to `kanban show` when
+    the DB is absent or minimal. `kanban list` recomputes readiness (a write), which Hermes refuses
+    inside dispatched workers, and the orchestrator runs these checks there."""
+    if (fast := _plan_cards_from_db(board, epic)) is not None:
+        return fast
     shown: dict[str, dict] = {}
     seen: set[str] = set()
-    pr_adv: set[str] = set()
     db = BOARDS / board / "kanban.db"
     named = [r["id"] for r in board_rows(board, "SELECT id FROM tasks WHERE id != ? AND instr(body, ?) > 0", (epic, epic))
              ] if db.exists() else []
@@ -880,7 +944,6 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
         d = json.loads(kanban(board, "show", tid, "--json"))
         t = d["task"]
         if t["title"].startswith(PR_ADVISOR_TITLE):
-            pr_adv.add(tid)  # a PR judgment is not part of the plan; workers link it as a parent
             continue
         if t["status"] == "archived":
             continue
@@ -893,8 +956,8 @@ def plan_cards(board: str, epic: str) -> dict[str, dict]:
             todo.extend(d["children"])
     goal = goal_modes(board, list(shown))
     for tid, c in shown.items():
-        c["parents"] = [p for p in c["parents"] if p not in pr_adv]
-        c["children"] = [p for p in c["children"] if p not in pr_adv]
+        c["parents"] = [p for p in c["parents"] if p in shown]
+        c["children"] = [p for p in c["children"] if p in shown]
         c["goal_mode"] = tid in goal
     return shown
 
@@ -960,7 +1023,6 @@ def repaired_done(body: str) -> str:
 # and SHAs of each attempt, and the same prohibitions on every card, rewritten by each [ADJ] (one card
 # was edited 11 times). Workers then read the history as requirements. Progress belongs in comments.
 CARD_CHARS = 1500
-BODY_LONG = "字（上限"  # marks the body-length finding: reminded on the EPIC, never sent to the advisor
 
 # Who may open an [ADJ] (Hermes `created_by`): the orchestrator, the dispatcher tick, and the
 # advisor / Hermes chat (profile default). teams-transcription 2026-11-18: the devops [SHIP] opened
@@ -1027,7 +1089,7 @@ def body_problem(kind: str, title: str, body: str) -> str | None:
         return None  # written by devflow itself
     if len(text) <= CARD_CHARS:
         return None
-    return (f"body {len(text)} {BODY_LONG} {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
+    return (f"body {len(text)} 字（上限 {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
             "AC 只寫編號；PR、run、review、SHA 與每輪經過寫留言，不寫進 body；共通規則已在 skill，不要每張卡抄")
 
 
@@ -1060,6 +1122,12 @@ def outside_project(board: str, c: dict) -> str | None:
     return None if p == root or root in p.parents else str(p)
 
 
+def plan_manual_rules(epic: str, spec: list[dict]) -> list[str]:
+    """Advisory findings for [manual] ACs: only an advisor can confirm they cannot be automated."""
+    return [f"{epic}: {a['ac']} 標為 [manual]，無法自動驗證：請 advisor 確認確實無法寫成情境，並指定證據"
+            for a in spec if a["type"] == "manual"]
+
+
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     e = entry(board)
     found: list[str] = []
@@ -1072,12 +1140,12 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             stack.extend(cards.get(t, {}).get("parents", []))
     spec = acceptance_spec(epic, cards[epic]["body"])
     acs = [a["ac"] for a in spec]
+    ac_types = {a["ac"]: a["type"] for a in spec}
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
     for a in spec:
         found += [f"{epic}: {p}" for p in spec_problems(a)]
-        if a["type"] == "manual":
-            found.append(f"{epic}: {a['ac']} 標為 [manual]，無法自動驗證：請 advisor 確認確實無法寫成情境，並指定證據")
+    found += plan_manual_rules(epic, spec)
     for tid, c in cards.items():
         kind = card_type(c["title"])
         if kind not in CARDS:
@@ -1112,6 +1180,12 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
             if (why := done_problem(c["title"], c["body"])):
                 found.append(f"{tid}: [{kind}] {why}")
+            covered = list(dict.fromkeys(
+                ac for m in COVER_LINE.finditer(c["body"] or "") for ac in re.findall(r"\bAC-\d+\b", m.group(0))
+                if ac in ac_types))
+            if covered and all(ac_types[ac] == "manual" for ac in covered):
+                found.append(f"{tid}: [{kind}] 覆蓋的 AC（{', '.join(covered)}）全為 [manual]（0 個可執行情境）；"
+                             "PR 卡無法通過 check acceptance 的 Covers 核對，請改覆蓋可執行 AC 或與對應實作合併")
             # Goal mode: a turn that stops without a kanban terminal call ("waiting for CI") gets a
             # continuation turn instead of a protocol-violation crash and the 24h active_pr hold.
             if not c.get("goal_mode"):
@@ -1224,7 +1298,7 @@ def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: l
     out = run([HERMES, "kanban", "--board", board, "create", f"[ADV] 計畫檢查 {epic}", "--assignee", CARDS["ADV"]["assignee"],
                "--workspace", "scratch", "--body", body, "--idempotency-key", key, "--created-by", "devflow-check",
                "--model", ADVISOR["model"], "--provider", ADVISOR["provider"]]).stdout
-    adv = re.search(r"t_[0-9a-f]{8}", out).group(0)
+    adv = TASK_ID_RE.search(out).group(0)
     for t in ships:
         if adv not in cards[t].get("parents", []):
             # Fails loudly: a SHIP left ungated must not be recorded as advised (the tick retries).
@@ -1234,13 +1308,17 @@ def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: l
 
 def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | None = None,
                advised: frozenset[str] = frozenset()) -> dict:
-    """Rules + Decisions risks. With `advise`, findings not in `advised` open an [ADV] card.
-    report["advised"] holds the keys to remember: the irreversible-risk finding counts once per
-    pending [SHIP] it gates, every other finding once."""
+    """Rules + Decisions risks. With `advise`, advisory findings ([manual] AC confirmations and
+    Decisions risks) not in `advised` open an [ADV] card; deterministic schema findings stay in
+    `findings` and EPIC comments without spending an Opus advisor run. `report["advised"]` holds the
+    keys to remember: the irreversible-risk finding counts once per pending [SHIP] it gates, every
+    other advisory finding once."""
     cards = cards or plan_cards(board, epic)
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
-    findings = plan_rules(board, epic, cards) + readiness_rules(board, cards)
+    rules = plan_rules(board, epic, cards)
+    manual = set(plan_manual_rules(epic, acceptance_spec(epic, cards[epic]["body"])))
+    findings = rules + readiness_rules(board, cards)
     questions = plan_questions(cards[epic]["body"])
     risks, note = plan_risks(epic, cards, questions)
     if note:
@@ -1254,15 +1332,14 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
     findings += list(risk.values())
     risky = "irreversible" in flagged
-    keys = {f: [f] for f in findings}
+    advisory = [f for f in rules if f in manual] + list(risk.values())
+    keys = {f: [f] for f in advisory}
     if risky:
         f = risk["irreversible"]
         keys[f] = [f"{f} @ {s}" for s in pending_ships(cards)] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note,
               "advised": sorted({k for ks in keys.values() for k in ks})}
-    # A long body is a writing issue the orchestrator fixes itself: the EPIC comment reminds it, an
-    # advisor run adds nothing (teams-transcription t_8f869670 / t_5ea4b8e4 2026-11-19 both said so).
-    new = [f for f in findings if BODY_LONG not in f and any(k not in advised for k in keys[f])]
+    new = [f for f in advisory if any(k not in advised for k in keys[f])]
     if new and advise:
         report["advisor_card"] = open_advisor_card(board, epic, cards, new, risky)
     return report
@@ -1331,16 +1408,19 @@ BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
 
 
 def tick_key(board: str) -> str:
-    """What a tick depends on: the board's files and the kit's own rules. A board idle since the last
-    tick is skipped, but not after a kit update: new rules (e.g. the fixed `## 本卡完成`) must reach the
-    stalled boards they were written for."""
+    """What a tick depends on: the board's files, pending PR judgments (written by workers while
+    kanban.db is idle), and the kit's own rules. A board idle since the last tick is skipped, but
+    not after a judgment write or a kit update."""
     import hashlib
     board_mtime = 0.0
     for p in (BOARDS / board).glob("kanban.db*"):
         with suppress(FileNotFoundError):  # SQLite removes -wal/-shm between glob and stat
             board_mtime = max(board_mtime, p.stat().st_mtime)
+    j_mtime = 0.0
+    with suppress(FileNotFoundError):
+        j_mtime = JUDGMENTS.stat().st_mtime
     kit = hashlib.sha1(Path(__file__).resolve().read_bytes() + (ROOT / "roles.json").read_bytes()).hexdigest()[:12]
-    return f"{board_mtime}:{kit}"
+    return f"{board_mtime}:{j_mtime}:{kit}"
 
 
 def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
@@ -1506,6 +1586,9 @@ def tick_board(board: str, st: dict) -> bool:
     wake_ops = st.setdefault("wake_ops", [])
     retry = False
     tasks = json.loads(kanban(board, "list", "--json"))
+    waiting_epics: list[str] = []
+    # Phase 1: fast board mutations (orchestrator devflow-ops + transient wake) run before any slow
+    # network/LLM plan checks so an EPIC check failure or timeout never starves an [ADJ] fix.
     for t in tasks:
         kind, tid = card_type(t["title"]), t["id"]
         if t["assignee"] != "orchestrator" or kind not in ("EPIC", "ADJ"):
@@ -1513,29 +1596,52 @@ def tick_board(board: str, st: dict) -> bool:
         final = f"{board}/{tid}@{t.get('completed_at')}"
         if t["status"] == "done" and final in settled:
             continue
-        d = json.loads(kanban(board, "show", tid, "--json"))
-        # 1. board edits the orchestrator asked for (workers cannot mutate other cards).
-        ran = apply_comment_ops(board, tid, d.get("comments") or [], applied)
-        wkey = f"{board}/{tid}"
-        bk = task_block_kind(board, tid) if d["task"]["status"] == "blocked" else None
-        if ran and d["task"]["status"] == "blocked" and bk == "transient" and wkey not in wake_ops:
-            wake_ops.append(wkey)
-        if wkey in wake_ops:
-            if d["task"]["status"] != "blocked" or bk != "transient":
-                wake_ops.remove(wkey)
-            else:
-                try:
-                    resume(board, tid, "devflow tick：已套用 devflow-ops，請核對結果並繼續。")
+        try:
+            d = json.loads(kanban(board, "show", tid, "--json"))
+            ran = apply_comment_ops(board, tid, d.get("comments") or [], applied)
+            wkey = f"{board}/{tid}"
+            bk = task_block_kind(board, tid) if d["task"]["status"] == "blocked" else None
+            if ran and d["task"]["status"] == "blocked" and bk == "transient" and wkey not in wake_ops:
+                wake_ops.append(wkey)
+            if wkey in wake_ops:
+                if d["task"]["status"] != "blocked" or bk != "transient":
                     wake_ops.remove(wkey)
-                except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
-                    retry = True
-                    print(f"devflow: transient {board}/{tid} could not be resumed after devflow-ops: {err}",
-                          file=sys.stderr)
-        if t["status"] == "done":
-            settled.append(final)
-        # 2. plan check when an EPIC waits on a plan that changed since the last check
-        #    (dependency block parks the EPIC in todo until its parents finish).
-        if kind == "EPIC" and t["status"] in ("todo", "blocked", "scheduled") and d["parents"]:
+                else:
+                    try:
+                        resume(board, tid, "devflow tick：已套用 devflow-ops，請核對結果並繼續。")
+                        wake_ops.remove(wkey)
+                    except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+                        retry = True
+                        print(f"devflow: transient {board}/{tid} could not be resumed after devflow-ops: {err}",
+                              file=sys.stderr)
+            if t["status"] == "done":
+                settled.append(final)
+            if kind == "EPIC" and t["status"] in ("todo", "blocked", "scheduled") and d["parents"]:
+                waiting_epics.append(tid)
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card ops failure
+            retry = True
+            print(f"devflow: ops failed for {board}/{tid}: {err}", file=sys.stderr)
+    # Phase 2–4: PR judgments, held-card release, and question/triage routing run independently and
+    # before slow EPIC plan checks; one failing phase never blocks the others.
+    try:
+        retry = bool(tick_prs(board, repo, tasks)) or retry
+    except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate PR judgment phase
+        retry = True
+        print(f"devflow: tick_prs failed for {board}: {err}", file=sys.stderr)
+    try:
+        release_held(board, st)
+    except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate held-card release
+        retry = True
+        print(f"devflow: release_held failed for {board}: {err}", file=sys.stderr)
+    try:
+        retry = bool(route_questions(board, st)) or retry
+    except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate question routing
+        retry = True
+        print(f"devflow: route_questions failed for {board}: {err}", file=sys.stderr)
+    # Phase 5: plan check when an EPIC waits on a plan that changed since the last check
+    # (dependency block parks the EPIC in todo until its parents finish).
+    for tid in waiting_epics:
+        try:
             cards = plan_cards(board, tid)
             if fixed := repair_bodies(board, tid, cards):
                 kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)} 的 body：照抄的 EPIC AC 改成只寫編號，"
@@ -1546,12 +1652,14 @@ def tick_board(board: str, st: dict) -> bool:
                 rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
                 advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 kanban(board, "comment", tid, "devflow check plan：" + (
-                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（未建 [ADV]：已交 advisor 判斷過，或只是 body 長度，請 orchestrator 自己縮短）")
+                    "\n".join(f"- {f}" for f in rep["findings"]) + (
+                        f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card")
+                        else "（未建 [ADV]：已交 advisor 判斷過，或屬確定性規則提醒，請 orchestrator 自行處理）")
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 plans[tid] = fp
-    tick_prs(board, repo, tasks)
-    release_held(board, st)
-    retry = route_questions(board, st) or retry
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
+            retry = True
+            print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
     del applied[:-1000]
     del settled[:-1000]
     del wake_ops[:-1000]
@@ -1604,7 +1712,6 @@ UNREAD_SOURCES = ("oneshot", "kanban", "subagent", "cron")
 BOT_CHAT = "Bot Chat"
 OPEN = ("todo", "ready", "running", "blocked", "review", "scheduled", "triage")
 CHAT_FIELDS = ("platform", "chat_id", "thread_id", "user_id", "user_id_alt", "chat_type")
-EPIC_REF = re.compile(r"\bEPIC:\s*(t_[0-9a-f]+)")
 
 
 def board_rows(board: str, sql: str, args: tuple = ()) -> list[dict]:
@@ -1725,7 +1832,7 @@ def block_event(board: str, tid: str) -> int | None:
     return rows[0]["id"] if rows and rows[0]["kind"] != "unblocked" else None
 
 
-def route_questions(board: str, st: dict) -> None:
+def route_questions(board: str, st: dict) -> bool:
     asked = st.setdefault("asked", [])
     # block_kind, not the event payload: Hermes re-kinds a dependency block with no open parent.
     tasks = {t["id"]: t for t in board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks")}
@@ -1748,14 +1855,19 @@ def route_questions(board: str, st: dict) -> None:
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
-        if source == "set":
-            move_to_inbox(board, tid, subs, box, readable)
-        elif not any(readable(s) for s in subs.get(tid, [])):
-            chat = epic_chat(tid, tasks, subs, children, readable) or box
-            if chat is None:
-                continue
-            subscribe(board, tid, chat)
-            subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+        try:
+            if source == "set":
+                move_to_inbox(board, tid, subs, box, readable)
+            elif not any(readable(s) for s in subs.get(tid, [])):
+                chat = epic_chat(tid, tasks, subs, children, readable) or box
+                if chat is None:
+                    continue
+                subscribe(board, tid, chat)
+                subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card subscription failure
+            retry = True
+            print(f"devflow: subscribe/inbox failed for {board}/{tid}: {err}", file=sys.stderr)
+            continue
         if not subs.get(tid):
             continue
         # Both go to blocked for a human (Hermes' typed blocks); the person has to be asked, unless the
@@ -1777,10 +1889,11 @@ def route_questions(board: str, st: dict) -> None:
             continue
         # A cursor still before the block means the notifier has not reached it yet: nothing to do.
         if sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+            retry = True
             continue
         asked.append(key)
     del asked[:-1000]
-    ask_assignees(board, {k: v for k, v in tasks.items() if k not in handled}, subs, st)
+    retry = ask_assignees(board, {k: v for k, v in tasks.items() if k not in handled}, subs, st) or retry
     return retry
 
 
@@ -1826,8 +1939,9 @@ def waiting(t: dict) -> bool:
     return t["status"] in ("blocked", "triage") and t["block_kind"] in ASKED
 
 
-def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st: dict) -> None:
+def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st: dict) -> bool:
     asked, routed = st.setdefault("asked_bot", []), st.setdefault("bot_subs", {})
+    retry = False
     dest = {tid: waiting(t) and profile_bot_chat(t.get("assignee") or "default") for tid, t in tasks.items()}
     for key, r in list(routed.items()):
         b, tid = key.split("/", 1)
@@ -1836,7 +1950,12 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
         # removes a card's subscriptions itself, and unsubscribing a missing one fails the whole tick.
         if not now or (now["platform"], now["chat_id"]) != (r["platform"], r["chat_id"]):
             if any((s["platform"], s["chat_id"]) == (r["platform"], r["chat_id"]) for s in subs.get(tid, [])):
-                kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
+                try:
+                    kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+                    retry = True
+                    print(f"devflow: notify-unsubscribe failed for {board}/{tid}: {err}", file=sys.stderr)
+                    continue
             del routed[key]
     for tid, t in tasks.items():
         chat = dest[tid]
@@ -1847,7 +1966,12 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
         same = lambda s: (s["platform"], s["chat_id"]) == (chat["platform"], chat["chat_id"])  # noqa: E731
         sub = next((s for s in subs.get(tid, []) if same(s)), None)
         if sub is None:
-            subscribe(board, tid, chat, t["assignee"])
+            try:
+                subscribe(board, tid, chat, t["assignee"])
+            except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card bot subscribe failure
+                retry = True
+                print(f"devflow: bot subscribe failed for {board}/{tid}: {err}", file=sys.stderr)
+                continue
             routed[f"{board}/{tid}"] = {"platform": chat["platform"], "chat_id": chat["chat_id"], "profile": t["assignee"]}
             sub = next((s for s in board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
                         if same(s)), None)
@@ -1855,9 +1979,11 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
                 continue
         at = board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (ev,))[0]["created_at"]
         if not delivered(sub, ev, at) and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+            retry = True
             continue
         asked.append(f"{board}/{tid}/{ev}/{chat['chat_id']}")
     del asked[:-1000]
+    return retry
 
 
 # --- a block that is a workflow problem goes to the orchestrator, not the user ---------------------
@@ -1971,7 +2097,7 @@ def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: s
     res = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
               "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"flow-{tid}-{ev}",
               "--created-by", "devflow-tick"], check=False)
-    m = re.search(r"t_[0-9a-f]{8}", res.stdout) if res.returncode == 0 else None
+    m = TASK_ID_RE.search(res.stdout) if res.returncode == 0 else None
     if m is None:
         print(f"devflow: [ADJ] for {board}/{tid} not created, asking the user: {(res.stderr or res.stdout).strip()[-300:]}",
               file=sys.stderr)
@@ -1998,7 +2124,7 @@ def open_triage_adj(board: str, tid: str, t: dict, ev: int, blocked_children: li
     res = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
               "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"triage-{tid}-{ev}",
               "--created-by", "devflow-tick"], check=False)
-    m = re.search(r"t_[0-9a-f]{8}", res.stdout) if res.returncode == 0 else None
+    m = TASK_ID_RE.search(res.stdout) if res.returncode == 0 else None
     if m is None:
         print(f"devflow: [ADJ] for stalled triage {board}/{tid} not created: {(res.stderr or res.stdout).strip()[-300:]}",
               file=sys.stderr)
@@ -2904,13 +3030,29 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
 
 def advisor_verdict(board: str, rec: dict) -> str | None:
     """`ok` / `revise` from the done [ADV] card for this fingerprint; `missing` when it finished
-    without one; None while there is no card or it is still open. An archived card, or one opened
-    for another fingerprint, is dropped so the tick opens a new one."""
+    without one; None while there is no card or it is still open. An archived or deleted card, or
+    one opened for another fingerprint, is dropped so the tick opens a new one."""
     if not rec.get("advisor"):
         return None
-    d = json.loads(kanban(board, "show", rec["advisor"], "--json"))
+    try:
+        d = json.loads(kanban(board, "show", rec["advisor"], "--json"))
+    except (SystemExit, Exception) as err:  # noqa: BLE001 - unreadable/missing [ADV] must not crash tick/merge
+        db = BOARDS / board / "kanban.db"
+        missing = False
+        if db.exists():
+            try:
+                missing = not board_rows(board, "SELECT 1 FROM tasks WHERE id = ?", (rec["advisor"],))
+            except Exception:  # noqa: BLE001 - DB unavailable: treat as transient, keep pointer
+                missing = False
+        if missing:
+            update_judgment(f"{rec['repo']}#{rec['pr']}", fp=rec["fingerprint"], advisor=None)
+            rec["advisor"] = None
+        else:
+            print(f"devflow: [ADV] {board}/{rec['advisor']} unreadable: {err}", file=sys.stderr)
+        return None
     if d["task"]["status"] == "archived" or f"fingerprint: {rec['fingerprint']}" not in (d["task"]["body"] or ""):
         update_judgment(f"{rec['repo']}#{rec['pr']}", fp=rec["fingerprint"], advisor=None)
+        rec["advisor"] = None
         return None
     if d["task"]["status"] != "done":
         return None
@@ -2934,7 +3076,7 @@ def ensure_pr_advisor(board: str, rec: dict, epic: str | None) -> dict:
                "--assignee", CARDS["ADV"]["assignee"], "--workspace", "scratch", "--body", body,
                "--idempotency-key", f"adv-pr-{key}-{rec['fingerprint']}", "--created-by", "devflow-judgment",
                "--model", ADVISOR["model"], "--provider", ADVISOR["provider"]]).stdout
-    return update_judgment(key, fp=rec["fingerprint"], advisor=re.search(r"t_[0-9a-f]{8}", out).group(0))
+    return update_judgment(key, fp=rec["fingerprint"], advisor=TASK_ID_RE.search(out).group(0))
 
 
 def publish(rec: dict, verdict: str | None) -> dict:
@@ -2995,32 +3137,42 @@ def card_pr(repo: str, task: dict, show: dict) -> int | None:
 
 
 def epic_of(show: dict) -> str | None:
-    m = re.search(r"EPIC: (t_[0-9a-f]{8})", show["task"]["body"] or "")
-    return m and m.group(1)
+    m = EPIC_REF.search(show["task"]["body"] or "")
+    return m.group(1) if m else None
 
 
-def tick_prs(board: str, repo: str, tasks: list[dict]) -> None:
+def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
     """Judge PR cards in review and publish `devflow-judgment` (their completion requires it), and
     open the [ADV] for any judgment of this board that waits for one (also from `ship merge`)."""
+    retry = False
     for t in tasks:
         if (card_type(t["title"]) not in ("DEV", "OPS") or t["assignee"] != "reviewer"
                 or t["status"] in ("done", "archived")):
             continue
-        d = json.loads(kanban(board, "show", t["id"], "--json"))
-        n = card_pr(repo, t, d)
-        if n is None:
-            continue
         try:
+            d = json.loads(kanban(board, "show", t["id"], "--json"))
+            n = card_pr(repo, t, d)
+            if n is None:
+                continue
             rec, verdict = gate(board, repo, n)
+            if verdict is None:
+                ensure_pr_advisor(board, rec, epic_of(d))
         except DecisionsError as err:
+            retry = True
             print(f"{time.strftime('%FT%T')} {board} {t['id']}: Decisions API 無法使用：{err}", flush=True)
-            continue
-        if verdict is None:
-            ensure_pr_advisor(board, rec, epic_of(d))
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-PR failure
+            retry = True
+            print(f"devflow: tick_prs failed for {board}/{t['id']}: {err}", file=sys.stderr)
     for rec in load_judgments().values():
         if (rec.get("board") == board and rec.get("findings") and not rec.get("advisor")
                 and (rec.get("posted") or [None, None])[1] == "pending"):
-            ensure_pr_advisor(board, rec, None)
+            try:
+                ensure_pr_advisor(board, rec, None)
+            except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-judgment failure
+                retry = True
+                print(f"devflow: ensure_pr_advisor failed for {board}/{rec.get('repo')}#{rec.get('pr')}: {err}",
+                      file=sys.stderr)
+    return retry
 
 
 def cmd_check_pr(a) -> None:

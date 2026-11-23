@@ -876,6 +876,68 @@ class RouteQuestions(unittest.TestCase):
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(resumed), 1)
 
+    def test_tick_key_changes_when_pr_judgments_changes(self):
+        """#4: teams-transcription t_6d121ad4 (ev 897): check pr wrote pr-judgments.json while kanban.db stayed idle."""
+        key1 = self.df.tick_key("b")
+        self.df.JUDGMENTS.write_text(json.dumps({"o/r#7": {"board": "b", "findings": ["x"], "advisor": None}}))
+        key2 = self.df.tick_key("b")
+        self.assertNotEqual(key1, key2)
+
+    def test_tick_board_runs_devflow_ops_before_check_plan_and_isolates_phase_failures(self):
+        """#1b & #5: [ADJ] devflow-ops must run before slow EPIC check_plan, and an EPIC check_plan failure
+        must not abort tick_prs or route_questions."""
+        order = []
+        epic = {"id": "t_ep01", "title": "[EPIC] e", "assignee": "orchestrator", "status": "todo"}
+        adj = {"id": "t_adj1", "title": "[ADJ] fix", "assignee": "orchestrator", "status": "running"}
+        ops_body = "```devflow-ops\n[{\"op\": \"assign\", \"task\": \"t_x\", \"to\": \"devops\"}]\n```"
+
+        def kanban(board, cmd, *args):
+            if cmd == "list":
+                return json.dumps([epic, adj])   # EPIC listed before ADJ, like real Hermes
+            if cmd == "show":
+                if args[0] == "t_ep01":
+                    return json.dumps({"task": epic, "parents": ["t_ship"], "comments": []})
+                return json.dumps({"task": adj, "parents": [], "comments": [{"author": "orchestrator", "created_at": 1, "body": ops_body}]})
+            return ""
+        self.df.kanban = kanban
+        self.df.apply_op = lambda board, op: order.append("devflow-ops") or "ok"
+        self.df.tick_prs = lambda board, repo, tasks: order.append("tick_prs") or False
+        self.df.release_held = lambda board, st: order.append("release_held")
+        self.df.route_questions = lambda board, st: order.append("route_questions") or False
+        self.df.plan_cards = lambda board, eid: order.append("check_plan") or (_ for _ in ()).throw(SystemExit(1))
+        with redirect_stderr(io.StringIO()):
+            retry = self.df.tick_board("b", self.st)
+        self.assertEqual(order, ["devflow-ops", "tick_prs", "release_held", "route_questions", "check_plan"])
+        self.assertTrue(retry)
+
+    def test_route_questions_isolates_subscribe_failure_and_propagates_replay_retry(self):
+        """#6: one card failing subscribe must not skip later cards; lost replay_from CAS must signal retry."""
+        self.board.card("t_bad", "[DEV] bad", assignee="developer")
+        self.board.card("t_good", "[SHIP] good", assignee="devops")
+        ev = self.board.block("t_good")
+        orig_kanban = self.df.kanban
+
+        def flaky_kanban(board, cmd, tid, *args):
+            if tid == "t_bad" and cmd == "notify-subscribe":
+                raise SystemExit(1)
+            return orig_kanban(board, cmd, tid, *args)
+        self.df.kanban = flaky_kanban
+        self.df.replay_from = lambda *a: False
+        with redirect_stderr(io.StringIO()):
+            retry = self.df.route_questions("b", self.st)
+        self.assertTrue(retry)
+        # t_good was still subscribed despite t_bad failing.
+        subs = [r[0] for r in self.board.db.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id='t_good'")]
+        self.assertIn("local-inbox", subs)
+        self.assertIn("local-devops", subs)
+        # After CAS succeeds and t_bad stops failing, retry clears and notification delivers.
+        self.df.kanban = orig_kanban
+        self.df.replay_from = self.replay_from
+        retry2 = self.df.route_questions("b", self.st)
+        self.assertFalse(retry2)
+        self.board.notify()
+        self.assertIn(("t_good", ev, "local-inbox"), self.board.sent)
+
 
 if __name__ == "__main__":
     unittest.main()

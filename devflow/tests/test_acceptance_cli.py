@@ -525,21 +525,24 @@ class PlanUnjudged(Case):
         self.assertEqual(["beyond_said" in a for a in asked], [False, True])
         self.assertEqual([any("beyond_said" in f for f in r["findings"]) for r in (plain, said)], [False, True])
 
-    def test_a_long_body_is_reported_but_opens_no_advisor(self) -> None:
-        """teams-transcription t_8f869670 / t_5ea4b8e4 (2026-11-19): two [ADV] runs only for body length."""
+    def test_deterministic_schema_findings_do_not_open_an_advisor_only_manual_and_risks_do(self) -> None:
+        """#2: deterministic schema errors (body length, missing goal_mode, assignee) stay in findings/EPIC
+        comments and never open an Opus [ADV]; [manual] ACs and Decisions risks still open one."""
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.0} for q in qs}
         long = self.df.body_problem("SHIP", "[SHIP] s", "x" * 1600)
-        other = "t_dev：沒有 goal_mode"
-        self.df.plan_rules = lambda board, epic, cards: [f"t_ship：{long}"]
+        schema_other = "t_dev: [DEV] 沒有 goal_mode"
+        manual = f"{EPIC}: AC-3 標為 [manual]，無法自動驗證：請 advisor 確認確實無法寫成情境，並指定證據"
+        self.df.plan_rules = lambda board, epic, cards: [f"t_ship: {long}", schema_other]
         self.df.readiness_rules = lambda board, cards: []
         opened = []
         self.df.open_advisor_card = lambda board, epic, cards, findings, risky: opened.append(findings) or "t_adv"
         cards = {EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator", "parents": []}}
         rep = self.df.check_plan("b", EPIC, advise=True, cards=cards)
-        self.assertEqual((rep["findings"], opened), ([f"t_ship：{long}"], []))
-        self.df.plan_rules = lambda board, epic, cards: [f"t_ship：{long}", other]
+        self.assertEqual((rep["findings"], opened), ([f"t_ship: {long}", schema_other], []))
+        # A [manual] AC finding (advisory) DOES open an [ADV], without dragging the schema errors in.
+        self.df.plan_rules = lambda board, epic, cards: [f"t_ship: {long}", schema_other, manual]
         self.df.check_plan("b", EPIC, advise=True, cards=cards)
-        self.assertEqual(opened, [[other]])   # a real rule finding still goes, without the length one
+        self.assertEqual(opened, [[manual]])
 
 
 class PlanShipGate(Case):
