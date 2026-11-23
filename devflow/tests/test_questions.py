@@ -938,6 +938,133 @@ class RouteQuestions(unittest.TestCase):
         self.board.notify()
         self.assertIn(("t_good", ev, "local-inbox"), self.board.sent)
 
+    def test_tick_board_opens_plan_adj_for_actionable_rules_on_sleeping_epic_and_dedups(self):
+        """Item 1: actionable deterministic findings on a sleeping EPIC wake orchestrator via one [ADJ]
+        instead of commenting into a sleeping dependency-blocked EPIC; body-length reminders do not."""
+        epic = {"id": "t_ep01", "title": "[EPIC] e", "assignee": "orchestrator", "status": "todo",
+                "body": "## 驗收\n- AC-1 [manual] m", "workspace_kind": "dir", "parents": ["t_dev1"], "children": []}
+        dev = {"id": "t_dev1", "title": "[DEV] d", "assignee": "devops", "status": "ready",
+               "body": "## 目標\nd\n覆蓋：AC-1\nEPIC: t_ep01", "workspace_kind": "worktree", "parents": [], "children": ["t_ep01"]}
+        created = []
+
+        def kanban(board, cmd, *args):
+            if cmd == "list":
+                return json.dumps([epic, dev])
+            if cmd == "show":
+                return json.dumps({"task": epic, "parents": ["t_dev1"], "comments": []})
+            return ""
+        self.df.kanban = kanban
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+        plan = {"t_ep01": epic, "t_dev1": dev}
+        self.df.plan_cards = lambda board, eid: plan
+        self.df.repair_bodies = lambda board, eid, cards: []
+        self.df.check_plan = lambda board, eid, **kw: {
+            "findings": ["t_dev1: [DEV] assignee 應為 developer，現在是 devops"],
+            "actionable_rules": ["t_dev1: [DEV] assignee 應為 developer，現在是 devops"],
+            "advised": [], "note": "",
+        }
+        orig_run = self.df.run
+
+        def fake_run(cmd, **kw):
+            if "create" in cmd:
+                created.append(cmd)
+                return types.SimpleNamespace(returncode=0, stdout=f"Created t_adj{len(created):05d}\n", stderr="")
+            return orig_run(cmd, **kw)
+        self.df.run = fake_run
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        self.assertIn("[ADJ] 計畫規則修正 t_ep01", created[0])
+        # Second tick while t_adj00001 is still ready (and even if another card's body changes): must NOT open a duplicate [ADJ].
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        plan["t_dev1"]["body"] = "## 目標\nedited"
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        # If t_adj00001 finishes (`done`) WITHOUT fixing the rule (and without clearing st["plans"]),
+        # the next tick_board must invalidate/re-evaluate and schedule a 2nd repair [ADJ].
+        plan["t_adj00001"]["status"] = "done"
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
+        # Once the 2nd plan-repair [ADJ] also completes (`done`) without resolving (still without clearing st["plans"]),
+        # the next tick_board escalates to a durable needs_input block on the EPIC instead of silently caching.
+        self.board.card("t_ep01", "[EPIC] e", status="todo", assignee="orchestrator")
+        plan["t_adj00002"]["status"] = "done"
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
+        self.assertEqual(plan["t_ep01"]["block_kind"], "needs_input")
+        row = self.board.db.execute("SELECT status, block_kind FROM tasks WHERE id='t_ep01'").fetchone()
+        self.assertEqual(row, ("blocked", "needs_input"))
+        # Subsequent tick while the EPIC is blocked on needs_input is a no-op.
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
+        # Body-length-only findings (actionable_rules=[]) never open an [ADJ].
+        self.st["plans"].clear()
+        self.st["plan_adj"].clear()
+        self.df.check_plan = lambda board, eid, **kw: {
+            "findings": ["t_dev1: body 1600 字（上限 1500）"],
+            "actionable_rules": [], "advised": [], "note": "",
+        }
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
+        # An existing dependency-waiting `todo` [ADJ] cannot wake on a comment: open_plan_adj must schedule
+        # a new runnable [ADJ] instead of commenting on the sleeping `todo` [ADJ].
+        calls = []
+        self.df.run = lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(
+            returncode=0, stdout="Created t_adj00003\n", stderr="")
+        cards_with_sleeping_adj = {
+            "t_ep01": dict(epic),
+            "t_dev1": dict(dev),
+            "t_adj_sleep": {"id": "t_adj_sleep", "title": "[ADJ] existing", "status": "todo", "parents": ["t_dev1"]},
+        }
+        st2 = {}
+        res = self.df.open_plan_adj("b", "t_ep01", cards_with_sleeping_adj, ["t_dev1: wrong assignee"], st2)
+        self.assertEqual(res, ("t_adj00003", False))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("create", calls[0])
+
+    def test_release_rate_limited_advisors_clears_override_and_resumes_once(self):
+        """Item 5: an [ADV] stuck in rate_limit_cooldown on a pinned provider clears override and resumes,
+        and retries resume on the next tick if set-model succeeded but resume transiently failed."""
+        self.board.db.execute("ALTER TABLE tasks ADD COLUMN provider_override TEXT")
+        self.board.db.execute(
+            "INSERT INTO tasks (id, title, body, status, block_kind, assignee, provider_override) VALUES (?,?,?,?,?,?,?)",
+            ("t_adv1", "[ADV] PR 判斷 o/r#13", "fingerprint: abc", "ready", None, "default", "copilot"))
+        self.board.event("t_adv1", "respawn_guarded", {"reason": "rate_limit_cooldown"})
+        self.board.db.commit()
+        cleared, resumed = [], []
+        orig_kanban = self.df.kanban
+
+        def kanban(board, cmd, *args):
+            if cmd == "set-model":
+                cleared.append(args)
+                self.board.db.execute("UPDATE tasks SET provider_override=NULL WHERE id=?", (args[0],))
+                self.board.db.commit()
+                return ""
+            return orig_kanban(board, cmd, *args)
+        self.df.kanban = kanban
+        fail_once = [True]
+
+        def flaky_resume(board, tid, note=""):
+            if fail_once[0]:
+                fail_once[0] = False
+                raise SystemExit(1)
+            resumed.append((board, tid, note))
+        self.df.resume = flaky_resume
+        with redirect_stderr(io.StringIO()):
+            self.assertTrue(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(cleared, [("t_adv1", "none")])
+        self.assertEqual(resumed, [])
+        # Second tick: provider_override is already NULL in DB, but pending recovery retries resume and completes.
+        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(cleared, [("t_adv1", "none")])   # set-model not called a second time
+        self.assertEqual([r[:2] for r in resumed], [("b", "t_adv1")])
+        # Third tick: completely settled, no-op.
+        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(len(resumed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

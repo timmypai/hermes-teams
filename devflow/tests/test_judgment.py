@@ -426,6 +426,30 @@ class Tick(JudgmentCase):
         self.assertIsNone(rec["advisor"])            # in-memory rec synced so gate()/ensure_pr_advisor sees it immediately
         self.assertIsNone(self.record()["advisor"])
 
+    def test_tick_prs_archives_superseded_open_pr_advisor_cards(self) -> None:
+        """Item 5: teams-transcription PR #13 left old-head [ADV] t_a34f8867 running alongside t_8d25cd59."""
+        self.f.answers = {"unlabeled_fix": 0.9}
+        rec = self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", fp=rec["fingerprint"], advisor="t_newadv")
+        self.f.cards["t_oldadv"] = {"status": "ready", "body": f"PR: {self.f.pr['url']}\nfingerprint: 000000000000\n"}
+        self.f.cards["t_newadv"] = {"status": "ready", "body": f"PR: {self.f.pr['url']}\nfingerprint: {rec['fingerprint']}\n"}
+        archived = []
+        orig_kanban = self.df.kanban
+
+        def kanban(board, cmd, *args):
+            if cmd == "archive":
+                archived.append(args[0])
+                self.f.cards[args[0]]["status"] = "archived"
+                return ""
+            return orig_kanban(board, cmd, *args)
+        self.df.kanban = kanban
+        tasks = [
+            {"id": "t_oldadv", "title": f"{self.df.PR_ADVISOR_TITLE}{REPO}#7", "assignee": "default", "status": "ready"},
+            {"id": "t_newadv", "title": f"{self.df.PR_ADVISOR_TITLE}{REPO}#7", "assignee": "default", "status": "ready"},
+        ]
+        self.assertFalse(self.df.tick_prs("b", REPO, tasks))
+        self.assertEqual(archived, ["t_oldadv"])
+
 
 if __name__ == "__main__":
     unittest.main()

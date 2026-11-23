@@ -77,6 +77,11 @@ gh pr checks --watch          # 等 CI；紅燈 → 修 → push → 再等
 - `crap.txt` 全部 `Cov% 0.0` 或 `mutate.txt` 全是 UNCOVERED，通常是工具找不到這個 repo 的測試：加可執行的 `.devflow/coverage.sh`，用 repo 自己的測試指令產生 LCOV 到 `target/coverage/<語言>/lcov.info`（Go 是 `coverage.out`），`quality.sh` 會改讀它。
 - CI 的 `verify`／`verify-base` 失敗：`gh run view <id> --log-failed` 看哪個情境、哪一段；`gh run download <id>` 取證據（`acceptance-matrix.md`、`acceptance.json`、`acceptance-base.json`、截圖 `shots/`、步驟輸出 `logs/`）與 `devflow-diagnostics-pr-<sha>`（容器狀態、退出碼、log）。修到綠。
 - CI 失敗修到綠；若是 runner/基礎設施問題（非程式碼），在 handoff 註明並照樣送 review，由 devops 處理。
+- **送審前確定性自檢（一次就做對）**：`gh pr checks --watch` 綠燈後、呼叫 `kanban_request_review` 之前，若本卡有 `Covers:` 可執行情境，先跑一次唯讀自檢：
+  ```bash
+  /opt/data/devflow/bin/devflow check acceptance <slug> <EPIC> --pr <PR號> --review --json
+  ```
+  確認 `Covers:` 的每個情境 ID 存在於 EPIC、Given/When/Then 步驟文字與 EPIC 一字不差、head `verify` 通過且 `verify-base` 為紅燈（或豁免格式正確）。若自檢非 0（除 Decisions API 暫時無法使用的 `UNJUDGED` exit 3 外），當場在同一回合修好並重跑 CI 後再送審，不要把確定性不符丟給 reviewer 退件。
 
 ## 5.5 除錯迴圈（整合層問題、部署後才出現的 bug）
 Hermes 容器沒有 Docker，整合層的重現跑在 GitHub-hosted 的 `repro.yml`，不碰正式主機。照 `diagnosing-bugs`：先有會紅的重現，再假設、再修。
