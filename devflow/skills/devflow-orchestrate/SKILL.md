@@ -99,7 +99,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 - `[ADJ]` 卡不要跟要修的卡 link（不論 parent 或 child），否則互等。
 - 執行失敗（gave_up / crash）：找出根因並修掉（設定、卡片 body、換 assignee、拆小）；能用一次真實小測試證明修好就做。
 - 根因是 Hermes 原生限制時：照 README「Hermes 原生限制與對應」處理；沒有對應就 `kanban_complete` 寫明限制與建議，不建修 Hermes 程式或 image 的卡，也不在 `/opt/data/projects/<slug>` 以外建工作區（`check plan` 會列為問題）。使用者同意「處理這個問題」不等於同意改 Hermes。
-- 標題 `[ADJ] 流程阻塞 t_x` 是 dispatcher tick 自動建的：worker 用 needs_input/capability 問了不是使用者能決定的事（工具、權限、卡片寫法、交接卡住）。照上面找根因修掉，最後用 `devflow-ops` 的 `resume`（note 寫明改了什麼、worker 下一步做什麼）。真的要使用者決定時才在本卡 `kanban_block(kind="needs_input")`。本卡還沒完成時，同一張卡再被擋，tick 不另建 `[ADJ]`，會把新問題留言到本卡：一併處理。
+- 標題 `[ADJ] 流程阻塞 t_x` 是 dispatcher tick 自動建的：worker 用 needs_input/capability 問了不是使用者能決定的事（工具、權限、卡片寫法、交接卡住），或有張沒有 block 事件的 `triage` 卡擋住下游未完成卡片。照上面找根因修掉，最後用 `devflow-ops` 的 `resume`（note 寫明改了什麼、worker 下一步做什麼；對 `triage` 卡會移出 `triage` 進入 `ready`/`todo`）。真的要使用者決定時才在本卡 `kanban_block(kind="needs_input")`。本卡還沒完成時，同一張卡再被擋，tick 不另建 `[ADJ]`，會把新問題留言到本卡：一併處理。
 - `[DEV]`/`[OPS]` 沒送審就 done（runs 沒有 `review_requested`，PR 沒有獨立 review）：Hermes 不能把 done 的卡移回 review 欄，`resume` 也不行。建一張接續卡：同標題前綴、同 assignee、`goal_mode=true`、`workspace_path`=舊卡的 worktree、parents 同舊卡，body `## 目標` 寫「接續 t_old：PR #N 已開、CI 綠，修正已完成；確認 exact head 後送審」，`## 本卡完成` 照固定文字。用 `devflow-ops`：`link <接續卡> <舊卡每個 child>`、`unlink <舊卡> <child>`。不另建審查卡或新 `[SHIP]`。
 - 卡片本身卡死（例如在不能設 required checks 的 repo 上設了 PR `completion_contract`，完成被 Hermes gate 拒絕；這類設定建立後不能改）：建替代卡（同 assignee、同 `workspace_kind`，worktree 用 `workspace_path`=舊卡 worktree，不設 contract），body 寫「接續 t_old：已完成什麼、剩什麼」；用 `devflow-ops`：對舊卡每個 child `link <新卡> <child>`、`unlink <舊卡> <child>`，最後 `archive <舊卡>`。
 - 要重跑的卡：`devflow-ops` 的 `resume`。不要為此 `kanban_block`。

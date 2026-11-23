@@ -623,6 +623,89 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual(sorted(self.board.sent), [("t_dev", ev_dev, "local-inbox"), ("t_res", ev_res, "local-inbox")])
         self.assertEqual([p["ask_in"] for p in self.df.pending()], ["default", "default"])
 
+    # --- stalled triage cards blocking downstream work go to an [ADJ] ----------------------------
+    def _stalled_triage_chain(self) -> tuple[str, int]:
+        """t_dev (triage, no block) -> t_ship (todo, dependency) -> epic (todo, dependency)."""
+        epic = "t_e05c0ffe"
+        self.board.card(epic, "[EPIC] goal", status="todo", assignee="orchestrator")
+        self.board.card("t_ship", "[SHIP] s", status="todo", assignee="devops")
+        self.board.db.execute("UPDATE tasks SET block_kind='dependency' WHERE id IN (?, 't_ship')", (epic,))
+        self.board.card("t_dev", "[DEV] fix", body=f"EPIC: {epic}\nwait for orchestrator", status="triage", assignee="developer")
+        created_ev = self.board.db.execute("SELECT MAX(id) FROM task_events WHERE task_id='t_dev'").fetchone()[0]
+        self.board.db.executemany("INSERT INTO task_links VALUES (?,?)", [("t_dev", "t_ship"), ("t_ship", epic)])
+        self.board.db.commit()
+        return epic, created_ev
+
+    def test_a_triage_card_blocking_downstream_work_opens_one_adj(self):
+        """teams-transcription t_46ded1b5 -> t_12402f67 (2026-11-22): triage with no block stalled silently."""
+        epic, ev = self._stalled_triage_chain()
+        judged, created = self._flow(0.9)
+        self.tick()
+        self.board.event("t_dev", "edited", {"fields": ["body"]})    # e.g. tick's repair_bodies must not re-fire
+        self.tick()
+        self.assertEqual(judged, [])
+        self.assertEqual(len(created), 1)
+        cmd = created[0]
+        self.assertEqual(cmd[5], "[ADJ] 流程阻塞 t_dev")
+        self.assertEqual(cmd[cmd.index("--assignee") + 1], "orchestrator")
+        self.assertEqual(cmd[cmd.index("--idempotency-key") + 1], f"triage-t_dev-{ev}")
+        self.assertEqual(cmd[cmd.index("--created-by") + 1], "devflow-tick")
+        body = cmd[cmd.index("--body") + 1]
+        self.assertIn(f"EPIC: {epic}", body)
+        self.assertIn("處理：t_dev", body)
+        self.assertIn("t_ship", body)
+        self.assertEqual(self.board.sent, [])
+
+    def test_a_standalone_triage_card_without_open_children_does_not_open_adj(self):
+        self.board.card("t_draft", "[DEV] draft", status="triage", assignee="developer")
+        self.board.card("t_done_child", "[SHIP] old", status="done", assignee="devops")
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_draft', 't_done_child')")
+        self.board.db.commit()
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+
+    def test_a_triage_card_waiting_on_block_kind_uses_flow_blocks_not_stalled_triage(self):
+        self._stalled_triage_chain()
+        self.board.db.execute("UPDATE tasks SET block_kind='needs_input' WHERE id='t_dev'")
+        self.board.event("t_dev", "block_loop_detected", {"kind": "needs_input", "reason": "問題：請決定？"})
+        judged, created = self._flow(0.9)   # user question: flow_blocks must NOT open [ADJ], stalled_triage must skip
+        self.tick()
+        self.assertEqual(len(judged), 1)
+        self.assertEqual(created, [])
+
+    def test_a_stalled_triage_card_with_an_open_adj_gets_a_comment_not_a_second_adj(self):
+        epic, _ = self._stalled_triage_chain()
+        self.board.card("t_adj0", "[ADJ] 收斂", body=f"EPIC: {epic}\n處理：t_dev\n內文", status="running", assignee="orchestrator")
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertIn("t_dev", self.comments[0][1])
+        self.assertIn("t_ship", self.comments[0][1])
+
+    def test_a_stalled_triage_card_retries_create_failure_and_respects_adj_cap(self):
+        self._stalled_triage_chain()
+        _, created_fail = self._flow(0.05, create_ok=False)
+        with redirect_stderr(io.StringIO()):
+            self.tick()
+        self.assertEqual(len(created_fail), 1)
+        self.assertEqual(self.st.get("triage"), {})                 # transient failure is retried next tick
+        _, created_ok = self._flow(0.05, create_ok=True)
+        self.tick()
+        self.assertEqual(len(created_ok), 1)
+
+        # Second card already repaired by ADJ_PER_CARD [ADJ]s: do not open a third.
+        self.board.card("t_dev2", "[DEV] fix 2", status="triage", assignee="developer")
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_dev2', 't_ship')")
+        self.board.card("t_a1", "[ADJ] 流程阻塞 t_dev2", status="done", assignee="orchestrator")
+        self.board.card("t_a2", "[ADJ] 處理失敗卡 t_dev2", status="done", assignee="orchestrator")
+        self.board.db.commit()
+        _, created_cap = self._flow(0.05, create_ok=True)
+        self.tick()
+        self.assertEqual(created_cap, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1715,6 +1715,7 @@ def route_questions(board: str, st: dict) -> None:
         return (s["platform"], s["chat_id"]) in people
 
     handled = flow_blocks(board, tasks, children, st)
+    stalled_triage(board, tasks, children, st)
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
@@ -1921,6 +1922,69 @@ def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: s
         print(f"devflow: [ADJ] for {board}/{tid} not created, asking the user: {(res.stderr or res.stdout).strip()[-300:]}",
               file=sys.stderr)
     return m.group(0) if m else None
+
+
+def triage_event(board: str, tid: str) -> int:
+    """Latest lifecycle event that put `tid` in triage (excludes body edits such as tick's repair_bodies)."""
+    rows = board_rows(board, "SELECT id FROM task_events WHERE task_id = ? AND kind IN "
+                             "('created', 'status', 'triage') ORDER BY id DESC LIMIT 1", (tid,))
+    return rows[0]["id"] if rows else 0
+
+
+def open_triage_adj(board: str, tid: str, t: dict, ev: int, blocked_children: list[str], epic: str | None) -> str | None:
+    """Open an [ADJ] for the orchestrator when a non-blocked triage card stalls downstream open cards."""
+    body = ((f"EPIC: {epic}\n" if epic else "") + f"處理：{tid}\n\n" +
+            f"## 目標\n{tid}（{t['title']}）停在 `triage` 且沒有 block 事件，但下游卡片"
+            f"（{', '.join(sorted(blocked_children))}）正在等它完成；dispatcher 不會認領 `triage` 卡，依賴鏈已停住。"
+            "確認規格、路由與接手者，讓它離開 `triage` 開始執行（或以替代卡接替並封存）。\n\n"
+            "## 做法\n照 devflow-orchestrate「C. 調整」：讀本卡指到的卡片、其下游卡與 EPIC 留言；"
+            "需要改寫 body、換 assignee 或移出 `triage` 時，用 `devflow-ops`（`edit`、`assign`、`resume`；"
+            "`resume` 會把 `triage` 卡移出並依 parent 狀態轉為 `ready` 或 `todo`）。不要把本 `[ADJ]` link 到它或下游卡。"
+            "真的需要使用者決定時，才在本卡 kanban_block(kind=\"needs_input\") 問他。")
+    res = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
+              "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"triage-{tid}-{ev}",
+              "--created-by", "devflow-tick"], check=False)
+    m = re.search(r"t_[0-9a-f]{8}", res.stdout) if res.returncode == 0 else None
+    if m is None:
+        print(f"devflow: [ADJ] for stalled triage {board}/{tid} not created: {(res.stderr or res.stdout).strip()[-300:]}",
+              file=sys.stderr)
+    return m.group(0) if m else None
+
+
+def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> None:
+    """A non-waiting `triage` card with open downstream children stalls the dependency chain silently:
+    Hermes never dispatches `triage`, and without a `needs_input`/`capability` block neither `flow_blocks`
+    nor notifications fire (teams-transcription t_46ded1b5 -> t_12402f67, 2026-11-22). Open one [ADJ] for
+    the orchestrator (or comment on its live [ADJ]), bounded by ADJ_PER_CARD."""
+    seen = st.setdefault("triage", {})
+    for tid, t in tasks.items():
+        if t["status"] != "triage" or waiting(t) or card_type(t["title"]) in ("EPIC", "ADJ"):
+            continue
+        blocked_children = [c for c in children.get(tid, []) if tasks.get(c, {}).get("status") in OPEN]
+        if not blocked_children:
+            continue
+        ev = triage_event(board, tid)
+        key = f"{board}/{tid}/{ev}"
+        if key in seen:
+            continue
+        laps = adjs_for(tid, tasks)
+        if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
+            res = run([HERMES, "kanban", "--board", board, "comment", live,
+                       f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"],
+                      check=False)
+            if res.returncode == 0:
+                seen[key] = live
+            else:
+                print(f"devflow: stalled triage notice for {board}/{tid} not posted to {live}: "
+                      f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
+        elif len(laps) >= ADJ_PER_CARD:
+            seen[key] = "cap"
+        else:
+            adj = open_triage_adj(board, tid, t, ev, blocked_children, next(owning_epics(tid, tasks, children), None))
+            if adj:
+                seen[key] = adj
+    for k in list(seen)[:-1000]:
+        del seen[k]
 
 
 def chat_receipt(profile: str, chat_id: str, tid: str, since: float) -> dict:
