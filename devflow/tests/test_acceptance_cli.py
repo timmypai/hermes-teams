@@ -594,6 +594,47 @@ class PlanShipGate(Case):
         self.df.check_plan("b", EPIC, advise=True, cards=cards)
         self.assertEqual(self.links, [])
 
+    def test_scope_risks_rearm_for_new_work_cards_and_gate_pending_ships(self) -> None:
+        """Items 2 & 3: beyond_said/scope_creep must re-arm when new cards join (not permanently muted after
+        first firing) and must gate pending [SHIP] cards; BEYOND_SAID inspects cards too."""
+        self.assertIn("cards", self.df.BEYOND_SAID[1])
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"name": q["name"], "probability": 0.9 if q["name"] == "beyond_said" else 0.0} for q in qs}
+        epic_said = {"title": "[EPIC] e", "body": f"{BODY}\n## 使用者原話\n只部署並登入", "status": "todo",
+                     "assignee": "orchestrator", "parents": ["t_s1"]}
+        cards1 = {
+            EPIC: epic_said,
+            "t_d1": {"title": "[DEV] d1", "body": f"EPIC: {EPIC}", "status": "ready", "assignee": "developer", "parents": []},
+            "t_s1": {"title": "[SHIP] s1", "body": f"EPIC: {EPIC}", "status": "todo", "assignee": "devops", "parents": ["t_d1"]},
+        }
+        rep1 = self.df.check_plan("b", EPIC, advise=True, cards=cards1)
+        self.assertEqual(rep1.get("advisor_card"), "t_00000001")
+        self.assertIn(("t_00000001", "t_s1"), self.links)   # beyond_said gates pending [SHIP]
+        advised = set(rep1["advised"])
+        # Same cards: no duplicate [ADV].
+        rep2 = self.df.check_plan("b", EPIC, advise=True, cards=cards1, advised=frozenset(advised))
+        self.assertNotIn("advisor_card", rep2)
+        # Adding a brand-new work card t_d2 re-arms beyond_said with a distinct idempotency key.
+        cards2 = {**cards1, "t_d2": {"title": "[OPS] d2", "body": f"EPIC: {EPIC}", "status": "ready", "assignee": "devops", "parents": []}}
+        rep3 = self.df.check_plan("b", EPIC, advise=True, cards=cards2, advised=frozenset(advised))
+        self.assertEqual(rep3.get("advisor_card"), "t_00000002")
+        self.assertNotEqual(self.created[0], self.created[1])
+        self.assertIn(("t_00000002", "t_s1"), self.links)
+
+    def test_actionable_rules_exclude_body_length_and_manual_advisory(self) -> None:
+        """Item 1: check_plan separates actionable structural rules from body-length and [manual] reminders."""
+        self.df.decide = lambda content, qs: {q["name"]: {"name": q["name"], "probability": 0.0} for q in qs}
+        long_msg = f"t_s1: {self.df.body_problem('SHIP', '[SHIP] s1', 'x' * 1600)}"
+        manual_msg = f"{EPIC}: AC-3 標為 [manual]，無法自動驗證：請 advisor 確認確實無法寫成情境，並指定證據"
+        bad_rule = "t_d1: [DEV] assignee 應為 developer，現在是 devops"
+        self.df.plan_rules = lambda board, epic, cards: [long_msg, manual_msg, bad_rule]
+        cards = {
+            EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator", "parents": ["t_s1"]},
+            "t_s1": {"title": "[SHIP] s1", "body": "x" * 1600, "status": "todo", "assignee": "devops", "parents": []},
+        }
+        rep = self.df.check_plan("b", EPIC, advise=False, cards=cards)
+        self.assertEqual(rep["actionable_rules"], [bad_rule])
+
 
 class PrExemption(Case):
     def test_base_exemptions_are_judged(self) -> None:

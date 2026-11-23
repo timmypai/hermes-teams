@@ -223,6 +223,54 @@ class Plan(unittest.TestCase):
         self.cards[DEV] = ("[DEV] d", f"## 目標\nd\n{self.done}## 驗收\n覆蓋：AC-4, AC-6\nEPIC: {EPIC}", [], [SHIP], None)
         self.assertEqual(self.findings("全為 [manual]"), [])
 
+    def test_repair_bodies_enables_goal_mode_in_place_for_pending_dev_ops(self):
+        """Item 1: tick enables goal_mode in place on pending [DEV]/[OPS] instead of archiving/recreating."""
+        self.board(set())  # DEV lacks goal_mode
+        enabled = []
+        self.df.enable_goal_mode = lambda board, tid: enabled.append((board, tid)) or True
+        cards = self.df.plan_cards("b", EPIC)
+        self.assertFalse(cards[DEV]["goal_mode"])
+        fixed = self.df.repair_bodies("b", EPIC, cards)
+        self.assertEqual(enabled, [("b", DEV)])
+        self.assertEqual(fixed, [DEV])
+        self.assertTrue(cards[DEV]["goal_mode"])
+        self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "goal_mode" in f], [])
+
+    def test_ship_accumulating_more_than_two_post_hoc_pr_cards_after_start_is_a_finding(self):
+        """Item 4: teams-transcription t_12402f67 accumulated 8 post-hoc PR cards after starting."""
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                  workspace_kind TEXT, workspace_path TEXT, completion_contract TEXT, created_by TEXT,
+                  result TEXT, goal_mode INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER, started_at INTEGER);
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);""")
+            epic_body = "## 驗收\n- AC-1 [cli] x\n  - S1 s\n    - Given g\n    - When w\n    - Then t\n"
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+                (EPIC, "[EPIC] e", epic_body, "todo", "orchestrator", "dir", str(self.repo), None, "default", None, 0, 100, 100),
+                (SHIP, "[SHIP] s", f"EPIC: {EPIC}", "todo", "devops", "dir", str(self.repo), None, "orchestrator", None, 0, 100, 1000),
+                ("t_pre1", "[DEV] pre1", f"## 目標\na\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "done", "developer", "worktree", str(self.repo), None, "orchestrator", None, 1, 200, 300),
+                ("t_pre2", "[DEV] pre2", f"## 目標\nb\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "done", "developer", "worktree", str(self.repo), None, "orchestrator", None, 1, 250, 350),
+                ("t_pre3", "[DEV] pre3", f"## 目標\nc\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "done", "developer", "worktree", str(self.repo), None, "orchestrator", None, 1, 300, 400),
+                ("t_p1", "[DEV] p1", f"## 目標\np1\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "done", "developer", "worktree", str(self.repo), None, "devops", None, 1, 1100, 1105),
+                ("t_p2", "[OPS] p2", f"## 目標\np2\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "done", "devops", "worktree", str(self.repo), None, "devops", None, 1, 1200, 1205),
+            ])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [
+                ("t_pre1", SHIP), ("t_pre2", SHIP), ("t_pre3", SHIP), ("t_p1", SHIP), ("t_p2", SHIP), (SHIP, EPIC),
+            ])
+        # 3 pre-start + 2 post-start PR cards: within limit (2).
+        cards = self.df.plan_cards("b", EPIC)
+        self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [])
+        # Adding a 3rd post-start PR card triggers the structural whack-a-mole finding.
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "t_p3", "[OPS] p3", f"## 目標\np3\n{self.done}覆蓋：AC-1\nEPIC: {EPIC}", "ready", "devops", "worktree", str(self.repo), None, "devops", None, 1, 1300, None))
+            c.execute("INSERT INTO task_links VALUES (?,?)", ("t_p3", SHIP))
+        cards = self.df.plan_cards("b", EPIC)
+        found = [f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f]
+        self.assertEqual([f.split(":")[0] for f in found], [SHIP])
+        self.assertIn("t_p1, t_p2, t_p3", found[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -938,6 +938,85 @@ class RouteQuestions(unittest.TestCase):
         self.board.notify()
         self.assertIn(("t_good", ev, "local-inbox"), self.board.sent)
 
+    def test_tick_board_opens_plan_adj_for_actionable_rules_on_sleeping_epic_and_dedups(self):
+        """Item 1: actionable deterministic findings on a sleeping EPIC wake orchestrator via one [ADJ]
+        instead of commenting into a sleeping dependency-blocked EPIC; body-length reminders do not."""
+        epic = {"id": "t_ep01", "title": "[EPIC] e", "assignee": "orchestrator", "status": "todo",
+                "body": "## 驗收\n- AC-1 [manual] m", "workspace_kind": "dir", "parents": ["t_dev1"], "children": []}
+        dev = {"id": "t_dev1", "title": "[DEV] d", "assignee": "devops", "status": "ready",
+               "body": "## 目標\nd\n覆蓋：AC-1\nEPIC: t_ep01", "workspace_kind": "worktree", "parents": [], "children": ["t_ep01"]}
+        created = []
+
+        def kanban(board, cmd, *args):
+            if cmd == "list":
+                return json.dumps([epic, dev])
+            if cmd == "show":
+                return json.dumps({"task": epic, "parents": ["t_dev1"], "comments": []})
+            return ""
+        self.df.kanban = kanban
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+        self.df.plan_cards = lambda board, eid: {"t_ep01": epic, "t_dev1": dev}
+        self.df.repair_bodies = lambda board, eid, cards: []
+        self.df.check_plan = lambda board, eid, **kw: {
+            "findings": ["t_dev1: [DEV] assignee 應為 developer，現在是 devops"],
+            "actionable_rules": ["t_dev1: [DEV] assignee 應為 developer，現在是 devops"],
+            "advised": [], "note": "",
+        }
+        orig_run = self.df.run
+
+        def fake_run(cmd, **kw):
+            if "create" in cmd:
+                created.append(cmd)
+                return types.SimpleNamespace(returncode=0, stdout="Created t_adj00001\n", stderr="")
+            return orig_run(cmd, **kw)
+        self.df.run = fake_run
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        self.assertIn("[ADJ] 計畫規則修正 t_ep01", created[0])
+        # Plan fingerprint changes (body edit) with identical actionable_rules: must NOT open a duplicate [ADJ].
+        self.st["plans"].clear()
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        # Body-length-only findings (actionable_rules=[]) never open an [ADJ].
+        self.st["plans"].clear()
+        self.st["plan_adj"].clear()
+        self.df.check_plan = lambda board, eid, **kw: {
+            "findings": ["t_dev1: body 1600 字（上限 1500）"],
+            "actionable_rules": [], "advised": [], "note": "",
+        }
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+
+    def test_release_rate_limited_advisors_clears_override_and_resumes_once(self):
+        """Item 5: an [ADV] stuck in rate_limit_cooldown on a pinned provider clears override and resumes."""
+        self.board.db.execute("ALTER TABLE tasks ADD COLUMN provider_override TEXT")
+        self.board.db.execute(
+            "INSERT INTO tasks (id, title, body, status, block_kind, assignee, provider_override) VALUES (?,?,?,?,?,?,?)",
+            ("t_adv1", "[ADV] PR 判斷 o/r#13", "fingerprint: abc", "ready", None, "default", "copilot"))
+        self.board.event("t_adv1", "respawn_guarded", {"reason": "rate_limit_cooldown"})
+        self.board.db.commit()
+        cleared, resumed = [], []
+        orig_kanban = self.df.kanban
+
+        def kanban(board, cmd, *args):
+            if cmd == "set-model":
+                cleared.append(args)
+                self.board.db.execute("UPDATE tasks SET provider_override=NULL WHERE id=?", (args[0],))
+                self.board.db.commit()
+                return ""
+            return orig_kanban(board, cmd, *args)
+        self.df.kanban = kanban
+        self.df.resume = lambda board, tid, note="": resumed.append((board, tid, note))
+        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(cleared, [("t_adv1", "none")])
+        self.assertEqual([r[:2] for r in resumed], [("b", "t_adv1")])
+        # Second tick after override cleared: no-op.
+        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(len(resumed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
