@@ -45,7 +45,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
        - When 開啟待辦頁
        - Then 看到標題「我的待辦」與「新增」按鈕
    ```
-   Given 寫要先成立的狀態（developer 會在 Given 結尾斷言它），When 只寫一個操作，Then 寫使用者或呼叫端看得到的結果與具體值。情境完整 id 是 `<EPIC id>/AC-n.Sm`；Given/When/Then 文字就是測試步驟名稱，之後要改只能改 EPIC 並讓相關 PR 重跑。用 `devflow-ops` 的 `edit` 改 EPIC body（原文保留在「使用者原話」）；子卡照新編號寫。
+   Given 寫要先成立的狀態（developer 會在 Given 結尾斷言它），When 只寫一個操作，Then 寫使用者或呼叫端看得到的結果與具體值。情境完整 id 是 `<EPIC id>/AC-n.Sm`；Given/When/Then 文字就是測試步驟名稱（若 repo 已維護 `.devflow/scenarios.json`，`check plan` 與 `check acceptance` 會自動從 `.devflow/scenarios.json` 載入情境步驟，EPIC 卡片上只需保留精簡白話 `AC-n` 列表即可；若寫在 EPIC 上也一律用白話描述看得到的動作與結果，不寫 SHA、路徑或內部參數）。用 `devflow-ops` 的 `edit` 改 EPIC body（原文保留在「使用者原話」）；子卡照新編號寫。
    改寫與展開只能**更精確地說使用者要的結果**，不能加使用者沒要求的機制：稽核紀錄、白名單、前後快照、准入檢查、自訂審查政策、專屬帳號或通道都不是 AC，也不寫進「提示」當限制（`check plan` 會把 EPIC 對照「使用者原話」，多出來的列為 `beyond_said`）。「不要動其他服務」就是一條可觀察的結果（例如部署前後其他容器的 ID 與啟動時間不變），不是要建一套隔離系統。使用者明確要求或核准的限制，在「提示」寫成「使用者 <日期> 決定：…」：worker 會把它當成高於 devflow 流程的限制照做（`devflow` skill「誰定流程」），沒有這個標記的提示不能改變流程。
    部署後的服務只綁主機 `127.0.0.1:<port>`；使用者打開它的方式固定是 `devflow repo access <slug>` 的 SSH tunnel（README「部署」）。`[ui]` 情境的 Given 寫「服務已部署」即可，不寫「經核准的安全入口」，也不要求公開網域或 HTTPS；部署後 smoke 在主機上連同一個位址，等同使用者經 tunnel 看到的畫面。不要為入口問使用者。
 2. 判斷 repo 狀態，決定第一段：
@@ -64,17 +64,17 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    - 有 `[SHIP]` 時先做**終點反推的端到端前置盤點**（一次查清，禁止留到 `[SHIP]` 才逐一撞牆打地鼠）：
      1. 跑 `terminal: devflow repo doctor <slug>` 看 `deploy`：`contract-files` 或 `port` 沒過 → 加一張 `[OPS]` 用 PR 修，後面接它自己的 `[SHIP]`；其他 `[DEV]` 的 parent 指向這張 `[SHIP]`，讓每張 `[SHIP]` 都在這張 `[OPS]` 下游。`[OPS]` body 寫出這些項目 id 與 doctor 給的修法（`check plan` 會檢查）。`runner-online`／`runner-request`／`fork-approval` 沒過不用建卡：`[SHIP]` 合併前會擋下並問使用者。
      2. 跑 `terminal: gh secret list -R <OWNER/REPO>`（只看名稱，不讀值）並對照各 AC 的最終驗證步驟：若部署或正式環境操作需要特定腳本（如 `.devflow/ui/ops/<op>.spec.ts`），檢查 repo 是否已存在該腳本；還沒有就**在初始規劃一併排進 `[DEV]` 卡**，不要留給 `[SHIP]` 事後發現才連開補丁 PR。不設計新的部署方式或安全門檻。
-   - 每條 AC 至少一張卡負責；卡片 `## 驗收` 第一行寫「覆蓋：AC-1, AC-3」，只寫編號，不抄 AC 原文（全文在 EPIC，worker 用 `kanban_show` 讀得到；照抄的行 tick 會自動刪掉、留編號）。PR 卡（`[DEV]`/`[OPS]`）覆蓋的 AC 不可全為 `[manual]`（0 個可執行情境會導致 `check acceptance` 的 `Covers:` 核對失敗）。下面只加這張卡自己的技術驗收（最多 5 條）。
-   - 卡片只寫目標與驗收，不寫實作細節；做法交給 architect / developer。
+   - 每條 AC 至少一張卡負責；卡片 `## 驗收` 第一行寫「覆蓋：AC-1, AC-3」，只寫編號，不抄 AC 原文（全文在 EPIC，worker 用 `kanban_show` 讀得到；照抄的行 tick 會自動刪掉、留編號）。PR 卡（`[DEV]`/`[OPS]`）覆蓋的 AC 不可全為 `[manual]`（0 個可執行情境會導致 `check acceptance` 的 `Covers:` 核對失敗）。下面最多補 1–2 句**給人判讀的白話完成結果**，不列技術實作清單、不設 `## 提示` 技術垃圾桶。
+   - **卡片是給人看及判讀的**：標題與內容只寫白話目標與結果，禁止塞入 commit SHA、run ID、檔案路徑、函數/參數名或容器旗標；技術做法交給 architect / developer 在 repo 內完成。
 4. 建卡：
    ```
-   kanban_create(title="[DEV] ...", assignee="developer", workspace_kind="worktree", goal_mode=true,
-                 parents=[...], body="## 目標\n<1-3 句>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\n- <本卡自己的檢查>\n## 提示\n- <相關檔案、指向留言或 run 的連結>\n- EPIC: t_xxxx",
+   kanban_create(title="[DEV] <白話標題：做什麼事>", assignee="developer", workspace_kind="worktree", goal_mode=true,
+                 parents=[...], body="## 目標\n<1-2 句白話：達成什麼使用者看得到的結果>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\nEPIC: t_xxxx",
                  skills=[選用，例如 "tdd"])
    ```
    `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。送審時 Hermes 的 goal judge 只讀 title+body 的前 2000 字，判斷「本卡完成」是否已達成。所以：
    - `## 本卡完成` 一字不改照抄上面那句，緊接在 `## 目標` 後面。不要加「已交 review」「reviewer 已接手」「已批准」「已部署」，也不要寫送審工具名稱：judge 不知道是哪個工具在問，這些在送審時都還沒發生，會永遠拒絕送審（teams-transcription t_6d121ad4；2026-11-19 實測）。改過的文字 dispatcher tick 會自動改回，並在 EPIC 留言。
-   - body 寫短：整份 ≤ 1500 字（`check plan` 檢查，只在 EPIC 留言提醒、不建 `[ADV]`，看到就自己縮短；EPIC 不含 `## 驗收` 與「使用者原話」）。`## 目標` 1-3 句；限制只寫這張卡特有的；共通規則（不自審、不直接部署、不改 Hermes、秘密處理、fail closed）已在 skill，不要抄。不要寫「使用者已同意…不代表…不得…」這類條文，也不要寫實作設計（schema、欄位、步驟）：做法由 developer / devops 決定。
+   - **body 只寫人話且極短**：整份 ≤ 600 字（`check plan` 檢查，不含 `[DEV]`/`[OPS]` 的 `## 本卡完成` 與 EPIC 的 `## 驗收`／`## 使用者原話`／`## 使用者決定`）。`## 目標` 1–2 句白話；**不寫 `## 提示` 技術細節**（不抄 repo 架構、SHA、run ID、socket、seccomp、禁止條文或 schema 步驟；做法由 developer / devops 讀 repo 決定）。
    - body 是規格，不是紀錄：PR 號、head SHA、run id、review id、每一輪試過什麼、誰接手，寫進 `kanban_comment`，body 最多放一行「經過見留言」。改卡（`[ADJ]` 或 `devflow-ops edit`）是**改寫**成目前的規格，不是在後面疊加新段落。
    goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。

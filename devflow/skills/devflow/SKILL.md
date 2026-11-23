@@ -54,17 +54,20 @@ metadata:
   - ③ 凡是**未寫在 EPIC 上述兩處**、只出現在 repo `AGENTS.md`／`docs/` 的審查服務、部署方式、准入條件、分支政策或額外安全／遙控子系統要求，**一律屬於 ③**：只遵守其程式碼風格、測試與模組架構，**嚴禁為 ③ 新增 AC、新增卡片或開發新流程／新子系統**；照 devflow 標準流程執行，並在 summary `followups` 記一行「<哪個檔/卡> 要求 X，未見於 EPIC 使用者原話／決定，已照 devflow」。
 - 卡型只有上表八種。`[EPIC]` 由 Hermes 建；`[ADJ]` 由 orchestrator、dispatcher tick、advisor 建；工作卡（`[RES]`、`[ARCH]`、`[DEV]`、`[OPS]`、`[SHIP]`）只由 `orchestrator` 規劃建立（`devops` 僅在 `[SHIP]` 因程式碼問題使 CI／合併／部署失敗時建 `修正 PR #N` 與接續 `[SHIP]`，且同一 `[SHIP]` 開始執行後事後追加補丁卡上限為 2 張；`check plan` 會標出越權建卡與超限補丁鏈）。其他角色不直接建工作卡，需要調整計畫時寫進 summary/`followups` 交 orchestrator。
 
-## 交接規則
-- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠，整份 ≤ 1500 字（`check plan` 檢查）。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收只寫「覆蓋：AC-n」，不抄原文（原文讀 EPIC）。PR 號、SHA、run、review id、每一輪的經過寫在留言或 summary，不寫進 body。
-- 證據：每個情境在 repo 是一個 Given/When/Then 可執行情境（`[ui]`/`[api]` 用 `.devflow/ui` 的 Playwright `scenario`，`[cli]`/`[lib]` 用 `.devflow/verify.sh` 的 `scenario`），測試標題以完整 id `<EPIC>/AC-n.Sm` 開頭、步驟文字與 EPIC 一字不差。PR CI（head + base 紅綠證明）、部署後（smoke）、整合驗收（部署 SHA 全部情境）各產生 `acceptance.json`，存 GitHub Actions artifact；卡片 metadata 只放 PR 號與 run URL，不貼長 log。證據身分（repo、SHA、workflow、run attempt）由 `devflow check acceptance` 向 GitHub 核對，不信卡片或報告自述。
-- 交付寫在 `kanban_complete`（或 `kanban_request_review`）：`summary` 1–3 句；`metadata` 放結構化事實（`pr_url`、`branch`、`head_sha`、`tests`、`decisions`、`findings`…）。下游卡自動在 context 看到 parent 的 summary/metadata。
+## 交接規則（人看白話卡片，機器看 Repo 與 Metadata）
+- **卡片是給人看及判讀的**：標題與 body 只寫非工程師也能一眼看懂的**白話目標與結果**，整份 ≤ 600 字（`check plan` 檢查；不含 `[DEV]`/`[OPS]` 的固定 `## 本卡完成` 與 EPIC 的 `## 驗收`／`## 使用者原話`／`## 使用者決定`）。
+  - **禁止寫進卡片標題、body 或向使用者提問的訊息**：commit SHA、CI run ID、artifact 編號、檔案路徑、函式／變數名、容器或 kernel 參數（`seccomp`、`nonroot`、`UID/GID`、`socket`）、內部機制代號（`canary`、`exact-head`、`interlock`、`binding` 秒數）。
+  - EPIC 卡只寫 `## 目標`（1–2 句白話）、`## 驗收`（白話 `AC-1..n` 結果）與 `## 使用者原話`／`## 使用者決定`；自動化測試情境的 Given/When/Then 步驟可定義在 repo 的 `.devflow/scenarios.json`（及 `.devflow/verify.sh`、`.devflow/ui/*.spec.ts`），不用把長篇測試步驟塞滿 EPIC 卡片。
+  - 子卡（`[DEV]`、`[OPS]`、`[SHIP]`、`[RES]`、`[ARCH]`）只寫 `## 目標`（1–2 句白話）、`## 本卡完成`（僅 `[DEV]`/`[OPS]` 固定句）、`## 驗收`（`覆蓋：AC-n` 加最多 1–2 句白話完成結果與 `EPIC: t_xxxx`），**不設 `## 提示` 技術垃圾桶、不列技術實作清單**。
+- 證據：每個情境在 repo 是一個 Given/When/Then 可執行情境（`[ui]`/`[api]` 用 `.devflow/ui` 的 Playwright `scenario`，`[cli]`/`[lib]` 用 `.devflow/verify.sh` 的 `scenario`；步驟定義在 repo `.devflow/scenarios.json` 或 EPIC）。PR CI（head + base 紅綠證明）、部署後（smoke）、整合驗收（部署 SHA 全部情境）各產生 `acceptance.json`，存 GitHub Actions artifact；卡片 metadata 只放 PR 號與 run URL，不貼長 log。證據身分（repo、SHA、workflow、run attempt）由 `devflow check acceptance` 向 GitHub 核對，不信卡片或報告自述。
+- 交付寫在 `kanban_complete`（或 `kanban_request_review`）：`summary` 1–2 句白話結論；技術細節與結構化事實（`pr_url`、`branch`、`head_sha`、`tests`、`decisions`、`findings`…）一律放 `metadata`（JSON）。下游卡自動在 context 看到 parent 的 summary/metadata。
 - 不寫額外交接文件；需要給人看的長內容用 `artifacts` 附檔。
 - 外部 skill 說的 "issue tracker / tickets / issues" 一律指這個 board 的 Kanban 卡；"PR" 指 GitHub PR。
 
 ## 推進規則（不設卡控）
 - 可逆的事自己決定並記在 summary，不停下來問。
 - review 退件用 `kanban_request_changes`，不是 block；沒有次數上限。同一原因再失敗時換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
-- 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason 寫成使用者能直接回答的一句話。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句話>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後必寫，使用者只看這段就能決定：`背景：` 在做什麼、卡在哪（1–3 句，含檔案/錯誤/網址等證據）；`A：` / `B：` 各選項會發生什麼、代價與風險；`建議：` 為什麼選它。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
+- 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason **必須是給人直接判讀的純白話**（禁止寫 commit SHA、CI run ID、artifact 編號或內部參數代號）。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句白話問題>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後只寫簡潔白話，使用者只看這段就能決定：`背景：` 目前完成到哪、只缺哪一件事（1–2 句白話）；`A：` / `B：` 各選項的白話結果與影響；`建議：` 一句話理由。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
 - 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後你重查仍缺、再 block 同一題，Hermes 會判定重複阻擋，把卡轉進 triage（teams-transcription t_12402f67 2026-11-22）。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。
 - 長時間操作（CI、部署）期間呼叫 `kanban_heartbeat`。

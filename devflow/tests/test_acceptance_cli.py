@@ -635,6 +635,36 @@ class PlanShipGate(Case):
         rep = self.df.check_plan("b", EPIC, advise=False, cards=cards)
         self.assertEqual(rep["actionable_rules"], [bad_rule])
 
+    def test_epic_acceptance_spec_hydrates_scenarios_from_repo_scenarios_json_so_epic_card_stays_human_readable(self) -> None:
+        """Human-readable EPIC cards list only plain-language AC lines while automated Given/When/Then
+        scenarios live in `<repo>/.devflow/scenarios.json`."""
+        repo_dir = self.root / "repo" / ".devflow"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        (repo_dir / "scenarios.json").write_text(json.dumps({
+            f"{EPIC}/AC-1.S1": {
+                "description": "登入成功",
+                "smoke": True,
+                "given": "服務已啟動",
+                "when": "輸入正確密碼按登入",
+                "then": "進入管理頁面",
+            }
+        }, ensure_ascii=False))
+        human_epic = "## 目標\n部署服務並驗證管理登入。\n\n## 驗收\n- AC-1 [ui] 可開啟管理後台並以密碼登入成功\n- AC-2 [manual] 不影響主機上其他服務\n"
+        spec = self.df.epic_acceptance_spec("b", EPIC, human_epic)
+        self.assertEqual([self.df.spec_problems(a) for a in spec], [[], []])
+        self.assertEqual(len(spec[0]["scenarios"]), 1)
+        self.assertEqual(spec[0]["scenarios"][0]["id"], f"{EPIC}/AC-1.S1")
+        self.assertTrue(spec[0]["scenarios"][0]["smoke"])
+        self.assertEqual(spec[0]["scenarios"][0]["then"], "進入管理頁面")
+
+    def test_body_problem_enforces_600_char_human_readable_limit_excluding_fixed_done_section(self) -> None:
+        """Cards are for humans to read and judge (<= 600 chars, excluding fixed `## 本卡完成` boilerplate)."""
+        self.assertEqual(self.df.CARD_CHARS, 600)
+        short_dev = f"## 目標\n{'白話目標。' * 80}\n\n{self.df.DONE_HEADING}\n{self.df.DONE_TEXT}\n\n## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}"
+        self.assertIsNone(self.df.body_problem("DEV", "[DEV] d", short_dev))
+        bloated_ship = "## 目標\n" + ("技術細節 " * 130)
+        self.assertIsNotNone(self.df.body_problem("SHIP", "[SHIP] s", bloated_ship))
+
 
 class PrExemption(Case):
     def test_base_exemptions_are_judged(self) -> None:
