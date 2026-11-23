@@ -3139,34 +3139,34 @@ def resolve_acceptance_spec(board: str, repo: str, epic: str, cards: dict[str, d
     conflicts: list[str] = []
     ac_conflicts: dict[str, list[str]] = {}
     unresolved_errors: list[str] = []
-    for n, pr in prs.items():
-        sha = pr.get("headRefOid") or ""
-        by_ac, err = repo_scenarios_for_rev(board, repo, epic, sha, cards=cards, pr_number=n, total_prs=len(prs))
-        pr_by_ac[n] = by_ac
-        pr_scens[n] = {s["id"]: s for scs in by_ac.values() for s in scs}
-        if review and err:
-            msg = f"PR #{n}：{err}"
-            conflicts.append(msg)
-            unresolved_errors.append(msg)
-    pr_nums = list(prs)
-    for i, n1 in enumerate(pr_nums):
-        for n2 in pr_nums[i + 1:]:
-            for sid in sorted(set(pr_scens[n1]) & set(pr_scens[n2])):
-                if pr_scens[n1][sid] != pr_scens[n2][sid]:
-                    msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對情境 {sid} 定義衝突"
-                    conflicts.append(msg)
-                    m = SCENARIO_ID.match(sid)
-                    if m:
-                        ac_conflicts.setdefault(m.group(2), []).append(msg)
-            for ac_id in sorted((set(pr_by_ac[n1]) & set(pr_by_ac[n2])) & repo_acs):
-                ids1 = [s["id"] for s in pr_by_ac[n1][ac_id]]
-                ids2 = [s["id"] for s in pr_by_ac[n2][ac_id]]
-                if set(ids1) != set(ids2):
-                    msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對 {ac_id} 情境清單不一致（{ids1} vs {ids2}）"
-                    if msg not in conflicts:
-                        conflicts.append(msg)
-                        ac_conflicts.setdefault(ac_id, []).append(msg)
     if review:
+        for n, pr in prs.items():
+            sha = pr.get("headRefOid") or ""
+            by_ac, err = repo_scenarios_for_rev(board, repo, epic, sha, cards=cards, pr_number=n, total_prs=len(prs))
+            pr_by_ac[n] = by_ac
+            pr_scens[n] = {s["id"]: s for scs in by_ac.values() for s in scs}
+            if err:
+                msg = f"PR #{n}：{err}"
+                conflicts.append(msg)
+                unresolved_errors.append(msg)
+        pr_nums = list(prs)
+        for i, n1 in enumerate(pr_nums):
+            for n2 in pr_nums[i + 1:]:
+                for sid in sorted(set(pr_scens[n1]) & set(pr_scens[n2])):
+                    if pr_scens[n1][sid] != pr_scens[n2][sid]:
+                        msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對情境 {sid} 定義衝突"
+                        conflicts.append(msg)
+                        m = SCENARIO_ID.match(sid)
+                        if m:
+                            ac_conflicts.setdefault(m.group(2), []).append(msg)
+                for ac_id in sorted((set(pr_by_ac[n1]) & set(pr_by_ac[n2])) & repo_acs):
+                    ids1 = [s["id"] for s in pr_by_ac[n1][ac_id]]
+                    ids2 = [s["id"] for s in pr_by_ac[n2][ac_id]]
+                    if set(ids1) != set(ids2):
+                        msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對 {ac_id} 情境清單不一致（{ids1} vs {ids2}）"
+                        if msg not in conflicts:
+                            conflicts.append(msg)
+                            ac_conflicts.setdefault(ac_id, []).append(msg)
         merged_by_ac: dict[str, list[dict]] = {}
         seen_sids: set[str] = set()
         for n in pr_nums:

@@ -600,6 +600,101 @@ class CheckAcceptance(Case):
         self.assertIsNotNone(err2)
         self.assertIn(missing_sha[:12], err2)
 
+    def test_final_acceptance_allows_sequential_merged_prs_adding_scenarios_to_same_ac(self) -> None:
+        """In final acceptance, sequential merged PRs that add scenarios to the same AC (PR #5 adds S1,
+        PR #6 keeps S1 unchanged and adds S2) must pass using the verified final revision inventory, while
+        genuinely conflicting step text in an earlier PR's evidence still fails."""
+        import subprocess
+        repo_dir = self.root / "repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        git = lambda *args: subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True)
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test")
+        (repo_dir / ".devflow").mkdir(parents=True, exist_ok=True)
+
+        def entry_for(sid: str) -> dict:
+            s = self.spec[sid]
+            return {"description": s["description"], "smoke": s["smoke"], "given": s["given"], "when": s["when"], "then": s["then"]}
+
+        # Commit 1 (PR #5): adds AC-1.S1 only
+        (repo_dir / ".devflow" / "scenarios.json").write_text(json.dumps({A1S1: entry_for(A1S1)}, ensure_ascii=False))
+        git("add", ".devflow/scenarios.json")
+        git("commit", "-m", "pr5: add AC-1.S1")
+        sha1 = git("rev-parse", "HEAD").stdout.strip()
+
+        # Commit 2 (PR #6): retains AC-1.S1 unchanged and adds AC-1.S2
+        (repo_dir / ".devflow" / "scenarios.json").write_text(json.dumps({A1S1: entry_for(A1S1), A1S2: entry_for(A1S2)}, ensure_ascii=False))
+        git("add", ".devflow/scenarios.json")
+        git("commit", "-m", "pr6: add AC-1.S2")
+        sha2 = git("rev-parse", "HEAD").stdout.strip()
+
+        self.body = "## 目標\n待辦清單\n\n## 驗收\n- AC-1 [ui] 使用者可新增待辦\n"
+        prs = {
+            5: {"number": 5, "title": "pr5", "state": "MERGED", "headRefOid": sha1, "mergeCommit": {"oid": sha1},
+                "body": f"Covers: {A1S1}\n"},
+            6: {"number": 6, "title": "pr6", "state": "MERGED", "headRefOid": sha2, "mergeCommit": {"oid": sha2},
+                "body": f"Covers: {A1S2}\nAlready-met: {A1S2} 首頁在這個變更前就已顯示標題與新增按鈕\n"},
+        }
+        self.df.pr_meta = lambda repo, n: dict(prs[n])
+        pr5_run = wf_run(101, "ci.yml", "pull_request", sha1, "feat-1")
+        pr6_run = wf_run(102, "ci.yml", "pull_request", sha2, "feat-2")
+        dep_run = wf_run(200, "deploy.yml", "push", sha2, "main")
+        int_run = wf_run(300, "ci.yml", "workflow_dispatch", sha2, "main")
+        self.gh.tip = sha2
+        self.gh.compare[(sha1, sha2)] = "ahead"
+        self.gh.compare[(sha2, sha2)] = "identical"
+        self.gh.runs = {"ci.yml": [pr5_run, pr6_run, int_run], "deploy.yml": [dep_run]}
+        self.gh.artifacts = {
+            101: {
+                f"devflow-evidence-pr-{sha1}-1": self.evidence("pr", sha1, pr5_run, [self.scenario(A1S1)]),
+                f"devflow-evidence-base-{sha1}-1": {
+                    "acceptance.json": self.report("base", sha1, pr5_run, [self.scenario(A1S1, "red")]),
+                    "acceptance-base.json": {
+                        "identity": self.report("base", sha1, pr5_run, [])["identity"],
+                        "base_sha": "0" * 40,
+                        "results": [{"id": A1S1, "verdict": "RED", "failed_phase": "then", "error": "", "exempt": None}],
+                    },
+                },
+            },
+            102: {
+                f"devflow-evidence-pr-{sha2}-1": self.evidence("pr", sha2, pr6_run, [self.scenario(A1S2)]),
+                f"devflow-evidence-base-{sha2}-1": {
+                    "acceptance.json": self.report("base", sha2, pr6_run, [self.scenario(A1S2, "passed")]),
+                    "acceptance-base.json": {
+                        "identity": self.report("base", sha2, pr6_run, [])["identity"],
+                        "base_sha": sha1,
+                        "results": [{"id": A1S2, "verdict": "GREEN", "failed_phase": None, "error": "", "exempt": None}],
+                    },
+                },
+            },
+            200: {f"devflow-evidence-deploy-{sha2}-1": self.evidence("deploy", sha2, dep_run, [self.scenario(A1S2)])},
+            300: {f"devflow-evidence-integration-{sha2}-1": self.evidence("integration", sha2, int_run, [self.scenario(A1S1), self.scenario(A1S2)])},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = self.df.check_acceptance("b", EPIC, [5, 6], review=False, evidence=[], tmp=Path(tmp))
+        self.assertEqual(rep["problems"], [])
+        self.assertEqual([r["verdict"] for r in rep["criteria"]], ["PASS"])
+
+        # Negative check: if PR #6 also altered AC-1.S1's step text in final main, PR #5's older evidence mismatches and FAILS.
+        altered = {**entry_for(A1S1), "then": "改寫後的不同結果"}
+        (repo_dir / ".devflow" / "scenarios.json").write_text(json.dumps({A1S1: altered, A1S2: entry_for(A1S2)}, ensure_ascii=False))
+        git("add", ".devflow/scenarios.json")
+        git("commit", "-m", "pr7: alter AC-1.S1 text")
+        sha3 = git("rev-parse", "HEAD").stdout.strip()
+        self.gh.tip = sha3
+        self.gh.compare[(sha1, sha3)] = "ahead"
+        self.gh.compare[(sha2, sha3)] = "ahead"
+        dep3 = wf_run(201, "deploy.yml", "push", sha3, "main")
+        int3 = wf_run(301, "ci.yml", "workflow_dispatch", sha3, "main")
+        self.gh.runs = {"ci.yml": [pr5_run, pr6_run, int3], "deploy.yml": [dep3]}
+        self.gh.artifacts[201] = {f"devflow-evidence-deploy-{sha3}-1": self.evidence("deploy", sha3, dep3, [self.scenario(A1S2)])}
+        self.gh.artifacts[301] = {f"devflow-evidence-integration-{sha3}-1": self.evidence("integration", sha3, int3, [self.scenario(A1S1), self.scenario(A1S2)])}
+        with tempfile.TemporaryDirectory() as tmp:
+            rep_bad = self.df.check_acceptance("b", EPIC, [5, 6], review=False, evidence=[], tmp=Path(tmp))
+        self.assertEqual([r["verdict"] for r in rep_bad["criteria"]], ["FAIL"])
+        self.assertTrue(any("改寫後的不同結果" in r for r in rep_bad["criteria"][0]["reasons"]), rep_bad["criteria"])
+
 
 class SourceExcerpts(Case):
     def write(self, name: str, text: str) -> Path:
