@@ -47,13 +47,18 @@ class Board:
         self.sent: list[tuple[str, int, str]] = []   # (task, event id, chat) the notifier delivered
         self.clock = 0
 
+    def now(self) -> int:
+        """Whole seconds like Hermes, strictly increasing so call order is time order."""
+        self.clock = max(self.clock + 1, int(time.time()))
+        return self.clock
+
     def card(self, tid: str, title: str, *, body: str = "", status: str = "todo", assignee: str = "default") -> None:
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,NULL,?)", (tid, title, body, status, assignee))
         self.event(tid, "created")
 
     def event(self, tid: str, kind: str, payload: dict | None = None) -> int:
         cur = self.db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                              (tid, kind, json.dumps(payload or {}), int(time.time())))
+                              (tid, kind, json.dumps(payload or {}), self.now()))
         self.db.commit()
         return int(cur.lastrowid or 0)
 
@@ -63,7 +68,7 @@ class Board:
 
     def comment(self, tid: str, author: str, body: str) -> None:
         self.db.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
-                        (tid, author, body, int(time.time())))
+                        (tid, author, body, self.now()))
         self.db.commit()
 
     def unblock(self, tid: str) -> None:
@@ -72,23 +77,25 @@ class Board:
 
     def subscribe(self, tid: str, chat: dict, profile: str = "default") -> None:
         """Hermes add_notify_sub: the cursor starts after every existing event."""
-        self.clock += 1
         top = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
         self.db.execute("INSERT INTO kanban_notify_subs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (tid, chat["platform"], chat["chat_id"], chat.get("thread_id"), chat.get("user_id"), None,
-                         chat.get("chat_type"), profile, "notify+wake", self.clock, top, 0))
+                         chat.get("chat_type"), profile, "notify+wake", self.now(), top, 0))
         self.db.commit()
 
     def notify(self) -> None:
-        """Hermes notifier: send blocked events after each cursor, then advance it and record the ping."""
-        for tid, chat, cursor in self.db.execute(
-                "SELECT task_id, chat_id, last_event_id FROM kanban_notify_subs").fetchall():
+        """Hermes notifier: send blocked events after each cursor, then advance it. A push chat (Bot
+        Chat, `local`) records the ping; an app chat (`api_server`) is reached by the wake self-post,
+        which records none."""
+        for tid, platform, chat, cursor in self.db.execute(
+                "SELECT task_id, platform, chat_id, last_event_id FROM kanban_notify_subs").fetchall():
             rows = self.db.execute("SELECT id, kind FROM task_events WHERE task_id=? AND id>?", (tid, cursor)).fetchall()
             for eid, kind in rows:
                 if kind == "blocked":
                     self.sent.append((tid, eid, chat))
-                    self.db.execute("UPDATE kanban_notify_subs SET last_ping_event_id=? WHERE task_id=? AND chat_id=?",
-                                    (eid, tid, chat))
+                    if platform != "api_server":
+                        self.db.execute("UPDATE kanban_notify_subs SET last_ping_event_id=? WHERE task_id=? AND chat_id=?",
+                                        (eid, tid, chat))
             if rows:
                 self.db.execute("UPDATE kanban_notify_subs SET last_event_id=? WHERE task_id=? AND chat_id=?",
                                 (rows[-1][0], tid, chat))
@@ -111,6 +118,7 @@ class RouteQuestions(unittest.TestCase):
         self.addCleanup(self.board.db.close)
         self.df.kanban = self.kanban
         self.df.replay_from = self.replay_from
+        self.df.mark_triage_needs_input = self.mark_triage_needs_input
         self.st: dict = {}
         # Decisions says "only the user can answer" unless a test says otherwise: no network in tests.
         self.df.decide = lambda content, questions: {"user_decision": {"probability": 0.9}}
@@ -160,6 +168,16 @@ class RouteQuestions(unittest.TestCase):
         self.board.db.commit()
         return cur.rowcount == 1
 
+    def mark_triage_needs_input(self, board, tid, reason):
+        cur = self.board.db.execute(
+            "UPDATE tasks SET block_kind='needs_input' WHERE id=? AND status='triage' "
+            "AND (block_kind IS NULL OR block_kind NOT IN ('needs_input', 'capability'))",
+            (tid,))
+        if cur.rowcount != 1:
+            return None, False
+        eid = self.board.event(tid, "blocked", {"kind": "needs_input", "reason": reason})
+        return eid, False
+
     def tick(self) -> None:
         self.df.route_questions("b", self.st)
         self.board.notify()
@@ -181,6 +199,25 @@ class RouteQuestions(unittest.TestCase):
         ev_dev, ev_adj = self.board.block("t_dev"), self.board.block("t_adj")
         self.tick()
         self.assertEqual(sorted(self.board.sent), [("t_adj", ev_adj, "local-epic"), ("t_dev", ev_dev, "local-epic")])
+
+    def test_a_set_inbox_takes_every_cards_notices_from_the_chat_a_person_types_in(self):
+        """run_fa2a5faa: card wakes raced the user's Desktop prompts there (SESSION_NOT_OWNED, 2026-11-19)."""
+        self.df.INBOX.parent.mkdir(parents=True, exist_ok=True)
+        self.df.INBOX.write_text(json.dumps(INBOX_CHAT))
+        epic = "t_e03c0ffe"
+        self.board.card(epic, "[EPIC] goal")
+        self.board.subscribe(epic, EPIC_CHAT)                 # Hermes: the chat it was made in
+        self.board.card("t_ship", "[SHIP] s", assignee="devops")
+        self.board.subscribe("t_ship", EPIC_CHAT)
+        self.board.subscribe("t_ship", {**DEVOPS_CHAT, "chat_id": "local-devops"}, "devops")   # its Bot Chat stays
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_ship', ?)", (epic,))
+        ev = self.board.block("t_ship")
+        self.tick()
+        self.tick()
+        subs = sorted(self.board.db.execute("SELECT task_id, chat_id FROM kanban_notify_subs").fetchall())
+        self.assertEqual(subs, [(epic, "local-inbox"), ("t_ship", "local-devops"), ("t_ship", "local-inbox")])
+        self.assertNotIn(("t_ship", ev, "local-epic"), self.board.sent)
+        self.assertIn(("t_ship", ev, "local-inbox"), self.board.sent)
 
     def test_a_question_already_sent_is_not_sent_again(self):
         self.board.card("t_chat", "[DEV] made in a chat")
@@ -284,7 +321,7 @@ class RouteQuestions(unittest.TestCase):
         db = self.data / ("state.db" if profile == "default" else f"profiles/{profile}/state.db")
         with closing(sqlite3.connect(db)) as s:
             s.execute("CREATE TABLE IF NOT EXISTS messages (session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
-            s.execute("INSERT INTO messages VALUES (?,?,?,?)", (chat_id, role, content, time.time()))
+            s.execute("INSERT INTO messages VALUES (?,?,?,?)", (chat_id, role, content, self.board.now()))
             s.commit()
 
     def test_pending_reports_what_each_chat_transcript_shows_not_the_ping_cursor(self):
@@ -300,10 +337,22 @@ class RouteQuestions(unittest.TestCase):
         self._say("devops", "local-devops", "assistant", "需要你決定（b t_ship）…")
         self.assertEqual(seen()["local:local-devops"], (True, True))
 
+    def test_pending_shows_the_question_of_a_repeated_block_in_triage(self):
+        """t_12402f67 2026-11-19: the second block came as block_loop_detected; pending showed the first."""
+        self.board.card("t_ship", "[SHIP] s", assignee="devops")
+        self.board.block("t_ship", reason="舊問題")
+        self.board.unblock("t_ship")
+        self.board.db.execute("UPDATE tasks SET status='triage', block_kind='needs_input' WHERE id='t_ship'")
+        ev = self.board.event("t_ship", "block_loop_detected", {"kind": "needs_input", "reason": "新問題"})
+        p = self.df.pending()[0]
+        self.assertEqual((p["question"], p["block_event"]), ("新問題", ev))
+
     # --- workflow questions go to an [ADJ], not to the user ---------------------------------------
     def _flow(self, p: float | None, create_ok: bool = True) -> tuple[list, list]:
-        """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded."""
+        """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded and, like Hermes,
+        puts the [ADJ] on the board; `hermes kanban comment` goes to self.comments."""
         judged, created = [], []
+        self.comments: list[tuple[str, str]] = []
 
         def decide(content, questions):
             judged.append(content)
@@ -312,12 +361,23 @@ class RouteQuestions(unittest.TestCase):
             return {"user_decision": {"probability": p}}
 
         def run(cmd, **kw):
+            if cmd[4] == "comment":
+                if not create_ok:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="database is locked")
+                self.comments.append((cmd[5], cmd[6]))
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
             created.append(cmd)
             if not create_ok:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr="database is locked")
-            return types.SimpleNamespace(returncode=0, stdout=f"Created t_ad{len(created):06x}\n", stderr="")
+            tid = f"t_ad{len(created):06x}"
+            self.board.card(tid, cmd[5], body=cmd[cmd.index("--body") + 1], assignee="orchestrator")
+            return types.SimpleNamespace(returncode=0, stdout=f"Created {tid}\n", stderr="")
         self.df.decide, self.df.run = decide, run
         return judged, created
+
+    def _finish(self, tid: str) -> None:
+        self.board.db.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        self.board.db.commit()
 
     def test_an_idle_board_is_ticked_again_after_a_kit_update(self):
         key = self.df.tick_key("b")
@@ -385,12 +445,88 @@ class RouteQuestions(unittest.TestCase):
         evs = []
         for i in range(3):
             if i:
-                self.board.unblock("t_ops")      # the [ADJ] resumed it; the worker blocked again
+                self._finish(f"t_ad{i:06x}")     # the [ADJ] resumed it and finished; the worker blocked again
+                self.board.unblock("t_ops")
             evs.append(self.board.block("t_ops"))
             self.tick()
         self.assertEqual(len(created), 2)
         self.assertEqual(len(judged), 2)
         self.assertEqual([e for _, e, chat in self.board.sent if chat == "local-devops"], [evs[2]])
+
+    def test_adj_laps_count_every_creator_but_only_explicit_marks(self):
+        """t_3b14e30d had 8 [ADJ]; Hermes and devops opened most, so a tick-only count never stopped it.
+        An [ADJ] that only cites the card (as EPIC/history) is not a lap; an archived one is not either."""
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adh1", "[ADJ] 處理失敗卡 t_ops", status="done", assignee="orchestrator")
+        self.board.card("t_adh2", "[ADJ] 改 smoke", body="EPIC: t_e04c0ffe\n處理：t_ship, t_ops\n內文", status="done")
+        self.board.card("t_adh3", "[ADJ] 收斂", body="原 OPS t_ops、原 SHIP t_ship 的歷史", status="done")
+        self.board.card("t_adh4", "[ADJ] 流程阻塞 t_ops", status="archived")
+        ev = self.board.block("t_ops")
+        self.tick()
+        self.assertEqual((created, judged), ([], []))
+        self.assertIn(("t_ops", ev, "local-devops"), self.board.sent)
+
+    def test_a_card_an_open_adj_repairs_gets_no_second_adj_and_the_question_goes_there(self):
+        """2026-11-18: tick opened t_a4059a2e for the block Hermes' t_0c2c0548 was already handling."""
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adj0", "[ADJ] 收斂停止的卡", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="running")
+        ev = self.board.block("t_ops", reason="問題：請 orchestrator 重定義停止範圍？")
+        self.tick()
+        self.assertEqual((created, judged), ([], []))
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertIn("重定義停止範圍", self.comments[0][1])
+        self.assertNotIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertEqual(self.df.pending()[0]["handled_by"], "t_adj0")
+        self.tick()
+        self.assertEqual(len(self.comments), 1)   # once per block
+
+    def test_a_question_the_open_adj_did_not_receive_is_asked_to_the_user(self):
+        self._ops_card()
+        judged, created = self._flow(0.05, create_ok=False)
+        self.board.card("t_adj0", "[ADJ] 收斂停止的卡", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="running")
+        ev = self.board.block("t_ops")
+        with redirect_stderr(io.StringIO()):
+            self.tick()
+        self.assertEqual((created, judged, self.comments), ([], [], []))
+        self.assertIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertIsNone(self.df.pending()[0]["handled_by"])
+
+    def test_a_card_held_by_active_pr_after_its_parents_finished_is_resumed_once(self):
+        """[SHIP] t_3b14e30d: promoted after PR #5 was approved, then skipped every minute (2026-11-19)."""
+        resumed = []
+        self.df.resume = lambda board, tid, note=None: resumed.append(tid) or f"resumed {tid}"
+        guard = {"reason": "active_pr"}
+        self.board.card("t_ship", "[SHIP] s", status="ready", assignee="devops")
+        self.board.event("t_ship", "respawn_guarded", guard)        # before the promotion: not this case
+        self.board.event("t_ship", "promoted")
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, [])                                # promoted, not held yet
+        self.board.card("t_run", "[DEV] d", status="ready", assignee="developer")
+        self.board.event("t_run", "promoted")
+        self.board.event("t_run", "claimed")                         # it ran: its own hold is the worker's
+        for tid in ("t_ship", "t_run"):
+            self.board.event(tid, "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.board.event("t_ship", "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, ["t_ship"])
+        self.board.event("t_ship", "promoted")                       # promoted again later: one more resume
+        self.board.event("t_ship", "respawn_guarded", guard)
+        self.df.release_held("b", self.st)
+        self.assertEqual(resumed, ["t_ship", "t_ship"])
+
+    def test_an_open_adj_that_only_cites_the_card_does_not_take_its_question(self):
+        self._ops_card()
+        judged, created = self._flow(0.05)
+        self.board.card("t_adj0", "[ADJ] 別的修正", body="EPIC: t_e04c0ffe\n處理：t_other\n參考 t_ops 的 run", status="running")
+        self.board.block("t_ops")
+        self.tick()
+        self.assertEqual((len(created), self.comments), (1, []))
+        self.assertIn("處理：t_ops", created[0][created[0].index("--body") + 1])
 
     def test_unsure_or_unavailable_decisions_asks_the_user(self):
         self._ops_card()
@@ -497,6 +633,148 @@ class RouteQuestions(unittest.TestCase):
         self.tick()
         self.assertEqual(sorted(self.board.sent), [("t_dev", ev_dev, "local-inbox"), ("t_res", ev_res, "local-inbox")])
         self.assertEqual([p["ask_in"] for p in self.df.pending()], ["default", "default"])
+
+    # --- stalled triage cards blocking downstream work go to an [ADJ] ----------------------------
+    def _stalled_triage_chain(self) -> tuple[str, int]:
+        """t_dev (triage, no block) -> t_ship (todo, dependency) -> epic (todo, dependency)."""
+        epic = "t_e05c0ffe"
+        self.board.card(epic, "[EPIC] goal", status="todo", assignee="orchestrator")
+        self.board.card("t_ship", "[SHIP] s", status="todo", assignee="devops")
+        self.board.db.execute("UPDATE tasks SET block_kind='dependency' WHERE id IN (?, 't_ship')", (epic,))
+        self.board.card("t_dev", "[DEV] fix", body=f"EPIC: {epic}\nwait for orchestrator", status="triage", assignee="developer")
+        created_ev = self.board.db.execute("SELECT MAX(id) FROM task_events WHERE task_id='t_dev'").fetchone()[0]
+        self.board.db.executemany("INSERT INTO task_links VALUES (?,?)", [("t_dev", "t_ship"), ("t_ship", epic)])
+        self.board.db.commit()
+        return epic, created_ev
+
+    def test_a_triage_card_blocking_downstream_work_opens_one_adj(self):
+        """teams-transcription t_46ded1b5 -> t_12402f67 (2026-11-22): triage with no block stalled silently."""
+        epic, ev = self._stalled_triage_chain()
+        judged, created = self._flow(0.9)
+        self.tick()
+        self.board.event("t_dev", "edited", {"fields": ["body"]})    # e.g. tick's repair_bodies must not re-fire
+        self.tick()
+        self.assertEqual(judged, [])
+        self.assertEqual(len(created), 1)
+        cmd = created[0]
+        self.assertEqual(cmd[5], "[ADJ] 流程阻塞 t_dev")
+        self.assertEqual(cmd[cmd.index("--assignee") + 1], "orchestrator")
+        self.assertEqual(cmd[cmd.index("--idempotency-key") + 1], f"triage-t_dev-{ev}")
+        self.assertEqual(cmd[cmd.index("--created-by") + 1], "devflow-tick")
+        body = cmd[cmd.index("--body") + 1]
+        self.assertIn(f"EPIC: {epic}", body)
+        self.assertIn("處理：t_dev", body)
+        self.assertIn("t_ship", body)
+        self.assertEqual(self.board.sent, [])
+
+    def test_a_standalone_triage_card_without_open_children_does_not_open_adj(self):
+        self.board.card("t_draft", "[DEV] draft", status="triage", assignee="developer")
+        self.board.card("t_done_child", "[SHIP] old", status="done", assignee="devops")
+        self.board.db.execute("INSERT INTO task_links VALUES ('t_draft', 't_done_child')")
+        self.board.db.commit()
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+
+    def test_a_triage_card_waiting_on_block_kind_uses_flow_blocks_not_stalled_triage(self):
+        self._stalled_triage_chain()
+        self.board.db.execute("UPDATE tasks SET block_kind='needs_input' WHERE id='t_dev'")
+        self.board.event("t_dev", "block_loop_detected", {"kind": "needs_input", "reason": "問題：請決定？"})
+        judged, created = self._flow(0.9)   # user question: flow_blocks must NOT open [ADJ], stalled_triage must skip
+        self.tick()
+        self.assertEqual(len(judged), 1)
+        self.assertEqual(created, [])
+
+    def test_a_stalled_triage_card_with_an_open_adj_gets_a_comment_not_a_second_adj(self):
+        epic, _ = self._stalled_triage_chain()
+        self.board.card("t_adj0", "[ADJ] 收斂", body=f"EPIC: {epic}\n處理：t_dev\n內文", status="running", assignee="orchestrator")
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertIn("t_dev", self.comments[0][1])
+        self.assertIn("t_ship", self.comments[0][1])
+
+    def test_a_stalled_triage_card_at_adj_cap_escalates_to_the_user_once_and_can_be_answered(self):
+        """PR #29 P1: hitting ADJ_PER_CARD must not silently strand the chain; notify the user once, no 3rd [ADJ]."""
+        self._stalled_triage_chain()
+        self.board.card("t_a1", "[ADJ] 流程阻塞 t_dev", status="done", assignee="orchestrator")
+        self.board.card("t_a2", "[ADJ] 處理失敗卡 t_dev", status="done", assignee="orchestrator")
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+        self.assertEqual(len(self.board.sent), 1)
+        sent_tid, sent_ev, sent_chat = self.board.sent[0]
+        self.assertEqual((sent_tid, sent_chat), ("t_dev", "local-inbox"))
+        self.df.TICK.write_text(json.dumps(self.st))
+        items = self.df.pending()
+        self.assertEqual(len(items), 1)
+        p = items[0]
+        self.assertEqual((p["task"], p["kind"], p["block_event"], p["handled_by"]), ("t_dev", "needs_input", sent_ev, None))
+        self.assertIn("t_a1", p["question"])
+        self.assertIn("t_a2", p["question"])
+        self.assertIn("t_ship", p["question"])
+        notes = self._resume_like_hermes()
+        self.df.answer("b", "t_dev", sent_ev, "A", "App 對話")
+        self.assertEqual(len(notes), 1)
+
+    def _hook_would_dispatch(self) -> bool:
+        """Run the real `cmd_tick --hook` against TICK state and report whether it spawns a tick for board `b`."""
+        spawned: list[list[str]] = []
+        orig_popen, orig_stdin = self.df.subprocess.Popen, self.df.sys.stdin
+        self.df.subprocess.Popen = lambda cmd, **kw: spawned.append(cmd)
+        self.df.sys.stdin = io.StringIO(json.dumps({"extra": {"board": "b"}}))
+        try:
+            self.df.cmd_tick(types.SimpleNamespace(hook=True, board=None))
+        finally:
+            self.df.subprocess.Popen, self.df.sys.stdin = orig_popen, orig_stdin
+        return bool(spawned)
+
+    def _run_cmd_tick(self) -> None:
+        orig_kanban, orig_prs = self.df.kanban, self.df.tick_prs
+        self.df.kanban = lambda board, cmd, *args: "[]" if cmd == "list" else orig_kanban(board, cmd, *args)
+        self.df.tick_prs = lambda board, repo, tasks: None
+        try:
+            self.df.cmd_tick(types.SimpleNamespace(hook=False, board="b"))
+        finally:
+            self.df.kanban, self.df.tick_prs = orig_kanban, orig_prs
+
+    def test_failed_stalled_triage_create_leaves_board_unsettled_so_hook_retries(self):
+        """PR #29 P2: a failed [ADJ] create on an idle subscribed board must not cache tick_key."""
+        epic, _ = self._stalled_triage_chain()
+        for tid in (epic, "t_ship", "t_dev"):
+            self.board.subscribe(tid, INBOX_CHAT)
+        _, created_fail = self._flow(0.05, create_ok=False)
+        with redirect_stderr(io.StringIO()):
+            self._run_cmd_tick()
+        self.assertEqual(len(created_fail), 1)
+        self.assertTrue(self._hook_would_dispatch())                # no board mutation, hook still retries
+        _, created_ok = self._flow(0.05, create_ok=True)
+        self._run_cmd_tick()
+        self.assertEqual(len(created_ok), 1)
+        # Tick 2 creates the [ADJ] (mutates kanban.db); tick 3 subscribes it (mutates kanban.db); tick 4 settles.
+        self._run_cmd_tick()
+        self._run_cmd_tick()
+        self.assertEqual(len(created_ok), 1)
+        self.assertFalse(self._hook_would_dispatch())               # settled after recovery
+
+    def test_failed_stalled_triage_comment_leaves_board_unsettled_so_hook_retries(self):
+        """PR #29 P2: a failed comment to an open [ADJ] on an idle subscribed board must not cache tick_key."""
+        epic, _ = self._stalled_triage_chain()
+        self.board.card("t_adj0", "[ADJ] 收斂", body=f"EPIC: {epic}\n處理：t_dev\n內文", status="running", assignee="orchestrator")
+        for tid in (epic, "t_ship", "t_dev", "t_adj0"):
+            self.board.subscribe(tid, INBOX_CHAT)
+        self._flow(0.05, create_ok=False)
+        with redirect_stderr(io.StringIO()):
+            self._run_cmd_tick()
+        self.assertEqual(self.comments, [])
+        self.assertTrue(self._hook_would_dispatch())                # no board mutation, hook still retries
+        self._flow(0.05, create_ok=True)
+        self._run_cmd_tick()
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertFalse(self._hook_would_dispatch())               # settled after recovery
 
 
 if __name__ == "__main__":

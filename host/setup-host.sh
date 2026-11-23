@@ -14,6 +14,10 @@ case "$(uname -m)" in aarch64) ARCH=arm64 ;; x86_64) ARCH=x64 ;; *) echo "unsupp
 [[ -d "$HERMES_DATA_HOST" ]] || { echo "no such dir: $HERMES_DATA_HOST" >&2; exit 1; }
 install -d -m 755 "$LIB" /etc/devflow
 
+# Repo deploy scripts build with `docker buildx build` (BuildKit, --build-context); without the plugin
+# docker exits 125 "unknown command" (teams-transcription image_build, 2026-11-18).
+dpkg -s docker-buildx-plugin >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-buildx-plugin
+
 # 1. runner user + rootless Docker
 id "$RUNNER_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$RUNNER_USER"
 if ! grep -q "^$RUNNER_USER:" /etc/subuid; then

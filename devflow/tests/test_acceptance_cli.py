@@ -513,6 +513,34 @@ class PlanUnjudged(Case):
         self.df.check_plan("b", EPIC, advise=True, cards=cards, advised=frozenset(findings))
         self.assertEqual(len(opened), 1)
 
+    def test_beyond_said_is_asked_only_when_the_epic_keeps_the_users_words(self) -> None:
+        asked = []
+        self.df.decide = lambda content, qs: asked.append([q["name"] for q in qs]) or {
+            q["name"]: {"probability": 0.9 if q["name"] == "beyond_said" else 0.0} for q in qs}
+        self.df.plan_rules = lambda board, epic, cards: []
+        card = {"title": "[EPIC] e", "status": "todo", "assignee": "orchestrator", "workspace_kind": "dir",
+                "parents": [], "children": []}
+        plain = self.df.check_plan("b", EPIC, advise=False, cards={EPIC: {**card, "body": BODY}})
+        said = self.df.check_plan("b", EPIC, advise=False, cards={EPIC: {**card, "body": f"{BODY}\n## 使用者原話\n部署並登入"}})
+        self.assertEqual(["beyond_said" in a for a in asked], [False, True])
+        self.assertEqual([any("beyond_said" in f for f in r["findings"]) for r in (plain, said)], [False, True])
+
+    def test_a_long_body_is_reported_but_opens_no_advisor(self) -> None:
+        """teams-transcription t_8f869670 / t_5ea4b8e4 (2026-11-19): two [ADV] runs only for body length."""
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.0} for q in qs}
+        long = self.df.body_problem("SHIP", "[SHIP] s", "x" * 1600)
+        other = "t_dev：沒有 goal_mode"
+        self.df.plan_rules = lambda board, epic, cards: [f"t_ship：{long}"]
+        self.df.readiness_rules = lambda board, cards: []
+        opened = []
+        self.df.open_advisor_card = lambda board, epic, cards, findings, risky: opened.append(findings) or "t_adv"
+        cards = {EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator", "parents": []}}
+        rep = self.df.check_plan("b", EPIC, advise=True, cards=cards)
+        self.assertEqual((rep["findings"], opened), ([f"t_ship：{long}"], []))
+        self.df.plan_rules = lambda board, epic, cards: [f"t_ship：{long}", other]
+        self.df.check_plan("b", EPIC, advise=True, cards=cards)
+        self.assertEqual(opened, [[other]])   # a real rule finding still goes, without the length one
+
 
 class PlanShipGate(Case):
     """An advisor's ok covers the [SHIP] cards it gated, not ones the plan gains later."""

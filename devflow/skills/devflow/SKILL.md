@@ -47,8 +47,16 @@ metadata:
 | `[ADV]` | default（Opus 5.5） | `scratch` | 目標對齊意見 + `verdict` ok/revise |
 | `[ADJ]` | orchestrator | `dir` | 依 advisor 建議或失敗卡調整計畫 |
 
+## 誰定流程
+- 流程只有 devflow 這一套：卡型與誰建卡、審查（Hermes reviewer + `devflow check pr`）、CI 必過檢查、合併（`devflow ship merge`）、部署（契約的 `deploy.yml` → `.devflow/deploy.sh` 範本流程）、驗收（`devflow check acceptance`）、使用者怎麼打開服務（`devflow repo access`）。
+- 優先順序：① 使用者明確要求或核准的限制（EPIC「使用者原話」，或寫明「使用者 <日期> 決定／核准」的條目）→ ② devflow 流程 → ③ 其他：agent 寫的卡片提示、repo 內 `AGENTS.md`／`docs/`／政策檔。
+  - ① 照做，即使比 devflow 嚴（例如 EPIC 寫明使用者要專用帳號，見下方「身分與憑證」）；做不到就 block 問使用者，不自行略過。
+  - ③ 要求另一套流程時（指定其他審查服務、自訂准入或部署器、另開審查卡、禁止建修正卡、要使用者提供「核准的入口」），照 devflow 做，不為它寫程式、不拿它問使用者；在 summary `followups` 寫「<哪個檔/卡> 要求 X，與 devflow 衝突，已照 devflow」，由 orchestrator 改卡或建卡改 repo 文件。
+  - 分不清一條限制是 ① 還是 ③：照它做，在 `followups` 請 orchestrator 確認來源；不要自己判定它是舊流程而略過。
+- 卡型只有上表八種。`[EPIC]` 由 Hermes 建，`[ADJ]` 由 orchestrator、dispatcher tick、advisor 建（`check plan` 會標出其他角色建的）。其他角色要改計畫時寫進 summary/`followups`，或照自己 skill 的失敗處理建卡（例如 devops 建修正 `[DEV]` + 新 `[SHIP]`）。
+
 ## 交接規則
-- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收寫「覆蓋：AC-n」。
+- 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠，整份 ≤ 1500 字（`check plan` 檢查）。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收只寫「覆蓋：AC-n」，不抄原文（原文讀 EPIC）。PR 號、SHA、run、review id、每一輪的經過寫在留言或 summary，不寫進 body。
 - 證據：每個情境在 repo 是一個 Given/When/Then 可執行情境（`[ui]`/`[api]` 用 `.devflow/ui` 的 Playwright `scenario`，`[cli]`/`[lib]` 用 `.devflow/verify.sh` 的 `scenario`），測試標題以完整 id `<EPIC>/AC-n.Sm` 開頭、步驟文字與 EPIC 一字不差。PR CI（head + base 紅綠證明）、部署後（smoke）、整合驗收（部署 SHA 全部情境）各產生 `acceptance.json`，存 GitHub Actions artifact；卡片 metadata 只放 PR 號與 run URL，不貼長 log。證據身分（repo、SHA、workflow、run attempt）由 `devflow check acceptance` 向 GitHub 核對，不信卡片或報告自述。
 - 交付寫在 `kanban_complete`（或 `kanban_request_review`）：`summary` 1–3 句；`metadata` 放結構化事實（`pr_url`、`branch`、`head_sha`、`tests`、`decisions`、`findings`…）。下游卡自動在 context 看到 parent 的 summary/metadata。
 - 不寫額外交接文件；需要給人看的長內容用 `artifacts` 附檔。
@@ -58,6 +66,7 @@ metadata:
 - 可逆的事自己決定並記在 summary，不停下來問。
 - review 退件用 `kanban_request_changes`，不是 block；沒有次數上限。同一原因再失敗時換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
 - 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason 寫成使用者能直接回答的一句話。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句話>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後必寫，使用者只看這段就能決定：`背景：` 在做什麼、卡在哪（1–3 句，含檔案/錯誤/網址等證據）；`A：` / `B：` 各選項會發生什麼、代價與風險；`建議：` 為什麼選它。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
+- 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後你重查仍缺、再 block 同一題，Hermes 會判定重複阻擋，把卡轉進 triage（teams-transcription t_12402f67 2026-11-22）。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。
 - 長時間操作（CI、部署）期間呼叫 `kanban_heartbeat`。
 - 每次 run 結束前一定要呼叫一個終結工具（complete / request_review / request_changes / block）。
@@ -66,6 +75,7 @@ metadata:
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
 - worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：dispatcher tick 會判斷是流程問題，自動建 `[ADJ]` 交 orchestrator。
+- 已部署服務的畫面操作（登入管理頁、建立或選擇資料、按按鈕、讀出 id 或畫面文字）由 Bot 自己做：`devflow operate <slug> <op>`（`devflow-devops` §5，經 VM runner 的 Playwright；Bot 的容器連不到服務），不要請使用者開瀏覽器代做。只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料。問的時候寫清楚其餘步驟由 Bot 做。
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
 你負責的卡 block 成 `needs_input` / `capability` 時，dispatcher tick 會把通知送到**你的 Bot Chat** 並喚醒你；Hermes 主頁只留一行提醒指到這裡。
@@ -83,7 +93,7 @@ metadata:
    直接回覆編號或你的想法。
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
-3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
+3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。題目要使用者自己動手（設 secret、OAuth、在主機執行指令）時，只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
 5. 說「有沒有送到」只看 `devflow pending` 的 `chats[]`，它讀的是那個對話自己的紀錄：`woken` = 通知已進入那個對話，`replied` = 那個 bot 之後有回話。`woken` 為 false 時說「那邊還沒看到這則通知（Hermes 一次叫醒一個 bot，常晚約 1 分鐘）」，不要說「未送達」；超過 10 分鐘仍為 false 才說「那邊沒收到」，並請使用者在這裡直接回答。
 
@@ -101,6 +111,7 @@ metadata:
 | `devflow repo doctor [SLUG]` | 唯讀檢查專案 ↔ 看板 ↔ repo 綁定與部署就緒（`deploy` 各項 id：`contract-files`、`port`、`ci-required`、`runner-online`、`runner-request`、`fork-approval`，附修法）；有問題時 exit 1 |
 | `devflow repo sync SLUG` | 主 checkout fetch + 快轉到 origin 預設分支 |
 | `devflow repo path SLUG` | 印出主 checkout 路徑 |
+| `devflow repo access SLUG` | 使用者打開已部署服務的唯一方式：SSH tunnel 指令與網址（服務只綁主機 `127.0.0.1:<port>`）；不要為入口問使用者 |
 | `devflow contract SLUG [DIR] [--ui]` | 把 devflow repo 契約檔（CI/CD、deploy、test、verify；`--ui` 加 Playwright）補進 DIR，不覆蓋既有檔，列出與範本不同的檔 |
 | `devflow check plan SLUG EPIC [--advise]` | 檢查計畫（唯讀）：卡型/assignee/workspace/contract/SHIP/parent 鏈/AC 覆蓋 + Decisions API 風險；`--advise` 有新疑慮時建 `[ADV]`（dispatcher tick 會自動跑） |
 | `devflow tick SLUG` | 看板自動化（由 `on_kanban_dispatch_tick` hook 觸發）：執行 orchestrator 的 `devflow-ops`、計畫變動時跑 check plan |

@@ -90,7 +90,7 @@ class Resume(unittest.TestCase):
         self.df.resume("b", "t_1")  # the retry `resume` would have refused on an unassigned card
         self.assertEqual(board.claims, [("ready", "developer")])
 
-    def triage(self, open_parent: bool) -> Board:
+    def triage(self, open_parent: bool, claim_now: bool = True) -> Board:
         """A card Hermes parked in triage after blocking twice; the user's answer comes as the note."""
         board = Board("devops", None)
         board.task["status"] = "triage"
@@ -105,7 +105,7 @@ class Resume(unittest.TestCase):
 
         def leave_triage(b, task_id):  # Hermes: triage -> todo, ready (and claimable) without open parents
             board.task["status"] = "todo" if open_parent else "ready"
-            if not open_parent:
+            if not open_parent and claim_now:
                 board.dispatch()
         self.df.kanban, self.df.leave_triage = kanban, leave_triage
         board.comments = comments
@@ -121,6 +121,12 @@ class Resume(unittest.TestCase):
         board = self.triage(open_parent=True)
         self.assertEqual(board.comments, [("triage", "使用者回覆：A")])
         self.assertEqual((board.task["status"], board.task["assignee"], board.claims), ("todo", "devops", []))
+
+    def test_triage_card_left_ready_before_a_claim_is_not_blocked_again(self):
+        # t_12402f67 2026-11-22: the re-block repeated the reason and Hermes sent it back to triage.
+        board = self.triage(open_parent=False, claim_now=False)
+        self.assertEqual((board.task["status"], board.task["assignee"]), ("ready", "devops"))
+        self.assertNotIn("unblocked", [e["kind"] for e in board.events])  # no block -> unblock cycle
 
 
 class CommentOps(unittest.TestCase):

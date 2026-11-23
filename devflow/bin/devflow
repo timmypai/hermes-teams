@@ -417,6 +417,21 @@ def cmd_repo_path(a) -> None:
     print(entry(a.slug)["path"])
 
 
+# The one way a user opens a deployed service: services bind 127.0.0.1:<port> on the host (README),
+# so the entry is an SSH tunnel to that port. Fixed here so no card asks the user for "the approved
+# entry" (teams-transcription 2026-11-18 blocked 6h on that question) and no repo builds a public one.
+def repo_access(slug: str) -> dict:
+    e = entry(slug)
+    port = e["port"]
+    return {"slug": e["slug"], "tunnel": f"ssh -N -L {port}:127.0.0.1:{port} {ROLES['host']['ssh']}",
+            "url": f"http://127.0.0.1:{port}/",
+            "note": "使用者在自己的電腦執行 tunnel 指令，再用瀏覽器開 url；部署後的 smoke 在主機上連同一個位址"}
+
+
+def cmd_repo_access(a) -> None:
+    print(json.dumps(repo_access(a.slug), ensure_ascii=False, indent=2))
+
+
 def cmd_repo_sync(a) -> None:
     e = entry(a.slug)
     path, br = e["path"], e["default_branch"]
@@ -469,6 +484,75 @@ def cmd_contract(a) -> None:
               f"{TEMPLATE}): " + ", ".join(drift))
     if not (dest / "Dockerfile").exists() and "DEVFLOW_DEPLOY=false" not in (dest / ".devflow/config.env").read_text():
         print("note: no Dockerfile yet — write one, or set DEVFLOW_DEPLOY=false")
+
+
+def cmd_operate(a) -> None:
+    """Hermes operates the deployed service's UI itself: dispatch operate.yml (reviewed Playwright op
+    on the Oracle VM runner, the only machine that reaches the service), wait, download the result.
+    The worker containers cannot open the service: each rootless Docker runs --disable-host-loopback."""
+    import secrets
+    e = entry(a.slug)
+    repo, br = e["repo"], e["default_branch"]
+    args = json.loads(a.args) if a.args else {}
+    if not isinstance(args, dict):
+        die("--args must be a JSON object")
+    for kv in a.arg:
+        k, sep, v = kv.partition("=")
+        if not sep or not k:
+            die(f"--arg {kv!r}: want KEY=VALUE")
+        args[k] = v
+    # Download target: a caller's --dir must be new or empty (never cleared: `--dir .` would wipe the
+    # checkout); the default is a fresh directory per call.
+    dest = Path(a.dir) if a.dir else None
+    if dest is not None and dest.exists() and (not dest.is_dir() or any(dest.iterdir())):
+        die(f"--dir {dest} exists and is not an empty directory; give a new or empty one")
+    req = secrets.token_hex(6)
+    run(["gh", "workflow", "run", "operate.yml", "-R", repo, "--ref", br, "-f", f"op={a.op}",
+         "-f", f"args={json.dumps(args, ensure_ascii=False)}", "-f", f"request={req}"], gh="builder")
+    r = None
+    for _ in range(30):                     # the run shows up a few seconds after dispatch
+        time.sleep(3)
+        runs = workflow_runs(repo, "operate.yml", event="workflow_dispatch", branch=br) or []
+        r = next((x for x in runs if (x.get("display_title") or "").split()[-1:] == [req]), None)
+        if r:
+            break
+    if r is None:
+        die(f"operate.yml run for request {req} not found in {repo} (is operate.yml on {br}? `devflow contract`)")
+    deadline = time.time() + a.timeout
+    while r.get("status") != "completed":
+        if time.time() > deadline:
+            die(f"run {r['html_url']} still {r.get('status')} after {a.timeout}s")
+        time.sleep(5)
+        r = gh_json(["api", f"repos/{repo}/actions/runs/{r['id']}"]) or r
+    art = f"devflow-operate-{r['id']}-{r.get('run_attempt')}"
+    if dest is None:
+        import tempfile
+        base = Path("/tmp/devflow-operate")
+        base.mkdir(parents=True, exist_ok=True)
+        dest = Path(tempfile.mkdtemp(prefix=f"{e['slug']}-{a.op}-{r['id']}-", dir=base))
+    p = run(["gh", "run", "download", str(r["id"]), "-R", repo, "-n", art, "-D", str(dest)], gh="builder", check=False)
+    result, failures = None, []
+    if (dest / "result.json").exists():
+        result = json.loads((dest / "result.json").read_text())
+    if (dest / "playwright-report.json").exists():
+        def walk(s):
+            for spec in s.get("specs", []):
+                for t in spec.get("tests", []):
+                    for res in t.get("results", []):
+                        if res.get("error"):
+                            msg = re.sub(r"\x1b\[[0-9;]*m", "", res["error"].get("message", ""))
+                            failures.append(f"{spec.get('title')}: {msg[:600]}")
+            for child in s.get("suites", []):
+                walk(child)
+        for s in json.loads((dest / "playwright-report.json").read_text()).get("suites", []):
+            walk(s)
+    print(json.dumps({
+        "run": r["html_url"], "sha": r.get("head_sha"), "conclusion": r.get("conclusion"), "dir": str(dest),
+        "result": result, "images": sorted(str(x) for x in dest.rglob("*.png")), "failures": failures,
+        **({"download_error": (p.stderr or p.stdout).strip()[-300:]} if p.returncode else {}),
+    }, ensure_ascii=False, indent=2))
+    if r.get("conclusion") != "success":
+        sys.exit(1)
 
 
 def runner_key(repo: str) -> str:
@@ -832,12 +916,16 @@ def repo_deploys(board: str) -> bool:
 
 
 # The goal judge (Hermes tools/kanban_tools.py `_goal_gate`) runs when a goal-mode worker calls
-# kanban_request_review: it reads `title\n\nbody` cut at 2000 characters and asks "is this done?".
-# A completion condition that only exists after the handoff (review requested, approved, merged,
-# deployed) can never be shown, so the handoff is refused every time (teams-transcription t_6d121ad4,
-# 2026-11-18: 2/2 refused as written, 2/2 passed with this text). devflow owns the text.
+# kanban_request_review or kanban_complete: it reads `title\n\nbody` cut at 2000 characters and asks
+# "is this done?", without knowing which tool called. A completion condition that only exists after
+# the handoff (review requested, approved, merged, deployed) can never be shown, so the handoff is
+# refused every time (teams-transcription t_6d121ad4, 2026-11-18). Naming the handoff tool in the
+# text is refused too (judge probe 2026-11-19: 3/3 continue). The earlier "交 review 是完成後的下一步"
+# passed the judge but read to devops as "complete the card, the [SHIP] reviews" (t_48d094f6,
+# t_1463bbcb closed with no review); this text passed 3/3 and puts review on the card itself.
+# Which tool hands off lives in the skills (devflow-develop §6), which the judge does not read.
 DONE_HEADING = "## 本卡完成"
-DONE_TEXT = "PR 已開、exact-head CI 綠。交 review 是完成後的下一步，不是完成條件；合併與部署由 [SHIP] 負責。"
+DONE_TEXT = "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。"
 JUDGE_CHARS = 2000
 DONE_RE = re.compile(rf"^{DONE_HEADING}[ \t]*\n(.*?)(?=^##?[ \t]|\Z)", re.M | re.S)  # its ### subsections too
 
@@ -867,15 +955,96 @@ def repaired_done(body: str) -> str:
     return (head + "\n\n" if head else "") + f"{DONE_HEADING}\n{DONE_TEXT}\n" + ("\n" + tail if tail else "")
 
 
-def repair_done_sections(board: str, cards: dict[str, dict]) -> list[str]:
-    """Put the fixed `## 本卡完成` back on pending [DEV]/[OPS] cards whose text drifted (an [ADJ] or the
-    orchestrator rewrote it); a card whose `## 目標` is too long to fit stays a plan finding."""
+# A card body is a spec: goal, the fixed done text, which ACs it covers plus its own checks, pointers.
+# teams-transcription cards grew to 5-6k characters: every AC copied from the EPIC, PR/run/review ids
+# and SHAs of each attempt, and the same prohibitions on every card, rewritten by each [ADJ] (one card
+# was edited 11 times). Workers then read the history as requirements. Progress belongs in comments.
+CARD_CHARS = 1500
+BODY_LONG = "字（上限"  # marks the body-length finding: reminded on the EPIC, never sent to the advisor
+
+# Who may open an [ADJ] (Hermes `created_by`): the orchestrator, the dispatcher tick, and the
+# advisor / Hermes chat (profile default). teams-transcription 2026-11-18: the devops [SHIP] opened
+# four [ADJ] and a `[REVIEW]` card itself, each one a new process the skills never described.
+ADJ_CREATORS = {"orchestrator", "devflow-tick", "default"}
+
+# Which cards an [ADJ] repairs: only explicit marks, never every card id its body cites (bodies name
+# the EPIC, the original [SHIP], sources and history; counting those would hand an unrelated block
+# to an [ADJ] that merely quotes the card). Marks: the fixed titles `[ADJ] 流程阻塞 t_x` (tick) and
+# `[ADJ] 處理失敗卡 t_x` (Hermes), and a body line `處理：t_x[, t_y]` (tick, Hermes, advisor).
+ADJ_TITLE_TARGET = re.compile(r"^\[ADJ\]\s*(?:流程阻塞|處理失敗卡)\s*(t_[0-9A-Za-z]+)")
+ADJ_BODY_TARGET = re.compile(r"^處理[：:][ \t]*((?:t_[0-9A-Za-z]+[ \t]*[,，、]?[ \t]*)+)$", re.M)
+# At most this many [ADJ] repair one card; the next lap is the user's to choose (tick asks them; an
+# [ADJ] opened beyond it is a plan finding, and its orchestrator asks instead of opening another round).
+ADJ_PER_CARD = 2
+
+
+def adj_targets(title: str, body: str | None) -> set[str]:
+    ids = set()
+    if (m := ADJ_TITLE_TARGET.match(title or "")):
+        ids.add(m.group(1))
+    for m in ADJ_BODY_TARGET.finditer(body or ""):
+        ids.update(re.findall(r"t_[0-9A-Za-z]+", m.group(1)))
+    return ids
+
+
+def adjs_for(tid: str, tasks: dict[str, dict]) -> list[str]:
+    """Ids of the [ADJ] cards (archived ones excluded: cancelled duplicates) that explicitly repair `tid`."""
+    return [a for a, t in tasks.items() if card_type(t["title"]) == "ADJ" and t.get("status") != "archived"
+            and tid in adj_targets(t["title"], t.get("body"))]
+
+
+def epic_acs(epic_body: str) -> dict[str, str]:
+    return {m.group(1): norm(m.group(2)) for m in AC_RE.finditer(epic_body or "")}
+
+
+def strip_copied_acs(body: str, acs: dict[str, str]) -> str:
+    """`body` without lines that repeat an EPIC AC word for word; the AC ids stay in a `覆蓋：` line."""
+    dropped: list[str] = []
+
+    def keep(line: str) -> bool:
+        m = AC_RE.match(line)
+        if m and acs.get(m.group(1)) == norm(m.group(2)):
+            dropped.append(m.group(1))
+            return False
+        return True
+    lines = [ln for ln in (body or "").split("\n") if keep(ln)]
+    if not dropped:
+        return body
+    out = "\n".join(lines)
+    missing = [a for a in dict.fromkeys(dropped) if not re.search(rf"覆蓋[：:][^\n]*\b{a}\b", out)]
+    if missing:
+        cover = f"覆蓋：{', '.join(missing)}（全文見 EPIC）"
+        m = re.search(r"^## 驗收[ \t]*\n", out, re.M)
+        out = out[:m.end()] + cover + "\n" + out[m.end():] if m else out.rstrip("\n") + "\n\n## 驗收\n" + cover
+    return out
+
+
+def body_problem(kind: str, title: str, body: str) -> str | None:
+    text = body or ""
+    if kind == "EPIC":  # its ACs and scenarios, and the user's own words, may be long; the rest may not
+        text = re.sub(r"^## (驗收|使用者原話)[ \t]*\n.*?(?=^## |\Z)", "", text, flags=re.M | re.S)
+    elif kind == "ADV" or title.startswith(PR_ADVISOR_TITLE):
+        return None  # written by devflow itself
+    if len(text) <= CARD_CHARS:
+        return None
+    return (f"body {len(text)} {BODY_LONG} {CARD_CHARS}{'，不含驗收與使用者原話' if kind == 'EPIC' else ''}）："
+            "AC 只寫編號；PR、run、review、SHA 與每輪經過寫留言，不寫進 body；共通規則已在 skill，不要每張卡抄")
+
+
+def repair_bodies(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
+    """On pending cards: drop ACs copied from the EPIC (the ids stay), and put the fixed `## 本卡完成`
+    back on [DEV]/[OPS] whose text drifted. A card still too long stays a plan finding."""
+    acs = epic_acs(cards[epic]["body"])
     fixed = []
     for tid, c in cards.items():
-        if card_type(c["title"]) not in ("DEV", "OPS") or c["status"] == "done" or not done_problem(c["title"], c["body"]):
+        kind = card_type(c["title"])
+        if tid == epic or kind in ("EPIC", "ADV", None) or c["status"] == "done":
             continue
-        body = repaired_done(c["body"])
-        if done_problem(c["title"], body) is None:
+        body = strip_copied_acs(c["body"], acs)
+        if kind in ("DEV", "OPS") and done_problem(c["title"], body):
+            repaired = repaired_done(body)
+            body = repaired if done_problem(c["title"], repaired) is None else body
+        if body != c["body"]:
             kanban(board, "edit", tid, "--body", body)
             fixed.append(tid)
     return fixed
@@ -916,6 +1085,14 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue
         if c["status"] == "done":
             continue  # history; only pending work can still go wrong
+        if (why := body_problem(kind, c["title"], c["body"])):
+            found.append(f"{tid}: {why}")
+        if kind not in ("EPIC", "ADJ", "ADV") and len(laps := adjs_for(tid, cards)) > ADJ_PER_CARD:
+            found.append(f"{tid}: 已有 {len(laps)} 張 [ADJ] 處理這張卡（{', '.join(sorted(laps))}）：不再開下一輪，照 devflow-orchestrate"
+                         "「C. 調整」把卡在哪、試過什麼、A/B 選項交給使用者選路")
+        if kind == "ADJ" and c.get("created_by") and c["created_by"] not in ADJ_CREATORS:
+            found.append(f"{tid}: [ADJ] 由 {c.get('created_by')} 建立；[ADJ] 只由 orchestrator、dispatcher tick、"
+                         "advisor 建，其他角色照自己 skill 的失敗處理建卡或寫 followups（devflow skill「誰定流程」）")
         want = CARDS[kind]
         # PR cards move to the reviewer while in the review column.
         if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
@@ -965,20 +1142,38 @@ PLAN_QUESTIONS = [
 ]
 
 
-def plan_risks(epic: str, cards: dict[str, dict]) -> tuple[dict[str, float], str]:
+# Asked only when the EPIC keeps the user's own words. teams-transcription 2026-11-17: "deploy, do
+# not touch other services, test login" became allowlists, snapshots, admission and a custom
+# deployer in the EPIC's criteria and hints; scope_creep compares the plan with that EPIC, so it
+# could not see it. This question compares the EPIC itself with what the user said.
+BEYOND_SAID = ("beyond_said", "The EPIC body keeps the user's own words (section `使用者原話`, or a `使用者原話：` "
+               "line). Compared with those words, do the EPIC's acceptance criteria, scenarios or hints (提示) add "
+               "substantial requirements the user did not ask for: mechanisms such as audit logs, allowlists, "
+               "before/after snapshots, admission or approval gates, a custom review policy, dedicated accounts, "
+               "or a special access channel, rather than stating the requested outcomes more precisely? Turning "
+               "'do not touch other services' into one observable check does not count; requiring a system to "
+               "prove it does.")
+SAID_RE = re.compile(r"^##\s*使用者原話|使用者原話[:：]", re.M)
+
+
+def plan_questions(epic_body: str | None) -> list[tuple[str, str]]:
+    return PLAN_QUESTIONS + ([BEYOND_SAID] if SAID_RE.search(epic_body or "") else [])
+
+
+def plan_risks(epic: str, cards: dict[str, dict], questions: list[tuple[str, str]]) -> tuple[dict[str, float], str]:
     plan = [{"id": t, "title": c["title"], "assignee": c["assignee"], "status": c["status"],
              "parents": c["parents"], "body": (c["body"] or "")[:2500]} for t, c in cards.items() if t != epic]
     content = [{"type": "input_text", "text": "Judge this development plan against the EPIC (the user's goal)."},
                {"type": "input_json", "data": {"epic": {"title": cards[epic]["title"], "body": cards[epic]["body"]},
                                                "cards": plan}}]
     try:
-        answers = decide(content, [{"type": "predicate", "name": n, "instructions": q} for n, q in PLAN_QUESTIONS])
-        missing = [n for n, _ in PLAN_QUESTIONS if not isinstance((answers.get(n) or {}).get("probability"), (int, float))]
+        answers = decide(content, [{"type": "predicate", "name": n, "instructions": q} for n, q in questions])
+        missing = [n for n, _ in questions if not isinstance((answers.get(n) or {}).get("probability"), (int, float))]
         if missing:
             raise DecisionsError(f"no probability for {', '.join(missing)}")
     except DecisionsError as err:
         return {}, f"Decisions API 無法使用：{err}"
-    return {n: float(answers[n]["probability"]) for n, _ in PLAN_QUESTIONS}, ""
+    return {n: float(answers[n]["probability"]) for n, _ in questions}, ""
 
 
 SHIP_PENDING = ("todo", "ready", "triage", "scheduled")
@@ -1046,16 +1241,17 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
     findings = plan_rules(board, epic, cards) + readiness_rules(board, cards)
-    risks, note = plan_risks(epic, cards)
+    questions = plan_questions(cards[epic]["body"])
+    risks, note = plan_risks(epic, cards, questions)
     if note:
         # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
         # [SHIP] because an irreversible operation cannot be ruled out. Stable text (no error
         # message) so a later failure does not open another [ADV] for the same plan.
-        flagged = {n for n, _ in PLAN_QUESTIONS}
-        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in PLAN_QUESTIONS}
+        flagged = {n for n, _ in questions}
+        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
     else:
         flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
-        risk = {n: f"Decisions {n}：{q}" for n, q in PLAN_QUESTIONS if n in flagged}
+        risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
     findings += list(risk.values())
     risky = "irreversible" in flagged
     keys = {f: [f] for f in findings}
@@ -1064,7 +1260,9 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         keys[f] = [f"{f} @ {s}" for s in pending_ships(cards)] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings, "risks": risks, "note": note,
               "advised": sorted({k for ks in keys.values() for k in ks})}
-    new = [f for f in findings if any(k not in advised for k in keys[f])]
+    # A long body is a writing issue the orchestrator fixes itself: the EPIC comment reminds it, an
+    # advisor run adds nothing (teams-transcription t_8f869670 / t_5ea4b8e4 2026-11-19 both said so).
+    new = [f for f in findings if BODY_LONG not in f and any(k not in advised for k in keys[f])]
     if new and advise:
         report["advisor_card"] = open_advisor_card(board, epic, cards, new, risky)
     return report
@@ -1194,8 +1392,12 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
             note = None
         leave_triage(board, task_id)
         d = json.loads(kanban(board, "show", task_id, "--json"))
-        if d["task"]["status"] in ("todo", "running"):
-            return f"{task_id} left triage: {d['task']['status']} ({d['task']['assignee']})"
+        status = d["task"]["status"]
+        if status == "triage":
+            die(f"{task_id} is still in triage after specify")
+        # Out of triage is the resume (todo/ready/running). Never block again here: Hermes counts
+        # blocks per reason without resetting on specify, so a re-block sends the card back to triage.
+        return f"{task_id} left triage: {status} ({d['task']['assignee']})"
     status, assignee = d["task"]["status"], d["task"]["assignee"]
     if status not in ("blocked", "scheduled", "ready"):
         die(f"{task_id} is {status}; only blocked/scheduled/ready/triage cards can be resumed")
@@ -1308,22 +1510,56 @@ def tick_board(board: str, st: dict) -> None:
         #    (dependency block parks the EPIC in todo until its parents finish).
         if kind == "EPIC" and t["status"] in ("todo", "blocked", "scheduled") and d["parents"]:
             cards = plan_cards(board, tid)
-            if fixed := repair_done_sections(board, cards):
-                kanban(board, "comment", tid, f"devflow：已把 {'、'.join(fixed)} 的 `{DONE_HEADING}` 改回固定文字"
-                                              f"「{DONE_TEXT}」（goal judge 只接受送審前就存在的條件）")
+            if fixed := repair_bodies(board, tid, cards):
+                kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)} 的 body：照抄的 EPIC AC 改成只寫編號，"
+                                              f"`{DONE_HEADING}` 改回固定文字「{DONE_TEXT}」（goal judge 只接受送審前就存在的條件）")
                 cards = plan_cards(board, tid)
             fp = plan_fingerprint(tid, cards, repo)
             if plans.get(tid) != fp:
                 rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
                 advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 kanban(board, "comment", tid, "devflow check plan：" + (
-                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（皆已交 advisor 判斷過）")
+                    "\n".join(f"- {f}" for f in rep["findings"]) + (f"\n已建 {rep['advisor_card']}" if rep.get("advisor_card") else "（未建 [ADV]：已交 advisor 判斷過，或只是 body 長度，請 orchestrator 自己縮短）")
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
-    route_questions(board, st)
+    release_held(board, st)
+    retry = route_questions(board, st)
     del applied[:-1000]
     del settled[:-1000]
+    return retry
+
+
+# Hermes holds a card for 24h once a comment carries a PR URL and no assignee handoff follows
+# (`respawn_guarded` active_pr). Meant for a worker that published a PR and stopped, it also holds a
+# card whose parents just finished: teams-transcription [SHIP] t_3b14e30d, promoted 13:51 after PR #5
+# was approved, then skipped every minute while nobody looked (2026-11-19). A card held after its
+# latest promotion, never claimed since, gets one `resume` (the native handoff) per promotion.
+
+def held_after_promotion(board: str) -> list[tuple[str, int]]:
+    return [(r["task_id"], r["promoted"]) for r in board_rows(board, """
+        SELECT p.task_id, p.promoted FROM tasks t JOIN (
+          SELECT task_id, MAX(id) AS promoted FROM task_events WHERE kind = 'promoted' GROUP BY task_id) p
+          ON p.task_id = t.id
+        WHERE t.status = 'ready' AND t.assignee IS NOT NULL
+          AND EXISTS (SELECT 1 FROM task_events g WHERE g.task_id = t.id AND g.id > p.promoted
+                      AND g.kind = 'respawn_guarded' AND json_extract(g.payload, '$.reason') = 'active_pr')
+          AND NOT EXISTS (SELECT 1 FROM task_events c WHERE c.task_id = t.id AND c.id > p.promoted
+                          AND c.kind = 'claimed')""")]
+
+
+def release_held(board: str, st: dict) -> None:
+    released = st.setdefault("released", [])
+    for tid, ev in held_after_promotion(board):
+        key = f"{board}/{tid}/{ev}"
+        if key in released:
+            continue
+        released.append(key)  # once per promotion, failed or not: a failing resume must not loop
+        try:
+            resume(board, tid, "devflow tick：parent 都完成後，Hermes 因留言含 PR 網址扣住本卡（active_pr），已交接重派。")
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - one card must not stop the tick
+            print(f"devflow: {board}/{tid} held by active_pr, resume failed: {err}", file=sys.stderr)
+    del released[:-1000]
 
 
 # --- needs_input reaches a person --------------------------------------------------------------
@@ -1414,6 +1650,33 @@ def subscribe(board: str, tid: str, chat: dict, profile: str = "default") -> Non
     kanban(board, *args)
 
 
+def move_to_inbox(board: str, tid: str, subs: dict[str, list], box: dict, readable) -> None:
+    """With an inbox set, a card notifies only there among the chats a person reads: Hermes subscribes
+    the chat a card was made in, and a gateway wake-up there races the person typing in it (the Desktop
+    prompt is refused SESSION_NOT_OWNED when the wake is admitted between its two ownership checks,
+    tui_gateway prompt_turn.py `_admit_prompt_turn`, Hermes; 2026-11-17..19: 9 times). Mitigation, not
+    a fix. Bot Chats of other profiles (`ask_assignees`) are not people's chats here and stay."""
+    mine = subs.get(tid, [])
+    at = (box["platform"], box["chat_id"])
+    if not any((s["platform"], s["chat_id"]) == at for s in mine):
+        subscribe(board, tid, box)
+    for s in mine:
+        if (s["platform"], s["chat_id"]) != at and readable(s) and (s["notifier_profile"] or "default") == "default":
+            kanban(board, "notify-unsubscribe", tid, "--platform", s["platform"], "--chat-id", s["chat_id"])
+    subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+
+
+def delivered(sub: dict, ev: int, ev_at: int) -> bool:
+    """Hermes' notifier already sent block event `ev` through `sub`. A push chat records the ping
+    (`last_ping_event_id`). An app (api_server) chat has no push channel: its delivery is the wake
+    self-post, which records no ping, and the cursor moves past an event only after that wake
+    succeeded (gateway/kanban_watchers_notifier.py `deliver`). A subscription made after the block
+    starts past it with nothing sent, hence its creation time. Counting only the ping replayed every
+    block to the app inbox once more (teams-transcription t_12402f67 event 2533, 2026-11-21)."""
+    return (sub["last_ping_event_id"] or 0) >= ev or (
+        sub["delivery_mode"] == "notify+wake" and sub["last_event_id"] >= ev and (sub["created_at"] or 0) < ev_at)
+
+
 def replay_from(board: str, sub: dict, event_id: int) -> bool:
     """Move one subscription's cursor back to just before `event_id` (Hermes' own compare-and-set
     writer); False when the notifier moved it meanwhile (the next tick retries)."""
@@ -1444,7 +1707,7 @@ def route_questions(board: str, st: dict) -> None:
     children: dict[str, list] = {}
     for link in board_rows(board, "SELECT parent_id, child_id FROM task_links"):
         children.setdefault(link["parent_id"], []).append(link["child_id"])
-    box, _ = inbox()
+    box, source = inbox()
     # Only chats a person reads count as asking: a ping into a `hermes chat --oneshot` session (what
     # the existing subscriptions are) reaches nobody.
     people = {(c["platform"], c["chat_id"]) for c in known_chats()} | ({(box["platform"], box["chat_id"])} if box else set())
@@ -1452,23 +1715,31 @@ def route_questions(board: str, st: dict) -> None:
     def readable(s: dict) -> bool:
         return (s["platform"], s["chat_id"]) in people
 
+    retry = stalled_triage(board, tasks, children, st)
     handled = flow_blocks(board, tasks, children, st)
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
-        if not any(readable(s) for s in subs.get(tid, [])):
+        if source == "set":
+            move_to_inbox(board, tid, subs, box, readable)
+        elif not any(readable(s) for s in subs.get(tid, [])):
             chat = epic_chat(tid, tasks, subs, children, readable) or box
             if chat is None:
                 continue
             subscribe(board, tid, chat)
             subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
+        if not subs.get(tid):
+            continue
         # Both go to blocked for a human (Hermes' typed blocks); the person has to be asked, unless the
         # question is a workflow problem an [ADJ] now handles.
         if t["status"] not in ("blocked", "triage") or t["block_kind"] not in ("needs_input", "capability") or tid in handled:
             continue
         ev = block_event(board, tid)
         mine = [s for s in subs[tid] if readable(s)]
-        if ev is None or not mine or any((s["last_ping_event_id"] or 0) >= ev for s in mine):
+        if ev is None or not mine:
+            continue
+        at = board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (ev,))[0]["created_at"]
+        if any(delivered(s, ev, at) for s in mine):
             continue
         sub = next((s for s in mine if s["delivery_mode"] == "notify+wake"), mine[0])
         # Keyed by destination too: a block asked in a chat that is no longer readable (Hermes' Bot
@@ -1482,6 +1753,7 @@ def route_questions(board: str, st: dict) -> None:
         asked.append(key)
     del asked[:-1000]
     ask_assignees(board, {k: v for k, v in tasks.items() if k not in handled}, subs, st)
+    return retry
 
 
 # --- the question goes to the Bot Chat of the card's assignee -----------------------------------
@@ -1553,7 +1825,8 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
                         if same(s)), None)
             if sub is None:
                 continue
-        if (sub["last_ping_event_id"] or 0) < ev and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
+        at = board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (ev,))[0]["created_at"]
+        if not delivered(sub, ev, at) and sub["last_event_id"] >= ev and not replay_from(board, sub, ev):
             continue
         asked.append(f"{board}/{tid}/{ev}/{chat['chat_id']}")
     del asked[:-1000]
@@ -1564,7 +1837,9 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
 # goal judge 循環", "請交給有 terminal 的 worker"); asked in a chat, they wait on the person until
 # someone notices (teams-transcription, 2026-11-18: the whole board idle for hours). Once per block,
 # Decisions judges whether only the user can answer; a confident "no" opens an [ADJ] for the
-# orchestrator instead, at most FLOW_ADJ_LIMIT times per card (then the user is asked after all).
+# orchestrator instead. A card an open [ADJ] already repairs (`adj_targets`) gets no second one: the
+# new question goes to that [ADJ] as a comment (2026-11-18: t_a4059a2e duplicated Hermes' t_0c2c0548).
+# Once ADJ_PER_CARD [ADJ] have repaired the card, whoever opened them, the user is asked instead.
 
 FLOW_QUESTION = (
     "A development worker stopped and asks the text in `question`. Is it asking the human user for something only "
@@ -1572,7 +1847,7 @@ FLOW_QUESTION = (
     "spending, credentials, or access the user owns? Answer no when it asks Hermes, an orchestrator, a maintainer, "
     "an 'admin side' or another worker to fix tooling, workflow, card wording, worker tools or permissions, or a "
     "stuck handoff, even when it is phrased as a question with options.")
-FLOW_ADJ_LIMIT = 2
+OPEN_ADJ = ("done", "archived")  # statuses of an [ADJ] that no longer handles anything
 
 
 def block_reason(board: str, ev: int) -> str:
@@ -1607,12 +1882,23 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
             continue
         key = f"{board}/{tid}/{ev}"
         if key not in flow:
-            earlier = sum(1 for k, v in flow.items() if k.startswith(f"{board}/{tid}/") and v != "user")
             question = block_reason(board, ev)
-            p = None if earlier >= FLOW_ADJ_LIMIT else user_must_answer(t, question)
-            adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
-                board, tid, t, ev, question, next(owning_epics(tid, tasks, children), None), p)
-            flow[key] = adj or "user"
+            laps = adjs_for(tid, tasks)
+            if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
+                # Handled only once the [ADJ] has the question; a failed comment asks the user, like a
+                # failed create (the question must reach someone this tick, not wait for a retry).
+                res = run([HERMES, "kanban", "--board", board, "comment", live,
+                           f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"],
+                          check=False)
+                if res.returncode != 0:
+                    print(f"devflow: question of {board}/{tid} not posted to {live}, asking the user: "
+                          f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
+                flow[key] = live if res.returncode == 0 else "user"
+            else:
+                p = None if len(laps) >= ADJ_PER_CARD else user_must_answer(t, question)
+                adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
+                    board, tid, t, ev, question, next(owning_epics(tid, tasks, children), None), p)
+                flow[key] = adj or "user"
         if flow[key] != "user":
             handled[tid] = flow[key]
     for k in list(flow)[:-1000]:
@@ -1623,7 +1909,7 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
 def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: str | None, p: float) -> str | None:
     """The new [ADJ]'s id; None when Hermes refused the create (the user is asked instead: one failing
     create must not stop question routing for the whole board)."""
-    body = ((f"EPIC: {epic}\n\n" if epic else "") +
+    body = ((f"EPIC: {epic}\n" if epic else "") + f"處理：{tid}\n\n" +
             f"## 目標\n{tid}（{t['title']}）停在流程問題，不是要使用者決定的事（Decisions：只有使用者能回答的機率 {p:.2f}）。"
             "找出根因修掉，讓它繼續。\n\n"
             f"## 問題（block 事件 {ev}）\n{question[:3000]}\n\n"
@@ -1638,6 +1924,130 @@ def open_flow_adj(board: str, tid: str, t: dict, ev: int, question: str, epic: s
         print(f"devflow: [ADJ] for {board}/{tid} not created, asking the user: {(res.stderr or res.stdout).strip()[-300:]}",
               file=sys.stderr)
     return m.group(0) if m else None
+
+
+def triage_event(board: str, tid: str) -> int:
+    """Latest lifecycle event that put `tid` in triage (excludes body edits such as tick's repair_bodies)."""
+    rows = board_rows(board, "SELECT id FROM task_events WHERE task_id = ? AND kind IN "
+                             "('created', 'status', 'triage') ORDER BY id DESC LIMIT 1", (tid,))
+    return rows[0]["id"] if rows else 0
+
+
+def open_triage_adj(board: str, tid: str, t: dict, ev: int, blocked_children: list[str], epic: str | None) -> str | None:
+    """Open an [ADJ] for the orchestrator when a non-blocked triage card stalls downstream open cards."""
+    body = ((f"EPIC: {epic}\n" if epic else "") + f"處理：{tid}\n\n" +
+            f"## 目標\n{tid}（{t['title']}）停在 `triage` 且沒有 block 事件，但下游卡片"
+            f"（{', '.join(sorted(blocked_children))}）正在等它完成；dispatcher 不會認領 `triage` 卡，依賴鏈已停住。"
+            "確認規格、路由與接手者，讓它離開 `triage` 開始執行（或以替代卡接替並封存）。\n\n"
+            "## 做法\n照 devflow-orchestrate「C. 調整」：讀本卡指到的卡片、其下游卡與 EPIC 留言；"
+            "需要改寫 body、換 assignee 或移出 `triage` 時，用 `devflow-ops`（`edit`、`assign`、`resume`；"
+            "`resume` 會把 `triage` 卡移出並依 parent 狀態轉為 `ready` 或 `todo`）。不要把本 `[ADJ]` link 到它或下游卡。"
+            "真的需要使用者決定時，才在本卡 kanban_block(kind=\"needs_input\") 問他。")
+    res = run([HERMES, "kanban", "--board", board, "create", f"[ADJ] 流程阻塞 {tid}", "--assignee", CARDS["ADJ"]["assignee"],
+              "--workspace", f"dir:{entry(board)['path']}", "--body", body, "--idempotency-key", f"triage-{tid}-{ev}",
+              "--created-by", "devflow-tick"], check=False)
+    m = re.search(r"t_[0-9a-f]{8}", res.stdout) if res.returncode == 0 else None
+    if m is None:
+        print(f"devflow: [ADJ] for stalled triage {board}/{tid} not created: {(res.stderr or res.stdout).strip()[-300:]}",
+              file=sys.stderr)
+    return m.group(0) if m else None
+
+
+def mark_triage_needs_input(board: str, task_id: str, reason: str) -> tuple[int | None, bool]:
+    """Attach a durable needs_input question to a stalled triage card that hit ADJ_PER_CARD.
+    Hermes `block_task` refuses `triage`; setting `block_kind='needs_input'` and appending a `blocked`
+    event in Hermes' own `write_txn` reuses Hermes' notifier, `devflow pending`, `devflow answer` and `resume`.
+    Returns `(event_id, retry)` where `retry` is True only on transient write failure (not state change)."""
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from hermes_cli import kanban_db_connect as k, kanban_db as kb\n"
+        "c = k.connect(Path(sys.argv[1]))\n"
+        "try:\n"
+        "    with kb.write_txn(c):\n"
+        "        cur = c.execute(\n"
+        "            \"UPDATE tasks SET block_kind = 'needs_input' WHERE id = ? AND status = 'triage' \"\n"
+        "            \"AND (block_kind IS NULL OR block_kind NOT IN ('needs_input', 'capability'))\",\n"
+        "            (sys.argv[2],),\n"
+        "        )\n"
+        "        if cur.rowcount != 1:\n"
+        "            sys.exit(2)\n"
+        "        kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'needs_input', 'reason': sys.argv[3]})\n"
+        "        eid = c.execute('SELECT last_insert_rowid()').fetchone()[0]\n"
+        "    print(eid)\n"
+        "finally:\n"
+        "    c.close()\n"
+    )
+    p = run([HERMES_PY, "-c", code, str(BOARDS / board / "kanban.db"), task_id, reason], check=False)
+    if p.returncode != 0:
+        if p.returncode != 2:
+            print(f"devflow: stalled triage escalation for {board}/{task_id} failed: "
+                  f"{(p.stderr or p.stdout).strip()[-300:]}", file=sys.stderr)
+            return None, True
+        return None, False
+    out = p.stdout.strip()
+    return (int(out), False) if out.isdigit() else (None, True)
+
+
+def triage_cap_reason(tid: str, t: dict, blocked_children: list[str], laps: list[str]) -> str:
+    kids = ", ".join(sorted(blocked_children))
+    adjs = ", ".join(sorted(laps))
+    return (
+        f"問題：{tid} 歷經 {len(laps)} 輪 [ADJ] 仍停在 triage 並擋住下游，要移出 triage 繼續執行還是暫緩／封存？選項：A 移出 triage 繼續 / B 暫緩或改方向（建議 A）\n"
+        f"背景：{tid}（{t['title']}）停在 triage 且無 block 事件，下游 {kids} 正等待它完成；"
+        f"已有 {len(laps)} 張 [ADJ]（{adjs}）處理過，達每卡上限（{ADJ_PER_CARD}），tick 不再開第 {len(laps) + 1} 張 [ADJ]。\n"
+        f"A：回覆指派或補充要求，交由 `devflow answer` 移出 triage（進入 ready／todo）繼續執行。\n"
+        f"B：暫緩、縮小範圍或由 orchestrator 改卡／封存替代。\n"
+        f"建議：先確認 {adjs} 留言中的根因再選 A 或補充改卡指示。"
+    )
+
+
+def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> bool:
+    """A non-waiting `triage` card with open downstream children stalls the dependency chain silently:
+    Hermes never dispatches `triage`, and without a `needs_input`/`capability` block neither `flow_blocks`
+    nor notifications fire (teams-transcription t_46ded1b5 -> t_12402f67, 2026-11-22). Open one [ADJ] for
+    the orchestrator (or comment on its live [ADJ]), bounded by ADJ_PER_CARD; once the cap is reached,
+    escalate as a durable `needs_input` question on the card so the user is notified and can recover it.
+    Returns True when a transient write failure requires retrying on the next tick."""
+    seen = st.setdefault("triage", {})
+    retry = False
+    for tid, t in tasks.items():
+        if t["status"] != "triage" or waiting(t) or card_type(t["title"]) in ("EPIC", "ADJ"):
+            continue
+        blocked_children = [c for c in children.get(tid, []) if tasks.get(c, {}).get("status") in OPEN]
+        if not blocked_children:
+            continue
+        ev = triage_event(board, tid)
+        key = f"{board}/{tid}/{ev}"
+        if key in seen:
+            continue
+        laps = adjs_for(tid, tasks)
+        if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
+            res = run([HERMES, "kanban", "--board", board, "comment", live,
+                       f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"],
+                      check=False)
+            if res.returncode == 0:
+                seen[key] = live
+            else:
+                retry = True
+                print(f"devflow: stalled triage notice for {board}/{tid} not posted to {live}: "
+                      f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
+        elif len(laps) >= ADJ_PER_CARD:
+            bev, failed = mark_triage_needs_input(board, tid, triage_cap_reason(tid, t, blocked_children, laps))
+            if bev is not None:
+                t["block_kind"] = "needs_input"
+                seen[key] = f"escalated:{bev}"
+            elif failed:
+                retry = True
+        else:
+            adj = open_triage_adj(board, tid, t, ev, blocked_children, next(owning_epics(tid, tasks, children), None))
+            if adj:
+                seen[key] = adj
+            else:
+                retry = True
+    for k in list(seen)[:-1000]:
+        del seen[k]
+    return retry
 
 
 def chat_receipt(profile: str, chat_id: str, tid: str, since: float) -> dict:
@@ -1673,11 +2083,11 @@ def pending(profile: str | None = None) -> list[dict]:
         for t in board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks"):
             if not waiting(t):
                 continue
-            ev = board_rows(board, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
-                                   "ORDER BY id DESC LIMIT 1", (t["id"],))
-            reason = (json.loads(ev[0]["payload"] or "{}").get("reason") or "") if ev else ""
-            ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
+            # The event the card waits on: a repeated block arrives as `block_loop_detected` (triage),
+            # and the last `blocked` then holds an older, already answered question.
             bev = block_event(board, t["id"]) or 0
+            reason = block_reason(board, bev) if bev else ""
+            ask_in = t["assignee"] if profile_bot_chat(t["assignee"] or "default") else "default"
             at = (board_rows(board, "SELECT created_at FROM task_events WHERE id = ?", (bev,)) or [{"created_at": 0}])[0]
             since = at["created_at"] or 0
             chats = [{"profile": s["notifier_profile"], "chat": f"{s['platform']}:{s['chat_id']}",
@@ -1777,13 +2187,16 @@ def cmd_tick(a) -> None:
     st = json.loads(TICK.read_text()) if TICK.exists() else {}
     mtime = tick_key(a.board)
     try:
-        tick_board(a.board, st)
+        retry = bool(tick_board(a.board, st))
     except SystemExit:
         pass
     except Exception as err:  # noqa: BLE001 - logged; the next tick retries
         print(f"{time.strftime('%FT%T')} {a.board}: {err!r}", flush=True)
     else:
-        st.setdefault("mtime", {})[a.board] = mtime
+        if retry:
+            st.setdefault("mtime", {}).pop(a.board, None)
+        else:
+            st.setdefault("mtime", {})[a.board] = mtime
     # Atomic: the hook reads this file without the lock, and a torn write would stop every board's tick.
     tmp = TICK.with_name(TICK.name + ".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
@@ -2284,7 +2697,12 @@ def cmd_check_acceptance(a) -> None:
 JUDGMENTS = ROOT / "state" / "pr-judgments.json"
 JUDGMENT_CHECK = "devflow-judgment"
 PR_ADVISOR_TITLE = "[ADV] PR 判斷 "
-GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)")
+# Delivery machinery every devflow repo shares (template). teams-transcription 2026-11-17 turned
+# .devflow/deploy.sh into a wrapper around a 27 KB project deployer that dropped build errors, so
+# two diagnostic PRs could not name a missing buildx. Changing these is judged, not only reviewed.
+DELIVERY_FILES = re.compile(r"^(\.devflow/(deploy\.sh|capture\.sh|redact\.py|up\.sh|playwright\.sh|acceptance\.py|"
+                            r"verify-base\.sh)|\.github/workflows/deploy\.yml)$")
+GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)|" + DELIVERY_FILES.pattern)
 FIX_TITLE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)   # same as the template check.py
 EXEMPTION = re.compile(r"^\s*(No-(lesson|proof)|Already-met|Base-unverifiable):\s*\S", re.M)
 # (name, asked when, question). The precondition is checked here, not left to the model: a
@@ -2309,6 +2727,14 @@ PR_QUESTIONS = [
      "This bug-fix PR adds or changes a lesson (`.devflow/lessons/L-NNNN.toml`). Does it fail to match the error "
      "this PR fixes: its root_cause describes something else, or its enforcement (the rule, test or scenario it "
      "names) would not catch this error if it came back?"),
+    ("replaces_standard", lambda pr, files: any(DELIVERY_FILES.match(f["filename"]) for f in files),
+     "This PR changes devflow's shared delivery machinery (`.devflow/deploy.sh`, `capture.sh`, `redact.py`, "
+     "`up.sh`, `playwright.sh`, `acceptance.py`, `verify-base.sh` or `.github/workflows/deploy.yml`). The standard "
+     "flow is: build, up, health check, run the smoke scenarios, and on failure capture diagnostics and roll back, "
+     "with each failing step's error output in the run log. Judging from the diff: does it replace or bypass those "
+     "steps (for example by handing the deploy to a project-specific script or another workflow), or keep a failing "
+     "step's error output (stderr, logs) out of the run log and the diagnostics artifact? Setting project values "
+     "(ports, service names, build arguments) or adding steps while keeping the standard ones does not count."),
 ]
 
 
@@ -2569,7 +2995,8 @@ def cmd_ship_merge(a) -> None:
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
     if pr["state"] == "MERGED":
-        print(json.dumps({"merged": True, "merged_sha": pr["mergeCommit"]["oid"], "note": "already merged"}))
+        print(json.dumps({"merged": True, "merged_sha": pr["mergeCommit"]["oid"], "note": "already merged",
+                          "protect": keep_protected(e)}, ensure_ascii=False))
         return
     if pr["state"] != "OPEN":
         die(f"PR #{a.pr} is {pr['state']}")
@@ -2603,8 +3030,15 @@ def cmd_ship_merge(a) -> None:
         die(f"未合併：gh pr merge 失敗：{(p.stderr or p.stdout).strip()[-400:]}")
     done = pr_meta(repo, a.pr)
     print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
-                      "fingerprint": pr["fingerprint"], "advisor": rec.get("advisor")}, ensure_ascii=False))
+                      "fingerprint": pr["fingerprint"], "advisor": rec.get("advisor"), "protect": keep_protected(e)},
+                     ensure_ascii=False))
 
+
+def keep_protected(e: dict) -> dict | None:
+    """After a merge, a repo still at contract=no gets `repo protect` (it only acts once the default
+    branch has the devflow-ci job). Was a manual [SHIP] step: teams-transcription merged three PRs
+    after main had devflow-ci and stayed contract=no, so no PR card was held to exact-head CI."""
+    return None if e.get("contract") else protect_repo(e["slug"])
 
 
 def main() -> None:
@@ -2617,6 +3051,8 @@ def main() -> None:
     p.set_defaults(fn=cmd_repo_add)
     repo.add_parser("list", aliases=["ls"]).set_defaults(fn=cmd_repo_list)
     p = repo.add_parser("path"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_path)
+    p = repo.add_parser("access", help="how the user opens the deployed service (SSH tunnel + URL)")
+    p.add_argument("slug"); p.set_defaults(fn=cmd_repo_access)
     p = repo.add_parser("sync"); p.add_argument("slug"); p.set_defaults(fn=cmd_repo_sync)
     p = repo.add_parser("protect", help="require devflow-ci on the default branch (enables PR completion_contract)")
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_protect)
@@ -2628,6 +3064,14 @@ def main() -> None:
     p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")
     p.add_argument("--ui", action="store_true", help="also add the Playwright UI scenario scaffold (.devflow/ui)")
     p.set_defaults(fn=cmd_contract)
+    p = sub.add_parser("operate", help="Hermes operates the deployed service UI: run reviewed op "
+                       ".devflow/ui/ops/<op>.spec.ts on the VM runner (operate.yml), print result + screenshots")
+    p.add_argument("slug"); p.add_argument("op")
+    p.add_argument("--arg", action="append", default=[], help="non-secret KEY=VALUE (repeatable)")
+    p.add_argument("--args", help="non-secret args as a JSON object (merged before --arg)")
+    p.add_argument("--dir", help="new or empty download dir (default: a fresh /tmp/devflow-operate/<slug>-<op>-<run>-*)")
+    p.add_argument("--timeout", type=int, default=1500, help="seconds to wait for the run")
+    p.set_defaults(fn=cmd_operate)
     check = sub.add_parser("check").add_subparsers(dest="sub", required=True)
     p = check.add_parser("plan", help="rules + Decisions risk check of an EPIC plan (read-only unless --advise)")
     p.add_argument("board"); p.add_argument("epic")

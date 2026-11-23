@@ -43,12 +43,16 @@ class Plan(unittest.TestCase):
             SHIP: ("[SHIP] s", f"EPIC: {EPIC}", [DEV], [EPIC], None),
         }
         self.df.kanban = self.show
+        self.creators: dict[str, str] = {}   # id -> Hermes created_by
+        self.statuses: dict[str, str] = {}   # id -> status (default todo)
 
     def show(self, board, cmd, tid, *args):
         title, body, parents, children, path = self.cards[tid]
         kind = title[1:title.index("]")]
-        return json.dumps({"task": {"id": tid, "title": title, "body": body, "status": "todo", "assignee": ASSIGNEE[kind],
-                                    "workspace_kind": WORKSPACE[kind], "workspace_path": path, "completion_contract": None},
+        return json.dumps({"task": {"id": tid, "title": title, "body": body, "status": self.statuses.get(tid, "todo"),
+                                    "assignee": ASSIGNEE[kind],
+                                    "workspace_kind": WORKSPACE[kind], "workspace_path": path, "completion_contract": None,
+                                    "created_by": self.creators.get(tid, "orchestrator")},
                            "parents": parents, "children": children, "runs": []})
 
     def board(self, goal: set[str]) -> None:
@@ -81,6 +85,16 @@ class Plan(unittest.TestCase):
         self.assertIn("## 驗收\n覆蓋：AC-1\n- AC-1 x\nEPIC: t_epic", fixed)
         self.assertNotIn("reviewer 批准", fixed)
 
+    def test_the_old_done_text_is_repaired_on_pending_cards(self):
+        """Its 「交 review 是完成後的下一步」 read as "complete the card, [SHIP] reviews": t_48d094f6 and
+        t_1463bbcb closed with no review (2026-11-19)."""
+        old = "PR 已開、exact-head CI 綠。交 review 是完成後的下一步，不是完成條件；合併與部署由 [SHIP] 負責。"
+        body = f"## 目標\nd\n## 本卡完成\n{old}\n## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}"
+        self.assertIsNotNone(self.df.done_problem("[OPS] o", body))
+        fixed = self.df.repaired_done(body)
+        self.assertNotIn("完成後的下一步", fixed)
+        self.assertIn("審查在本卡自己的 review 欄", fixed)
+
     def test_repair_never_folds_the_following_lines_into_the_done_section(self):
         for body in ("EPIC: t_e01\n## 本卡完成\n已交 review\n## 驗收\n覆蓋：AC-1",   # no `## 目標`
                      "EPIC: t_e01\n覆蓋：AC-1",                                     # no heading at all
@@ -92,6 +106,32 @@ class Plan(unittest.TestCase):
                 for line in body.splitlines():
                     if "本卡完成" not in line and "已交 review" not in line:
                         self.assertIn(line, fixed)
+
+    def test_tick_drops_acs_copied_from_the_epic_and_keeps_the_ids(self):
+        epic = "## 目標\ng\n## 驗收\n- AC-1 [cli] 部署成功且健康檢查通過\n  - S1 x\n- AC-2 [ui] 看到登入畫面"
+        own = "- 本卡另需：診斷輸出保留錯誤原文"
+        dev = (f"## 目標\nd\n{self.done}## 驗收\n- AC-1 [cli] 部署成功且健康檢查通過\n"
+               f"- **AC-2**：[ui] 看到登入畫面\n- AC-2 [ui] 看到登入畫面，另加條件\n{own}\nEPIC: {EPIC}")
+        self.cards[EPIC] = ("[EPIC] e", epic, [SHIP], [], None)
+        self.cards[DEV] = ("[DEV] d", dev, [], [SHIP], None)
+        self.board({DEV})
+        edits = []
+        self.df.kanban = lambda b, cmd, *a: edits.append(a) if cmd == "edit" else self.show(b, cmd, *a)
+        self.assertEqual(self.df.repair_bodies("b", EPIC, self.df.plan_cards("b", EPIC)), [DEV])
+        body = edits[0][2]
+        self.assertIn("覆蓋：AC-1, AC-2", body)
+        self.assertNotIn("部署成功且健康檢查通過", body)
+        self.assertIn("看到登入畫面，另加條件", body)             # changed wording is the card's own check
+        self.assertIn(own, body)
+        self.assertIsNone(self.df.done_problem("[DEV] d", body))
+        self.assertEqual(self.df.strip_copied_acs(body, self.df.epic_acs(epic)), body)   # idempotent
+
+    def test_a_long_body_is_a_finding_but_an_epics_acceptance_is_not_counted(self):
+        history = "PR #1 head 4927c1a、run 44306911907、review 5957244689 已核對。" * 40
+        self.cards[SHIP] = ("[SHIP] s", f"## 目標\n部署\n## 提示\n{history}\nEPIC: {EPIC}", [DEV], [EPIC], None)
+        self.cards[EPIC] = ("[EPIC] e", "## 目標\ng\n## 驗收\n- AC-1 x\n" + "  - S1 Given 很長的情境\n" * 200, [SHIP], [], None)
+        self.board({DEV})
+        self.assertEqual([f.split(":")[0] for f in self.findings("上限")], [SHIP])
 
     def test_a_done_section_past_the_judges_2000_characters_is_a_finding(self):
         body = f"## 目標\n{'很長的限制。' * 400}\n{self.done}## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}"
@@ -114,6 +154,32 @@ class Plan(unittest.TestCase):
         self.assertEqual(sorted(cards), sorted([EPIC, DEV, SHIP, "t_adj", "t_fix"]))
         outside = [f for f in self.df.plan_rules("b", EPIC, cards) if "不在本專案" in f]
         self.assertEqual([f.split(":")[0] for f in outside], ["t_fix"])
+
+    def test_an_adj_opened_by_a_worker_is_a_finding(self):
+        """teams-transcription 2026-11-18: the devops [SHIP] opened its own [ADJ] cards."""
+        for tid, who in (("t_adj1", "devops"), ("t_adj2", "devflow-tick"), ("t_adj3", "default")):
+            self.cards[tid] = (f"[ADJ] {who}", f"EPIC: {EPIC}\n## 目標\n調整", [], [], None)
+            self.creators[tid] = who
+        self.board({DEV})
+        self.assertEqual([f.split(":")[0] for f in self.findings("[ADJ] 由")], ["t_adj1"])
+
+    def test_a_card_repaired_by_more_adj_than_the_limit_is_a_finding_counting_explicit_marks_only(self):
+        """t_3b14e30d: eight [ADJ]. Bodies cite the EPIC, the SHIP and history; only marks count."""
+        self.cards[SHIP] = ("[SHIP] s", f"EPIC: {EPIC}", [DEV], [EPIC], None)
+        marks = {"t_adj1": ("[ADJ] 流程阻塞 t_ship", f"EPIC: {EPIC}"),
+                 "t_adj2": ("[ADJ] 處理失敗卡 t_ship", f"EPIC: {EPIC}"),
+                 "t_adj3": ("[ADJ] 改 smoke", f"EPIC: {EPIC}\n處理：t_dev、t_ship\n內文"),
+                 "t_adj4": ("[ADJ] 收斂", f"EPIC: {EPIC}\n原 SHIP t_ship、原 OPS t_dev 的歷史"),
+                 "t_adj5": ("[ADJ] 流程阻塞 t_ship", f"EPIC: {EPIC}")}
+        for tid, (title, body) in marks.items():
+            self.cards[tid] = (title, body, [], [], None)
+        self.statuses.update(t_adj1="done", t_adj2="done", t_adj5="archived")
+        self.board({DEV})
+        found = self.findings("張 [ADJ] 處理這張卡")
+        self.assertEqual([f.split(":")[0] for f in found], [SHIP])
+        self.assertIn("t_adj1, t_adj2, t_adj3", found[0])
+        self.statuses["t_adj3"] = "archived"
+        self.assertEqual(self.findings("張 [ADJ] 處理這張卡"), [])   # two marks: within the limit
 
 
 if __name__ == "__main__":

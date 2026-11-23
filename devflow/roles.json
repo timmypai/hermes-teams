@@ -46,6 +46,7 @@
     "ADV":  {"assignee": "default",      "workspace": "scratch"}
   },
   "advisor": {"model": "claude-opus-5.5", "provider": "copilot"},
+  "host": {"ssh": "ubuntu@161.33.168.214", "_comment": "使用者打開已部署服務的方式：SSH tunnel 到這台主機的 127.0.0.1:<port>（devflow repo access）"},
   "decisions": {"url": "https://api.openai.com/v1/decisions", "model": "gpt-6-luna", "flag": 0.5, "pass": 0.8},
   "pstack_always_off": ["setup-pstack", "make-bot-ui", "ketchup-video", "automate-me"],
   "obsolete_skills": {
@@ -171,7 +172,7 @@
                  "create-verification-skill", "maintain-verification-skill"],
       "gh": "builder",
       "git_name": "hermes-devops",
-      "config": {}
+      "config": {"platform_toolsets.cli": "[terminal, file, code_execution, skills, web, clarify, vision]"}
     }
   }
 }

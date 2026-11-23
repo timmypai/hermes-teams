@@ -41,6 +41,7 @@ metadata:
 - `[smoke]` 情境只能讀，不能寫資料：部署後會對正式服務跑。
 - 情境不得 skip、不得只在本機能過；flaky 視同失敗（`retries: 0`）。
 - repo 還沒有任何可腳本化的驗證方式時：`skill_view pstack:create-verification-skill`，照它的方法盤點啟動/操作/證據，但產物寫成 `.devflow/verify.sh` 的 `scenario` 與 `.devflow/ui/`（不是 `.cursor/skills`）。
+- 卡片要你寫「操作腳本」（Bot 對正式服務的 UI 操作，例如登入管理頁後建立或選擇資料、讀出 id）：寫在 `.devflow/ui/ops/<op>.spec.ts`，一個檔一個 `test`，形狀照 `ops/look.spec.ts`：參數讀 `DEVFLOW_OP_ARGS`（JSON），秘密讀環境變數（來自 repo secret `DEVFLOW_OPS_ENV`），結果寫 `DEVFLOW_OP_RESULT`（JSON），關鍵畫面截圖到 `/evidence/<名稱>.png`。每一步用 `expect` 斷言畫面真的到了（找不到就失敗，不要默默略過），寫入前先確認不是重複建立（同名資料已存在就選它）。秘密不寫進結果、截圖或 console。操作腳本不是情境：驗收不會跑 `ops/`，它的正確性另外用一個情境證明（在 CI 的一次性服務上跑同一套步驟）。
 
 ## 4. 驗證
 - 跑 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）與 `bash .devflow/check.sh`（規則與教訓，CI 的必過 `check` job）。Hermes 容器內沒有 Docker：映像建置、`verify.sh`、base 紅綠證明與部署驗證交給 CI；要先看情境在 base 是否紅燈，push 後用 `repro.yml`（見 5.5）或直接看 PR CI 的 `verify-base`。
@@ -103,6 +104,7 @@ kanban_request_review(
             "log": ["<做了什麼> — <為什麼>", ...], "followups": [...]})
 ```
 reviewer 會被自動派工。退件時這張卡回到你手上（同一 worktree、同一 PR），修正 → push → 等 CI → 再 `kanban_request_review(reviewer="reviewer", ...)`。
+作者只用 `kanban_request_review` 交出這張卡，不呼叫 `kanban_complete`：卡片 `## 本卡完成` 的「完成條件」是送審的條件，審查在這張卡自己的 review 欄，由 reviewer 核准後完成；`[SHIP]` 不審查。自己 complete 的卡不能再回 review 欄，PR 就沒人審、合併不了（teams-transcription t_48d094f6、t_1463bbcb）。
 
 ## 不做
 不 merge、不部署、不 push 到 main、不改 `.github/workflows` 的部署目標（`[OPS]` 卡除外）。範圍外問題寫進 `followups`。
