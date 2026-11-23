@@ -181,6 +181,48 @@ class Plan(unittest.TestCase):
         self.statuses["t_adj3"] = "archived"
         self.assertEqual(self.findings("張 [ADJ] 處理這張卡"), [])   # two marks: within the limit
 
+    def test_plan_cards_reads_full_hermes_sqlite_without_calling_kanban_show(self):
+        """#1a: real boards load the whole plan in one SQLite read instead of N `kanban show` subprocesses."""
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                  workspace_kind TEXT, workspace_path TEXT, completion_contract TEXT, created_by TEXT,
+                  result TEXT, goal_mode INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);""")
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+                (EPIC, "[EPIC] e", "## 驗收\n- AC-1 [cli] x", "todo", "orchestrator", "dir", str(self.repo), None, "default", None, 0),
+                (DEV, "[DEV] d", f"## 目標\nd\n{self.done}## 驗收\n覆蓋：AC-1\nEPIC: {EPIC}", "ready", "developer", "worktree", str(self.repo), None, "orchestrator", None, 1),
+                (SHIP, "[SHIP] s", f"EPIC：{EPIC}", "todo", "devops", "dir", str(self.repo), None, "orchestrator", None, 0),
+                ("t_arch", "[DEV] old", f"EPIC: {EPIC}", "archived", "developer", "worktree", None, None, "orchestrator", None, 1),
+                ("t_pradv", "[ADV] PR 判斷 o/r#1", f"EPIC: {EPIC}", "done", "default", "scratch", None, None, "devflow-judgment", None, 0),
+                ("t_other", "[DEV] other", "EPIC: t_0bad0bad", "todo", "developer", "worktree", None, None, "orchestrator", None, 1),
+            ])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [
+                (DEV, SHIP), (SHIP, EPIC), ("t_pradv", DEV), ("t_other", DEV),
+            ])
+        show_calls = []
+        self.df.kanban = lambda *a: show_calls.append(a) or (_ for _ in ()).throw(AssertionError(f"unexpected kanban call {a}"))
+        cards = self.df.plan_cards("b", EPIC)
+        self.assertEqual(show_calls, [])
+        self.assertEqual(sorted(cards), sorted([EPIC, DEV, SHIP]))
+        self.assertTrue(cards[DEV]["goal_mode"])
+        self.assertEqual(cards[DEV]["parents"], [])       # PR advisor & other-EPIC card excluded
+        self.assertEqual(cards[DEV]["children"], [SHIP])
+        self.assertEqual(cards[SHIP]["parents"], [DEV])
+
+    def test_pr_card_covering_only_manual_acs_is_a_finding(self):
+        """#3: teams-transcription t_b80d91b0 (PR #12) covered only [manual] ACs and failed check acceptance at review."""
+        epic_body = ("## 目標\ng\n## 驗收\n- AC-4 [manual] 真人語音\n- AC-5 [manual] 撤權\n"
+                     "- AC-6 [cli] 工程前置\n  - S1 單場授權\n    - Given g\n    - When w\n    - Then t\n")
+        self.cards[EPIC] = ("[EPIC] e", epic_body, [SHIP], [], None)
+        self.cards[DEV] = ("[DEV] d", f"## 目標\nd\n{self.done}## 驗收\n覆蓋：AC-4, AC-5\nEPIC: {EPIC}", [], [SHIP], None)
+        self.board({DEV})
+        found = self.findings("全為 [manual]")
+        self.assertEqual([f.split(":")[0] for f in found], [DEV])
+        # Covering at least one non-manual AC passes.
+        self.cards[DEV] = ("[DEV] d", f"## 目標\nd\n{self.done}## 驗收\n覆蓋：AC-4, AC-6\nEPIC: {EPIC}", [], [SHIP], None)
+        self.assertEqual(self.findings("全為 [manual]"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

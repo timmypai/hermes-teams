@@ -380,6 +380,51 @@ class Tick(JudgmentCase):
             self.df.gate("b", REPO, 7)
         self.assertEqual(self.f.statuses, [])
 
+    def test_tick_prs_isolates_per_card_failure_and_supports_fullwidth_epic_ref(self) -> None:
+        """#5 & #8: one failing PR card must not abort tick_prs for other PRs; EPIC：t_... is recognized."""
+        self.f.answers = {"unlabeled_fix": 0.9}
+        self.f.cards["t_bad"] = {"status": "review", "body": "EPIC: t_00000abc",
+                                 "runs": [{"status": "review", "metadata": {"published_pr": f"https://github.com/{REPO}/pull/999"}}]}
+        self.f.cards["t_good"] = {"status": "review", "body": "EPIC：t_00000abc\n",
+                                  "runs": [{"status": "review", "metadata": {"published_pr": self.f.pr["url"]}}]}
+        orig_meta = self.df.pr_meta
+        self.df.pr_meta = lambda repo, n: (_ for _ in ()).throw(SystemExit(1)) if n == 999 else orig_meta(repo, n)
+        tasks = [
+            {"id": "t_bad", "title": "[DEV] bad", "assignee": "reviewer", "status": "review", "completion_contract": REPO},
+            {"id": "t_good", "title": "[DEV] good", "assignee": "reviewer", "status": "review", "completion_contract": REPO},
+        ]
+        err = io.StringIO()
+        from contextlib import redirect_stderr
+        with redirect_stderr(err):
+            retry = self.df.tick_prs("b", REPO, tasks)
+        self.assertTrue(retry)
+        adv = self.record()["advisor"]
+        self.assertIsNotNone(adv)
+        self.assertIn("EPIC: t_00000abc", self.f.cards[adv]["body"])
+
+    def test_advisor_verdict_handles_missing_or_unreadable_advisor_card_without_dying(self) -> None:
+        """#7: unreadable [ADV] returns None safely; deleted [ADV] (absent from kanban.db) clears stale pointer."""
+        import sqlite3
+        from contextlib import closing, redirect_stderr
+        self.f.answers = {"unlabeled_fix": 0.8}
+        self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", advisor="t_gone")
+        self.df.kanban = lambda *a: (_ for _ in ()).throw(SystemExit(1))
+        # Without kanban.db (transient error), keep pointer and return None without crashing.
+        self.df.BOARDS = self.root / "boards"
+        with redirect_stderr(io.StringIO()):
+            self.assertIsNone(self.df.advisor_verdict("b", self.record()))
+        self.assertEqual(self.record()["advisor"], "t_gone")
+        # With kanban.db where t_gone does not exist, clear stale pointer so tick_prs can recreate.
+        db = self.df.BOARDS / "b" / "kanban.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        rec = self.record()
+        with redirect_stderr(io.StringIO()):
+            self.assertIsNone(self.df.advisor_verdict("b", rec))
+        self.assertIsNone(rec["advisor"])            # in-memory rec synced so gate()/ensure_pr_advisor sees it immediately
+        self.assertIsNone(self.record()["advisor"])
 
 
 if __name__ == "__main__":
