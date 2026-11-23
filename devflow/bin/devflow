@@ -1283,6 +1283,8 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     body_by_tid = {}
     for msg in plan_body_rules(cards):
         body_by_tid[msg.split(":", 1)[0]] = msg
+    decided_m = re.search(r"^##\s*使用者決定[ \t]*\n(.*?)(?=^## |\Z)", cards[epic]["body"] or "", flags=re.M | re.S)
+    decided = decided_m.group(1) if decided_m else ""
     for tid, c in cards.items():
         kind = card_type(c["title"])
         if kind not in CARDS:
@@ -1295,10 +1297,15 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if kind not in ("EPIC", "ADJ", "ADV") and len(laps := adjs_for(tid, cards)) > ADJ_PER_CARD:
             found.append(f"{tid}: 已有 {len(laps)} 張 [ADJ] 處理這張卡（{', '.join(sorted(laps))}）：不再開下一輪，照 devflow-orchestrate"
                          "「C. 調整」把卡在哪、試過什麼、A/B 選項交給使用者選路")
-        if kind == "SHIP" and len(post_hoc := ship_post_hoc_parents(tid, cards)) > SHIP_PATCH_LIMIT:
+        if (
+            kind == "SHIP"
+            and len(post_hoc := ship_post_hoc_parents(tid, cards)) > SHIP_PATCH_LIMIT
+            and tid not in decided
+            and any(cards[p]["status"] != "done" and p not in decided for p in post_hoc)
+        ):
             found.append(f"{tid}: [SHIP] 開始執行後已事後追加 {len(post_hoc)} 張 [DEV]/[OPS] 補丁卡"
                          f"（{', '.join(post_hoc)}，上限 {SHIP_PATCH_LIMIT}）：停止繼續加開補丁 PR，"
-                         "請 orchestrator 透過 needs_input 交給使用者決定（繼續補 PR、改手動完成剩餘驗收或另開新 EPIC）")
+                         "請 orchestrator 透過 needs_input 交給使用者決定（作廢多出的補丁卡、將核准卡號記於 EPIC `## 使用者決定` 或另開新 EPIC）")
         if kind == "ADJ" and c.get("created_by") and c["created_by"] not in ADJ_CREATORS:
             found.append(f"{tid}: [ADJ] 由 {c.get('created_by')} 建立；[ADJ] 只由 orchestrator、dispatcher tick、"
                          "advisor 建，其他角色照自己 skill 的失敗處理建卡或寫 followups（devflow skill「誰定流程」）")

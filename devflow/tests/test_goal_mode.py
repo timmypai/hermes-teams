@@ -270,6 +270,13 @@ class Plan(unittest.TestCase):
         found = [f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f]
         self.assertEqual([f.split(":")[0] for f in found], [SHIP])
         self.assertIn("t_p1, t_p2, t_p3", found[0])
+        # Recording user approval for t_p3 in EPIC `## 使用者決定` resolves the finding.
+        cards[EPIC]["body"] = epic_body + "\n## 使用者決定\n- 核准繼續 t_p3\n"
+        self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [])
+        # When all post-hoc PR cards are already `done` (no open patch card holding [SHIP]), [SHIP] is not blocked.
+        cards[EPIC]["body"] = epic_body
+        cards["t_p3"]["status"] = "done"
+        self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [])
 
     def test_work_card_opened_by_non_planner_is_a_finding(self):
         """Work cards ([RES]/[ARCH]/[DEV]/[OPS]/[SHIP]) must be planned by orchestrator (or devops for
