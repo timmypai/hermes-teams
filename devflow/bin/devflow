@@ -1675,10 +1675,22 @@ def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[
     return ran
 
 
+def runnable_plan_adj(adjs: list[str], cards: dict[str, dict]) -> str | None:
+    """An open [ADJ] that will execute without waiting on unfinished parents or user input: already
+    `ready`/`running`, or `blocked (transient)` (woken immediately by `hand_to_adj`'s `resume`).
+    A `todo`/`scheduled` [ADJ] parked on dependencies would not wake on a comment."""
+    for a in adjs:
+        t = cards[a]
+        st, bk = t.get("status"), t.get("block_kind")
+        if st in ("ready", "running") or (st == "blocked" and bk == "transient"):
+            return a
+    return None
+
+
 def open_plan_adj(board: str, epic: str, cards: dict[str, dict], rules: list[str], st: dict) -> tuple[str | None, bool]:
     """Wake orchestrator when a sleeping EPIC has actionable deterministic rule findings: comment on
-    an already-live [ADJ] for the plan, else open one `[ADJ] 計畫規則修正 <epic>` (deduped by findings
-    hash and capped at ADJ_PER_CARD). Returns `(adj_id, retry)`."""
+    an already-runnable [ADJ] for the plan, else open one `[ADJ] 計畫規則修正 <epic>` (deduped by
+    findings hash and capped at ADJ_PER_CARD). Returns `(adj_id, retry)`."""
     import hashlib
     plan_adj = st.setdefault("plan_adj", {})
     if not rules:
@@ -1688,7 +1700,7 @@ def open_plan_adj(board: str, epic: str, cards: dict[str, dict], rules: list[str
     if plan_adj.get(epic) == rkey:
         return None, False
     adjs = [t for t, c in cards.items() if card_type(c["title"]) == "ADJ" and c.get("status") != "archived"]
-    if (live := live_adj(adjs, cards)):
+    if (live := runnable_plan_adj(adjs, cards)):
         msg = f"devflow check plan 發現待修正的計畫規則錯誤（{epic}）：\n" + "\n".join(f"- {f}" for f in rules)
         if hand_to_adj(board, live, cards[live], msg):
             plan_adj[epic] = rkey
@@ -1870,18 +1882,28 @@ def rate_limited_advisors(board: str) -> list[tuple[str, int]]:
 
 def release_rate_limited_advisors(board: str, st: dict) -> bool:
     """Clear pinned external provider overrides on [ADV] cards hitting rate_limit_cooldown and resume
-    them on the profile's default model/provider so quota walls (e.g., 184h Copilot limit) never stall PRs."""
+    them on the profile's default model/provider so quota walls (e.g., 184h Copilot limit) never stall PRs.
+    Persists in-progress recovery in `pending_fallback_adv` before clearing `provider_override` so a
+    transient `resume` failure retries on the next tick even after `provider_override` becomes NULL."""
     fallback_adv = st.setdefault("fallback_adv", [])
+    pending_adv = st.setdefault("pending_fallback_adv", {})
     retry = False
     for tid, ev in rate_limited_advisors(board):
         key = f"{board}/{tid}/{ev}"
-        if key in fallback_adv:
+        if key not in fallback_adv and key not in pending_adv:
+            pending_adv[key] = {"board": board, "tid": tid, "ev": ev, "cleared": False}
+    for key, rec in list(pending_adv.items()):
+        if rec.get("board") != board:
             continue
+        tid = rec["tid"]
         try:
-            kanban(board, "set-model", tid, "none")
+            if not rec.get("cleared"):
+                kanban(board, "set-model", tid, "none")
+                rec["cleared"] = True
             resume(board, tid, "devflow tick：[ADV] 覆寫的外部 provider 觸發配額限制，已改回 profile 預設模型重派。")
             fallback_adv.append(key)
-        except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+            del pending_adv[key]
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - keep pending record and retry on next tick
             retry = True
             print(f"devflow: rate-limited [ADV] {board}/{tid} fallback failed: {err}", file=sys.stderr)
     del fallback_adv[:-1000]

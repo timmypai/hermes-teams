@@ -989,9 +989,25 @@ class RouteQuestions(unittest.TestCase):
         }
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 1)
+        # An existing dependency-waiting `todo` [ADJ] cannot wake on a comment: open_plan_adj must schedule
+        # a new runnable [ADJ] instead of commenting on the sleeping `todo` [ADJ].
+        calls = []
+        self.df.run = lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(
+            returncode=0, stdout="Created t_adj00002\n", stderr="")
+        cards_with_sleeping_adj = {
+            "t_ep01": epic,
+            "t_dev1": dev,
+            "t_adj_sleep": {"id": "t_adj_sleep", "title": "[ADJ] existing", "status": "todo", "parents": ["t_dev1"]},
+        }
+        st2 = {}
+        res = self.df.open_plan_adj("b", "t_ep01", cards_with_sleeping_adj, ["t_dev1: wrong assignee"], st2)
+        self.assertEqual(res, ("t_adj00002", False))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("create", calls[0])
 
     def test_release_rate_limited_advisors_clears_override_and_resumes_once(self):
-        """Item 5: an [ADV] stuck in rate_limit_cooldown on a pinned provider clears override and resumes."""
+        """Item 5: an [ADV] stuck in rate_limit_cooldown on a pinned provider clears override and resumes,
+        and retries resume on the next tick if set-model succeeded but resume transiently failed."""
         self.board.db.execute("ALTER TABLE tasks ADD COLUMN provider_override TEXT")
         self.board.db.execute(
             "INSERT INTO tasks (id, title, body, status, block_kind, assignee, provider_override) VALUES (?,?,?,?,?,?,?)",
@@ -1009,11 +1025,23 @@ class RouteQuestions(unittest.TestCase):
                 return ""
             return orig_kanban(board, cmd, *args)
         self.df.kanban = kanban
-        self.df.resume = lambda board, tid, note="": resumed.append((board, tid, note))
-        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        fail_once = [True]
+
+        def flaky_resume(board, tid, note=""):
+            if fail_once[0]:
+                fail_once[0] = False
+                raise SystemExit(1)
+            resumed.append((board, tid, note))
+        self.df.resume = flaky_resume
+        with redirect_stderr(io.StringIO()):
+            self.assertTrue(self.df.release_rate_limited_advisors("b", self.st))
         self.assertEqual(cleared, [("t_adv1", "none")])
+        self.assertEqual(resumed, [])
+        # Second tick: provider_override is already NULL in DB, but pending recovery retries resume and completes.
+        self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
+        self.assertEqual(cleared, [("t_adv1", "none")])   # set-model not called a second time
         self.assertEqual([r[:2] for r in resumed], [("b", "t_adv1")])
-        # Second tick after override cleared: no-op.
+        # Third tick: completely settled, no-op.
         self.assertFalse(self.df.release_rate_limited_advisors("b", self.st))
         self.assertEqual(len(resumed), 1)
 
