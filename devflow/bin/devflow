@@ -1458,9 +1458,17 @@ def apply_op(board: str, op: dict) -> str:
 OPS_RE = re.compile(r"```devflow-ops\s*\n(.*?)```", re.S)
 
 
-def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[str]) -> None:
-    """Run ```devflow-ops``` JSON blocks the orchestrator posted on its own card, once each."""
+def task_block_kind(board: str, tid: str) -> str | None:
+    """`kanban show --json` omits `block_kind`; read it directly from the board DB."""
+    rows = board_rows(board, "SELECT block_kind FROM tasks WHERE id = ?", (tid,))
+    return rows[0]["block_kind"] if rows else None
+
+
+def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[str]) -> int:
+    """Run ```devflow-ops``` JSON blocks the orchestrator posted on its own card, once each.
+    Returns the number of new blocks processed in this call."""
     import hashlib
+    ran = 0
     for c in comments:
         if c.get("author") != "orchestrator":
             continue
@@ -1469,6 +1477,7 @@ def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[
             if key in applied:
                 continue
             applied.append(key)
+            ran += 1
             try:
                 ops = json.loads(block)
                 ops = ops if isinstance(ops, list) else [ops]
@@ -1487,12 +1496,15 @@ def apply_comment_ops(board: str, tid: str, comments: list[dict], applied: list[
                     done.append("第一個失敗後就停止；修正原因後，把失敗與未執行的操作貼成新的 devflow-ops 區塊。")
                     break
             kanban(board, "comment", tid, "devflow-ops 結果：\n" + "\n".join(done))
+    return ran
 
 
-def tick_board(board: str, st: dict) -> None:
+def tick_board(board: str, st: dict) -> bool:
     repo = entry(board)["repo"]
     plans, advised = st.setdefault("plans", {}), st.setdefault("advised", {})
     applied, settled = st.setdefault("applied", []), st.setdefault("settled", [])
+    wake_ops = st.setdefault("wake_ops", [])
+    retry = False
     tasks = json.loads(kanban(board, "list", "--json"))
     for t in tasks:
         kind, tid = card_type(t["title"]), t["id"]
@@ -1503,7 +1515,22 @@ def tick_board(board: str, st: dict) -> None:
             continue
         d = json.loads(kanban(board, "show", tid, "--json"))
         # 1. board edits the orchestrator asked for (workers cannot mutate other cards).
-        apply_comment_ops(board, tid, d.get("comments") or [], applied)
+        ran = apply_comment_ops(board, tid, d.get("comments") or [], applied)
+        wkey = f"{board}/{tid}"
+        bk = task_block_kind(board, tid) if d["task"]["status"] == "blocked" else None
+        if ran and d["task"]["status"] == "blocked" and bk == "transient" and wkey not in wake_ops:
+            wake_ops.append(wkey)
+        if wkey in wake_ops:
+            if d["task"]["status"] != "blocked" or bk != "transient":
+                wake_ops.remove(wkey)
+            else:
+                try:
+                    resume(board, tid, "devflow tick：已套用 devflow-ops，請核對結果並繼續。")
+                    wake_ops.remove(wkey)
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+                    retry = True
+                    print(f"devflow: transient {board}/{tid} could not be resumed after devflow-ops: {err}",
+                          file=sys.stderr)
         if t["status"] == "done":
             settled.append(final)
         # 2. plan check when an EPIC waits on a plan that changed since the last check
@@ -1524,9 +1551,10 @@ def tick_board(board: str, st: dict) -> None:
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
     release_held(board, st)
-    retry = route_questions(board, st)
+    retry = route_questions(board, st) or retry
     del applied[:-1000]
     del settled[:-1000]
+    del wake_ops[:-1000]
     return retry
 
 
@@ -1869,6 +1897,35 @@ def user_must_answer(card: dict, question: str) -> float | None:
     return float(p) if isinstance(p, (int, float)) else None
 
 
+def live_adj(laps: list[str], tasks: dict[str, dict]) -> str | None:
+    """An open [ADJ] that can still receive a new question: active/queued, waiting on the user, or
+    transiently blocked (woken by `resume`). A crashed/gave_up [ADJ] (blocked with no block_kind) is not live."""
+    for a in laps:
+        t = tasks[a]
+        st, bk = t["status"], t.get("block_kind")
+        if st in ("ready", "running", "todo", "scheduled") or waiting(t) or (st == "blocked" and bk == "transient"):
+            return a
+    return None
+
+
+def hand_to_adj(board: str, live: str, t_adj: dict, message: str) -> bool:
+    """Deliver `message` to `live`, waking it via `resume` when parked in a transient block.
+    Returns True only when the [ADJ] received the message and (if transient) was resumed."""
+    res = run([HERMES, "kanban", "--board", board, "comment", live, message], check=False)
+    if res.returncode != 0:
+        print(f"devflow: notice not posted to {board}/{live}: {(res.stderr or res.stdout).strip()[-300:]}",
+              file=sys.stderr)
+        return False
+    if t_adj["status"] == "blocked" and t_adj.get("block_kind") == "transient":
+        try:
+            resume(board, live)
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - caller falls back or retries
+            print(f"devflow: transient [ADJ] {board}/{live} could not be resumed: {err}", file=sys.stderr)
+            return False
+        t_adj["status"], t_adj["block_kind"] = "ready", None
+    return True
+
+
 def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> dict[str, str]:
     """{card: its open [ADJ]} for waiting cards whose current question went to the orchestrator.
     st["flow"]["board/card/event"] = the [ADJ] id, or "user" (asked as before)."""
@@ -1884,16 +1941,11 @@ def flow_blocks(board: str, tasks: dict[str, dict], children: dict[str, list], s
         if key not in flow:
             question = block_reason(board, ev)
             laps = adjs_for(tid, tasks)
-            if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
-                # Handled only once the [ADJ] has the question; a failed comment asks the user, like a
-                # failed create (the question must reach someone this tick, not wait for a retry).
-                res = run([HERMES, "kanban", "--board", board, "comment", live,
-                           f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"],
-                          check=False)
-                if res.returncode != 0:
-                    print(f"devflow: question of {board}/{tid} not posted to {live}, asking the user: "
-                          f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
-                flow[key] = live if res.returncode == 0 else "user"
+            if (live := live_adj(laps, tasks)):
+                # Handled only once the [ADJ] has the question (and is woken if transient); a failure
+                # asks the user, like a failed create (the question must reach someone this tick).
+                msg = f"{tid} 又停在 block 事件 {ev}，由本卡一併處理（tick 不另建 [ADJ]）：\n{question[:3000]}"
+                flow[key] = live if hand_to_adj(board, live, tasks[live], msg) else "user"
             else:
                 p = None if len(laps) >= ADJ_PER_CARD else user_must_answer(t, question)
                 adj = None if p is None or p > 1 - DECISIONS["pass"] else open_flow_adj(
@@ -2022,16 +2074,12 @@ def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list]
         if key in seen:
             continue
         laps = adjs_for(tid, tasks)
-        if (live := next((a for a in laps if tasks[a]["status"] not in OPEN_ADJ), None)):
-            res = run([HERMES, "kanban", "--board", board, "comment", live,
-                       f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"],
-                      check=False)
-            if res.returncode == 0:
+        if (live := live_adj(laps, tasks)):
+            msg = f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"
+            if hand_to_adj(board, live, tasks[live], msg):
                 seen[key] = live
             else:
                 retry = True
-                print(f"devflow: stalled triage notice for {board}/{tid} not posted to {live}: "
-                      f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
         elif len(laps) >= ADJ_PER_CARD:
             bev, failed = mark_triage_needs_input(board, tid, triage_cap_reason(tid, t, blocked_children, laps))
             if bev is not None:
