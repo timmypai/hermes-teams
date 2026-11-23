@@ -283,11 +283,11 @@ def matrix(report: dict) -> str:
 
 
 def copy_sources(ev_dir: Path) -> None:
-    """The scenario code that produced this report: .devflow/verify.sh and .devflow/ui/**/*.ts."""
+    """The scenario code that produced this report: .devflow/verify.sh, .devflow/scenarios.json and .devflow/ui/**/*.ts."""
     dest = ev_dir / "sources"
     shutil.rmtree(dest, ignore_errors=True)
     root = Path(".devflow")
-    files = [root / "verify.sh"]
+    files = [root / "verify.sh", root / "scenarios.json"]
     if (root / "ui").is_dir():
         files += sorted(p for p in (root / "ui").rglob("*.ts") if "node_modules" not in p.parts)
     for f in files:

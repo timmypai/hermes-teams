@@ -977,24 +977,29 @@ class RouteQuestions(unittest.TestCase):
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 1)
         self.assertIn("[ADJ] 計畫規則修正 t_ep01", created[0])
-        # Plan fingerprint changes (body edit) while t_adj00001 is still ready: must NOT open a duplicate [ADJ].
-        self.st["plans"].clear()
+        # Second tick while t_adj00001 is still ready (and even if another card's body changes): must NOT open a duplicate [ADJ].
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 1)
-        # If t_adj00001 finishes (`done`) WITHOUT fixing the rule, open_plan_adj must schedule a 2nd repair [ADJ].
+        plan["t_dev1"]["body"] = "## 目標\nedited"
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 1)
+        # If t_adj00001 finishes (`done`) WITHOUT fixing the rule (and without clearing st["plans"]),
+        # the next tick_board must invalidate/re-evaluate and schedule a 2nd repair [ADJ].
         plan["t_adj00001"]["status"] = "done"
-        self.st["plans"].clear()
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 2)
-        # Once 2 plan-repair [ADJ] cards complete without resolving (or a new rule like SHIP patch-limit fires),
-        # open_plan_adj escalates to a durable needs_input block on the EPIC instead of silently caching.
-        plan["t_adj00002"]["status"] = "done"
+        # Once the 2nd plan-repair [ADJ] also completes (`done`) without resolving (still without clearing st["plans"]),
+        # the next tick_board escalates to a durable needs_input block on the EPIC instead of silently caching.
         self.board.card("t_ep01", "[EPIC] e", status="todo", assignee="orchestrator")
-        res = self.df.open_plan_adj("b", "t_ep01", plan, ["t_ship1: [SHIP] 開始執行後已事後追加 3 張 [DEV]/[OPS] 補丁卡"], self.st)
-        self.assertEqual(res, ("user", False))
+        plan["t_adj00002"]["status"] = "done"
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
         self.assertEqual(plan["t_ep01"]["block_kind"], "needs_input")
         row = self.board.db.execute("SELECT status, block_kind FROM tasks WHERE id='t_ep01'").fetchone()
         self.assertEqual(row, ("blocked", "needs_input"))
+        # Subsequent tick while the EPIC is blocked on needs_input is a no-op.
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
         # Body-length-only findings (actionable_rules=[]) never open an [ADJ].
         self.st["plans"].clear()
         self.st["plan_adj"].clear()

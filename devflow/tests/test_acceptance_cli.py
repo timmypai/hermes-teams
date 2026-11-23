@@ -122,6 +122,7 @@ class FakeGitHub:
         self.runs: dict[str, list[dict]] = {}
         self.artifacts: dict[int, dict[str, dict]] = {}
         self.compare: dict[tuple[str, str], str] = {}
+        self.contents: dict[tuple[str, str], dict] = {}
         self.calls: list[list[str]] = []
         self.tip = D  # newest commit of the default branch
 
@@ -140,6 +141,11 @@ class FakeGitHub:
                 out = {"artifacts": [{"name": n, "expired": False} for n in self.artifacts.get(int(m[1]), {})]}
             elif m := re.fullmatch(rf"repos/{REPO}/compare/(\w+)\.\.\.(\w+)", path):
                 out = {"status": self.compare.get((m[1], m[2]), "diverged")}
+            elif m := re.fullmatch(rf"repos/{REPO}/contents/(.+)", path):
+                ref = cmd[2].split("ref=")[1].split("&")[0] if "ref=" in cmd[2] else ""
+                out = self.contents.get((m[1], ref))
+                if out is None:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="404")
         elif cmd[:3] == ["gh", "run", "download"]:
             dest = Path(cmd[cmd.index("-D") + 1])
             for name, data in self.artifacts[int(cmd[3])][cmd[cmd.index("-n") + 1]].items():
@@ -423,6 +429,125 @@ class CheckAcceptance(Case):
         self.pr.update(state="OPEN", mergeCommit=None)
         code, rep = self.check()
         self.assertEqual((code, self.rows(rep)["AC-1"]["verdict"], self.rows(rep)["AC-3"]["verdict"]), (1, "FAIL", "UNJUDGED"))
+
+    def test_review_and_final_resolve_scenarios_json_from_verified_git_revisions_not_main_checkout(self) -> None:
+        """When `.devflow/scenarios.json` exists only on the PR head and the board checkout remains on `main`,
+        `check acceptance --review` resolves scenarios from the verified PR head, and final acceptance uses the
+        verified default-branch revision rather than arbitrary uncommitted local checkout files."""
+        import subprocess
+        repo_dir = self.root / "repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        git = lambda *args: subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True)
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test")
+        (repo_dir / "README.md").write_text("init\n")
+        git("add", "README.md")
+        git("commit", "-m", "init main")
+        main_sha = git("rev-parse", "HEAD").stdout.strip()
+
+        git("checkout", "-b", "feat")
+        (repo_dir / ".devflow").mkdir(parents=True, exist_ok=True)
+        scenarios_payload = {
+            sid: {
+                "description": s["description"],
+                "smoke": s["smoke"],
+                "given": s["given"],
+                "when": s["when"],
+                "then": s["then"],
+            }
+            for sid, s in self.spec.items()
+        }
+        (repo_dir / ".devflow" / "scenarios.json").write_text(json.dumps(scenarios_payload, ensure_ascii=False))
+        git("add", ".devflow/scenarios.json")
+        git("commit", "-m", "add scenarios on feat")
+        feat_sha = git("rev-parse", "HEAD").stdout.strip()
+
+        # Keep the board's main checkout on `main` where `.devflow/scenarios.json` does NOT exist!
+        git("checkout", "main")
+        self.assertFalse((repo_dir / ".devflow" / "scenarios.json").exists())
+
+        self.body = (
+            "## 目標\n待辦清單\n\n## 驗收\n"
+            "- AC-1 [ui] 使用者可新增待辦\n"
+            "- AC-2 [cli] 匯出 CSV\n"
+            "- AC-3 [manual] README 說明安裝步驟\n"
+        )
+        self.pr["state"] = "OPEN"
+        self.pr["headRefOid"] = feat_sha
+        self.pr_run = wf_run(100, "ci.yml", "pull_request", feat_sha, "feat")
+        # 1) `--review` resolves `.devflow/scenarios.json` from the verified PR head `feat_sha` and PASSES.
+        self.materialize()
+        self.gh.artifacts[100] = {
+            f"devflow-evidence-pr-{feat_sha}-1": self.evidence("pr", feat_sha, self.pr_run, [self.scenario(x) for x in self.ids["pr"]]),
+            f"devflow-evidence-base-{feat_sha}-1": {
+                "acceptance.json": self.report("base", feat_sha, self.pr_run, [self.scenario(x, "passed" if how == "green" else how) for x, how in self.base.items()]),
+                "acceptance-base.json": {
+                    "identity": self.report("base", feat_sha, self.pr_run, [])["identity"],
+                    "base_sha": main_sha,
+                    "results": [{"id": x, "verdict": {"red": "RED", "green": "GREEN"}[how], "failed_phase": None, "error": "", "exempt": None} for x, how in self.base.items()],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = self.df.check_acceptance("b", EPIC, [5], review=True, evidence=[], tmp=Path(tmp))
+        self.assertEqual(rep["problems"], [])
+        self.assertEqual([r["verdict"] for r in rep["criteria"]], ["PASS", "PASS"])
+
+        # 2) In final mode, writing an uncommitted `.devflow/scenarios.json` into the local checkout on `main`
+        # while the verified deployed tip `main_sha` lacks it in git must NOT be trusted.
+        (repo_dir / ".devflow").mkdir(parents=True, exist_ok=True)
+        (repo_dir / ".devflow" / "scenarios.json").write_text(json.dumps(scenarios_payload, ensure_ascii=False))
+        self.pr["state"] = "MERGED"
+        self.pr["mergeCommit"] = {"oid": feat_sha}
+        self.gh.tip = main_sha
+        self.deploy_run = wf_run(200, "deploy.yml", "push", main_sha, "main")
+        self.integ_run = wf_run(300, "ci.yml", "workflow_dispatch", main_sha, "main")
+        self.gh.compare[(feat_sha, main_sha)] = "ahead"
+        self.gh.runs["ci.yml"] = [self.pr_run, self.integ_run]
+        self.gh.runs["deploy.yml"] = [self.deploy_run]
+        with tempfile.TemporaryDirectory() as tmp:
+            rep_unmerged = self.df.check_acceptance("b", EPIC, [5], review=False, evidence=[], tmp=Path(tmp))
+        self.assertTrue(any("沒有任何情境" in r for row in rep_unmerged["criteria"] for r in row["reasons"]))
+
+        # 3) Once `feat` is merged into `main` at `feat_sha` and deployed, final acceptance reads `feat_sha` and PASSES.
+        (repo_dir / ".devflow" / "scenarios.json").unlink()
+        self.gh.tip = feat_sha
+        self.deploy_run = wf_run(200, "deploy.yml", "push", feat_sha, "main")
+        self.integ_run = wf_run(300, "ci.yml", "workflow_dispatch", feat_sha, "main")
+        self.gh.compare[(feat_sha, feat_sha)] = "identical"
+        self.gh.runs["ci.yml"] = [self.pr_run, self.integ_run]
+        self.gh.runs["deploy.yml"] = [self.deploy_run]
+        self.gh.artifacts[200] = {f"devflow-evidence-deploy-{feat_sha}-1": self.evidence("deploy", feat_sha, self.deploy_run, [self.scenario(x) for x in self.ids["deploy"]])}
+        self.gh.artifacts[300] = {f"devflow-evidence-integration-{feat_sha}-1": self.evidence("integration", feat_sha, self.integ_run, [self.scenario(x) for x in self.ids["integration"]])}
+        ev_file = self.root / "manual.txt"
+        ev_file.write_text("installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            rep_final = self.df.check_acceptance("b", EPIC, [5], review=False, evidence=[ev_file], tmp=Path(tmp))
+        self.assertEqual(rep_final["problems"], [])
+        self.assertEqual([r["verdict"] for r in rep_final["criteria"]], ["PASS", "PASS", "PASS"])
+
+    def test_review_flags_multi_pr_scenarios_json_conflicts(self) -> None:
+        """When two PRs define conflicting `.devflow/scenarios.json` steps for the same scenario id,
+        `check acceptance --review` fails closed with an explicit conflict problem."""
+        self.body = "## 目標\n待辦清單\n\n## 驗收\n- AC-1 [ui] 使用者可新增待辦\n- AC-2 [cli] 匯出 CSV\n"
+        h1, h2 = "1" * 40, "2" * 40
+        prs = {
+            5: {"number": 5, "title": "pr5", "state": "OPEN", "headRefOid": h1, "body": f"Covers: {A1S1}, {A1S2}"},
+            6: {"number": 6, "title": "pr6", "state": "OPEN", "headRefOid": h2, "body": f"Covers: {A2S1}"},
+        }
+        self.df.pr_meta = lambda repo, n: dict(prs[n])
+        base_map = {
+            sid: {"description": s["description"], "smoke": s["smoke"], "given": s["given"], "when": s["when"], "then": s["then"]}
+            for sid, s in self.spec.items()
+        }
+        conflicting_map = {**base_map, A1S1: {**base_map[A1S1], "then": "不一樣的結果"}}
+        self.gh.contents[(".devflow/scenarios.json", h1)] = base_map
+        self.gh.contents[(".devflow/scenarios.json", h2)] = conflicting_map
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = self.df.check_acceptance("b", EPIC, [5, 6], review=True, evidence=[], tmp=Path(tmp))
+        self.assertTrue(any("定義衝突" in p for p in rep["problems"]), rep["problems"])
+        self.assertTrue(any("定義衝突" in r for row in rep["criteria"] for r in row["reasons"]), rep["criteria"])
 
 
 class SourceExcerpts(Case):

@@ -856,20 +856,8 @@ def spec_problems(ac: dict) -> list[str]:
     return found + ac["problems"]
 
 
-def repo_scenarios(board: str, epic: str) -> dict[str, list[dict]]:
-    """Load Given/When/Then scenarios from `<repo>/.devflow/scenarios.json` (keyed by `<epic>/AC-n.Sm` or
-    `AC-n.Sm`) so the EPIC Kanban card can stay a concise, human-readable list of AC outcomes."""
+def _parse_repo_scenarios(raw: object, epic: str) -> dict[str, list[dict]]:
     import hashlib
-    st = load_state()
-    if board not in st or not st[board].get("path"):
-        return {}
-    path = Path(st[board]["path"]) / ".devflow" / "scenarios.json"
-    if not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
     if not isinstance(raw, dict):
         return {}
     by_ac: dict[str, list[dict]] = {}
@@ -895,12 +883,134 @@ def repo_scenarios(board: str, epic: str) -> dict[str, list[dict]]:
     return by_ac
 
 
-def epic_acceptance_spec(board: str, epic: str, body: str) -> list[dict]:
+def _candidate_worktrees(board: str, cards: dict[str, dict] | None, repo: str | None = None,
+                         pr_number: int | None = None, total_prs: int = 0) -> list[Path]:
+    if not cards:
+        return []
+    st = load_state()
+    main_path = Path(st[board]["path"]).resolve() if board in st and st[board].get("path") else None
+    exact: list[Path] = []
+    other: list[Path] = []
+    for c in cards.values():
+        wp = c.get("workspace_path")
+        if not wp:
+            continue
+        p = Path(wp)
+        if not p.is_dir():
+            continue
+        if pr_number is not None:
+            contract = c.get("completion_contract") or ""
+            text = f"{contract}\n{c.get('result') or ''}\n{c.get('body') or ''}"
+            if (repo and contract == f"https://github.com/{repo}/pull/{pr_number}") or re.search(
+                rf"(?:#|/pull/){pr_number}\b", text
+            ):
+                exact.append(p)
+                continue
+        if main_path is None or p.resolve() != main_path:
+            other.append(p)
+    if exact:
+        return exact
+    if pr_number is not None and total_prs > 1:
+        return []
+    return other
+
+
+def repo_scenarios_for_rev(board: str, repo: str | None, epic: str, rev: str | None, *,
+                           cards: dict[str, dict] | None = None, pr_number: int | None = None,
+                           total_prs: int = 0, allow_worktree: bool = False) -> dict[str, list[dict]]:
+    """Resolve `<repo>/.devflow/scenarios.json` for a verified commit `rev` (or PR worktree in non-git
+    fixtures). When the board checkout is a git repository, only committed tree objects at `rev` (or
+    GitHub's contents API at `ref=rev`, or a distinct PR feature worktree directory in `--review` when
+    `rev` is a synthetic non-git SHA) are trusted, never arbitrary local checkout files on `main`."""
+    import base64
+    st = load_state()
+    main_dir = Path(st[board]["path"]) if board in st and st[board].get("path") else None
+    worktrees = _candidate_worktrees(board, cards, repo, pr_number, total_prs)
+    git_dirs = [d for d in ([*worktrees, main_dir] if main_dir else worktrees) if d and d.is_dir()]
+    saw_git = False
+    if rev:
+        for d in git_dirs:
+            if subprocess.run(["git", "-C", str(d), "rev-parse", "--git-dir"],
+                              capture_output=True, text=True).returncode != 0:
+                continue
+            saw_git = True
+            if subprocess.run(["git", "-C", str(d), "cat-file", "-e", f"{rev}^{{commit}}"],
+                              capture_output=True, text=True).returncode == 0:
+                p = subprocess.run(["git", "-C", str(d), "show", f"{rev}:.devflow/scenarios.json"],
+                                   capture_output=True, text=True)
+                if p.returncode != 0:
+                    return {}
+                try:
+                    return _parse_repo_scenarios(json.loads(p.stdout), epic)
+                except ValueError:
+                    return {}
+        if repo:
+            data = gh_json(["api", f"repos/{repo}/contents/.devflow/scenarios.json?ref={rev}"], check=False)
+            if isinstance(data, dict):
+                if "content" in data and data.get("encoding") == "base64":
+                    try:
+                        raw = json.loads(base64.b64decode(data["content"]).decode())
+                    except (ValueError, OSError):
+                        raw = {}
+                else:
+                    raw = data
+                return _parse_repo_scenarios(raw, epic)
+    if saw_git:
+        if allow_worktree:
+            for d in worktrees:
+                path = d / ".devflow" / "scenarios.json"
+                if path.is_file():
+                    try:
+                        return _parse_repo_scenarios(json.loads(path.read_text()), epic)
+                    except (OSError, ValueError):
+                        return {}
+        return {}
+    search_dirs = (worktrees + ([main_dir] if main_dir else [])) if allow_worktree else ([main_dir] if main_dir else [])
+    for d in search_dirs:
+        path = d / ".devflow" / "scenarios.json"
+        if path.is_file():
+            try:
+                return _parse_repo_scenarios(json.loads(path.read_text()), epic)
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+
+def repo_scenarios(board: str, epic: str, *, cards: dict[str, dict] | None = None) -> dict[str, list[dict]]:
+    """Load Given/When/Then scenarios from `<repo>/.devflow/scenarios.json` (or an active card worktree on
+    the board during planning) so the EPIC Kanban card can stay a concise list of AC outcomes."""
+    st = load_state()
+    main_dir = Path(st[board]["path"]) if board in st and st[board].get("path") else None
+    if cards is None and (BOARDS / board / "kanban.db").exists():
+        with suppress(SystemExit, Exception):
+            cards = plan_cards(board, epic)
+    worktrees = _candidate_worktrees(board, cards)
+    merged: dict[str, list[dict]] = {}
+    seen_sids: set[str] = set()
+    for d in ([*worktrees, main_dir] if main_dir else worktrees):
+        if not d:
+            continue
+        path = d / ".devflow" / "scenarios.json"
+        if not path.is_file():
+            continue
+        try:
+            by_ac = _parse_repo_scenarios(json.loads(path.read_text()), epic)
+        except (OSError, ValueError):
+            continue
+        for ac_id, scs in by_ac.items():
+            for sc in scs:
+                if sc["id"] not in seen_sids:
+                    seen_sids.add(sc["id"])
+                    merged.setdefault(ac_id, []).append(sc)
+    return merged
+
+
+def epic_acceptance_spec(board: str, epic: str, body: str, *, cards: dict[str, dict] | None = None) -> list[dict]:
     """`acceptance_spec(epic, body)` hydrated with `<repo>/.devflow/scenarios.json` for any non-manual AC
     that keeps its Given/When/Then steps in the repo instead of inlining them on the human-facing EPIC card."""
     spec = acceptance_spec(epic, body)
     if any(a["type"] != "manual" and not a["scenarios"] for a in spec):
-        from_repo = repo_scenarios(board, epic)
+        from_repo = repo_scenarios(board, epic, cards=cards)
         for a in spec:
             if a["type"] != "manual" and not a["scenarios"] and a["ac"] in from_repo:
                 a["scenarios"] = list(from_repo[a["ac"]])
@@ -1272,7 +1382,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if t not in feeds:
             feeds.add(t)
             stack.extend(cards.get(t, {}).get("parents", []))
-    spec = epic_acceptance_spec(board, epic, cards[epic]["body"])
+    spec = epic_acceptance_spec(board, epic, cards[epic]["body"], cards=cards)
     acs = [a["ac"] for a in spec]
     ac_types = {a["ac"]: a["type"] for a in spec}
     if not acs:
@@ -1604,8 +1714,11 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
         contract = c.get("completion_contract") or ""
         if contract.startswith(f"https://github.com/{repo}/pull/"):
             contract = repo  # Hermes pins the PR URL on publish; same plan
-        rows.append([t, c["title"], c["assignee"], c["workspace_kind"], contract, sorted(c["parents"]),
-                     c["body"] if t == epic or card_type(c["title"]) != "ADV" else ""])
+        row = [t, c["title"], c["assignee"], c["workspace_kind"], contract, sorted(c["parents"]),
+               c["body"] if t == epic or card_type(c["title"]) != "ADV" else ""]
+        if t == epic or card_type(c["title"]) == "ADJ":
+            row.extend([c.get("status") or "", c.get("block_kind") or ""])
+        rows.append(row)
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -1981,7 +2094,15 @@ def tick_board(board: str, st: dict) -> bool:
                                               "補齊缺少的 `goal_mode`）")
                 cards = plan_cards(board, tid)
             fp = plan_fingerprint(tid, cards, repo)
-            if plans.get(tid) != fp:
+            rec = (st.get("plan_adj") or {}).get(tid)
+            repair_ended = bool(
+                isinstance(rec, dict)
+                and (
+                    (rec.get("adj") and not effective_plan_adj(rec.get("adj"), cards))
+                    or (rec.get("escalated") is not None and not waiting(cards.get(tid, {})))
+                )
+            )
+            if plans.get(tid) != fp or repair_ended:
                 rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
                 advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
@@ -1999,7 +2120,7 @@ def tick_board(board: str, st: dict) -> bool:
                     "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 if not adj_retry:
-                    plans[tid] = fp
+                    plans[tid] = plan_fingerprint(tid, cards, repo)
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
             print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
@@ -2998,13 +3119,88 @@ def scenario_shots(evidence: list[tuple[Path, dict]], ids: list[str], limit: int
     return list(shots.values())[:limit]
 
 
+def resolve_acceptance_spec(board: str, repo: str, epic: str, cards: dict[str, dict],
+                            prs: dict[int, dict], *, review: bool) -> tuple[list[dict], list[str], set[str], dict[int, dict[str, dict]]]:
+    """Hydrate `acceptance_spec` for `check_acceptance` from verified PR head revision(s) in `--review`
+    mode (detecting multi-PR scenario conflicts) or from the verified default-branch revision in final
+    mode, rather than reading arbitrary local checkout files from the board's main directory."""
+    spec = acceptance_spec(epic, cards[epic]["body"])
+    if not spec:
+        return spec, [], set(), {}
+    repo_acs = {a["ac"] for a in spec if a["type"] != "manual" and not a["scenarios"]}
+    if not repo_acs:
+        return spec, [], set(), {}
+    pr_by_ac: dict[int, dict[str, list[dict]]] = {}
+    pr_scens: dict[int, dict[str, dict]] = {}
+    for n, pr in prs.items():
+        sha = pr.get("headRefOid") or ""
+        by_ac = repo_scenarios_for_rev(board, repo, epic, sha, cards=cards, pr_number=n,
+                                       total_prs=len(prs), allow_worktree=True)
+        pr_by_ac[n] = by_ac
+        pr_scens[n] = {s["id"]: s for scs in by_ac.values() for s in scs}
+    conflicts: list[str] = []
+    ac_conflicts: dict[str, list[str]] = {}
+    pr_nums = list(prs)
+    for i, n1 in enumerate(pr_nums):
+        for n2 in pr_nums[i + 1:]:
+            for sid in sorted(set(pr_scens[n1]) & set(pr_scens[n2])):
+                if pr_scens[n1][sid] != pr_scens[n2][sid]:
+                    msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對情境 {sid} 定義衝突"
+                    conflicts.append(msg)
+                    m = SCENARIO_ID.match(sid)
+                    if m:
+                        ac_conflicts.setdefault(m.group(2), []).append(msg)
+            for ac_id in sorted((set(pr_by_ac[n1]) & set(pr_by_ac[n2])) & repo_acs):
+                ids1 = [s["id"] for s in pr_by_ac[n1][ac_id]]
+                ids2 = [s["id"] for s in pr_by_ac[n2][ac_id]]
+                if set(ids1) != set(ids2):
+                    msg = f"PR #{n1} 與 PR #{n2} 的 .devflow/scenarios.json 對 {ac_id} 情境清單不一致（{ids1} vs {ids2}）"
+                    if msg not in conflicts:
+                        conflicts.append(msg)
+                        ac_conflicts.setdefault(ac_id, []).append(msg)
+    if review:
+        merged_by_ac: dict[str, list[dict]] = {}
+        seen_sids: set[str] = set()
+        for n in pr_nums:
+            for ac_id, scs in pr_by_ac[n].items():
+                for sc in scs:
+                    if sc["id"] not in seen_sids:
+                        seen_sids.add(sc["id"])
+                        merged_by_ac.setdefault(ac_id, []).append(dict(sc))
+        source_by_ac = merged_by_ac
+    else:
+        branch = (gh_json(["api", f"repos/{repo}"], check=False) or {}).get("default_branch") or entry(board).get("default_branch") or "main"
+        if repo_deploys(board):
+            final_sha = (gh_json(["api", f"repos/{repo}/commits/{branch}"], check=False) or {}).get("sha") or ""
+        else:
+            runs = workflow_runs(repo, "ci.yml", event="workflow_dispatch", branch=branch)
+            r = pick_run(runs or [], "ci.yml", "workflow_dispatch", branch=branch, success=True)
+            final_sha = (r or {}).get("head_sha") or ""
+        source_by_ac = repo_scenarios_for_rev(board, repo, epic, final_sha, cards=cards, allow_worktree=False)
+    for a in spec:
+        if a["ac"] in repo_acs:
+            if a["ac"] in source_by_ac:
+                a["scenarios"] = [dict(s) for s in source_by_ac[a["ac"]]]
+                for s in a["scenarios"]:
+                    missing = [p.capitalize() for p in PHASES if not s[p]]
+                    if missing:
+                        a["problems"].append(f"情境 {s['id']} 缺少 {'/'.join(missing)}")
+            for msg in ac_conflicts.get(a["ac"], []):
+                if msg not in a["problems"]:
+                    a["problems"].append(msg)
+    return spec, conflicts, repo_acs, pr_scens
+
+
 def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool, evidence: list[Path],
                      tmp: Path) -> dict:
     """Deterministic checks of every AC against GitHub-verified scenario evidence, then (final mode)
     one Decisions call per AC that passed them."""
     repo = entry(board)["repo"]
     cards = plan_cards(board, epic)
-    spec = epic_acceptance_spec(board, epic, cards[epic]["body"])
+    prs = {n: pr_meta(repo, n) for n in numbers}
+    spec, spec_conflicts, repo_acs, pr_scens = resolve_acceptance_spec(
+        board, repo, epic, cards, prs, review=review
+    )
     if not spec:
         die(f"{epic} has no AC-n acceptance criteria")
     rows = [{"ac": a["ac"], "type": a["type"], "criterion": a["text"], "verdict": "FAIL", "reasons": spec_problems(a),
@@ -3015,14 +3211,14 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
         for s, c in zip(a["scenarios"], row["scenarios"]):
             cells.setdefault(s["id"], (row, s, c))
     detail: dict[str, dict] = {sid: {} for sid in cells}  # step results handed to the Decisions call
-    problems: list[str] = []
+    problems: list[str] = list(spec_conflicts)
     covered: set[str] = set()
     pr_rows: dict[int, list[dict]] = {}
     merges: list[tuple[int, str | None]] = []
     evidence_roots: dict[str, list[tuple[Path, dict]]] = {"integration": [], "deploy": [], "head": []}
 
     for n in numbers:
-        pr = pr_meta(repo, n)
+        pr = prs[n]
         mine: list[str] = []
         for x in pr_covers(pr.get("body")):
             m = SCENARIO_ID.match(x)
@@ -3076,6 +3272,8 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
         claimed = {x.get("id"): x for x in base["acceptance-base.json"].get("results") or [] if isinstance(x, dict)}
         for x in mine:
             row, sc, cell = cells[x]
+            if review and row["ac"] in repo_acs and x not in pr_scens.get(n, {}):
+                pr_fail(f"head {sha[:12]} 的 .devflow/scenarios.json 沒有情境 {x}", [row])
             cell["head"], reasons = proof_errors(head["acceptance.json"], sc, f"PR #{n} head")
             verdict, base_reasons = base_verdict(base["acceptance.json"], sc)
             reasons += base_reasons
