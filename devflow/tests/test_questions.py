@@ -776,6 +776,106 @@ class RouteQuestions(unittest.TestCase):
         self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
         self.assertFalse(self._hook_would_dispatch())               # settled after recovery
 
+    def test_flow_block_wakes_transient_adj_and_falls_back_if_resume_fails(self):
+        """teams-transcription t_d83beef8 -> t_46ded1b5 (2026-11-23): commenting on a blocked(transient) [ADJ] must resume it."""
+        self._ops_card()
+        self.board.card("t_adj0", "[ADJ] 收斂", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="blocked", assignee="orchestrator")
+        self.board.db.execute("UPDATE tasks SET block_kind='transient' WHERE id='t_adj0'")
+        self.board.db.commit()
+        resumed = []
+        self.df.resume = lambda board, tid, note=None: resumed.append(tid) or f"resumed {tid}"
+        self._flow(0.05)
+        ev = self.board.block("t_ops", reason="問題：goal judge 拒絕送審")
+        self.tick()
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertEqual(resumed, ["t_adj0"])
+        self.assertNotIn(("t_ops", ev, "local-devops"), self.board.sent)
+        self.df.TICK.write_text(json.dumps(self.st))
+        self.assertEqual(self.df.pending()[0]["handled_by"], "t_adj0")
+
+        # If waking the transient [ADJ] fails, fall back to asking the user instead of stranding the card.
+        self.board.db.execute("UPDATE tasks SET status='blocked', block_kind='transient' WHERE id='t_adj0'")
+        self.board.db.commit()
+        self.board.unblock("t_ops")
+        ev2 = self.board.block("t_ops", reason="問題：第二次送審失敗")
+        self.df.resume = lambda *a, **kw: (_ for _ in ()).throw(SystemExit(1))
+        with redirect_stderr(io.StringIO()):
+            self.tick()
+        self.assertIn(("t_ops", ev2, "local-devops"), self.board.sent)
+
+    def test_flow_block_skips_crashed_untyped_blocked_adj(self):
+        """A crashed/gave_up [ADJ] (blocked, block_kind=None) cannot handle new questions."""
+        self._ops_card()
+        self.board.card("t_adj0", "[ADJ] 已崩潰", body="EPIC: t_e04c0ffe\n處理：t_ops\n內文", status="blocked", assignee="orchestrator")
+        judged, created = self._flow(0.05)
+        self.board.block("t_ops", reason="問題：請修卡")
+        self.tick()
+        self.assertEqual(self.comments, [])
+        self.assertEqual((len(judged), len(created)), (1, 1))
+
+    def test_stalled_triage_wakes_transient_adj_and_retries_if_resume_fails(self):
+        epic, _ = self._stalled_triage_chain()
+        self.board.card("t_adj0", "[ADJ] 收斂", body=f"EPIC: {epic}\n處理：t_dev\n內文", status="blocked", assignee="orchestrator")
+        self.board.db.execute("UPDATE tasks SET block_kind='transient' WHERE id='t_adj0'")
+        self.board.db.commit()
+        for tid in (epic, "t_ship", "t_dev", "t_adj0"):
+            self.board.subscribe(tid, INBOX_CHAT)
+        self._flow(0.05, create_ok=True)
+        self.df.resume = lambda *a, **kw: (_ for _ in ()).throw(SystemExit(1))
+        with redirect_stderr(io.StringIO()):
+            self._run_cmd_tick()
+        self.assertTrue(self._hook_would_dispatch())                # failed resume must not cache tick_key
+        resumed = []
+        self.df.resume = lambda board, tid, note=None: resumed.append(tid) or f"resumed {tid}"
+        self._run_cmd_tick()
+        self.assertEqual(resumed, ["t_adj0"])
+        self.assertFalse(self._hook_would_dispatch())
+
+    def test_tick_resumes_transiently_blocked_adj_after_applying_devflow_ops(self):
+        """An [ADJ] that blocked transiently while waiting for devflow-ops wakes once tick applies them,
+        and retries resume on the next tick without re-applying ops if resume fails transiently."""
+        self.board.card("t_adj1", "[ADJ] 流程阻塞 t_dev", status="blocked", assignee="orchestrator")
+        self.board.card("t_adj2", "[ADJ] 問使用者", status="blocked", assignee="orchestrator")
+        self.board.db.execute("UPDATE tasks SET block_kind='transient' WHERE id='t_adj1'")
+        self.board.db.execute("UPDATE tasks SET block_kind='needs_input' WHERE id='t_adj2'")
+        self.board.db.commit()
+        resumed, applied_ops = [], []
+        self.df.apply_op = lambda board, op: applied_ops.append(op) or f"ran {op['op']}"
+        ops_body = "```devflow-ops\n[{\"op\": \"assign\", \"task\": \"t_dev\", \"to\": \"devops\"}]\n```"
+        # Mirror real Hermes `kanban show --json`, which omits `block_kind`.
+        adj_transient = {"id": "t_adj1", "title": "[ADJ] 流程阻塞 t_dev", "assignee": "orchestrator", "status": "blocked"}
+        adj_user = {"id": "t_adj2", "title": "[ADJ] 問使用者", "assignee": "orchestrator", "status": "blocked"}
+
+        def kanban(board, cmd, *args):
+            if cmd == "list":
+                return json.dumps([adj_transient, adj_user])
+            if cmd == "show":
+                t = adj_transient if args[0] == "t_adj1" else adj_user
+                return json.dumps({"task": t, "parents": [], "comments": [{"author": "orchestrator", "created_at": 1, "body": ops_body}]})
+            return ""
+        self.df.kanban = kanban
+        self.df.tick_prs = lambda *a: None
+        self.df.release_held = lambda *a: None
+        self.df.route_questions = lambda *a: False
+
+        # First tick: ops apply once, but resume fails transiently -> board stays unsettled (retry=True).
+        self.df.resume = lambda *a, **kw: (_ for _ in ()).throw(SystemExit(1))
+        with redirect_stderr(io.StringIO()):
+            retry = self.df.tick_board("b", self.st)
+        self.assertTrue(retry)
+        self.assertEqual(len(applied_ops), 2)
+
+        # Second tick: ops are NOT re-executed, transient [ADJ] is resumed, needs_input [ADJ] is untouched.
+        self.df.resume = lambda board, tid, note=None: resumed.append((tid, note)) or f"resumed {tid}"
+        retry2 = self.df.tick_board("b", self.st)
+        self.assertFalse(retry2)
+        self.assertEqual(len(applied_ops), 2)
+        self.assertEqual([tid for tid, _ in resumed], ["t_adj1"])
+
+        # Third tick: already cleared, no duplicate resume.
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(resumed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
