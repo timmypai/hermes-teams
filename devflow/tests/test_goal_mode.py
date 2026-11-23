@@ -270,12 +270,32 @@ class Plan(unittest.TestCase):
         found = [f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f]
         self.assertEqual([f.split(":")[0] for f in found], [SHIP])
         self.assertIn("t_p1, t_p2, t_p3", found[0])
-        # Recording user approval for t_p3 in EPIC `## 使用者決定` resolves the finding.
-        cards[EPIC]["body"] = epic_body + "\n## 使用者決定\n- 核准繼續 t_p3\n"
+        # Negative cases: explicit refusal, incidental mention, ID prefix, wrong SHIP id, and approval outside
+        # `## 使用者決定` must NEVER exempt the patch-cap finding.
+        for bad_section in (
+            f"\n## 使用者決定\n- 使用者 2026-11-23 決定：不核准 {SHIP} 再追加補丁卡 t_p3。\n",
+            f"\n## 使用者決定\n- 不核准追加補丁：{SHIP} t_p3\n",
+            f"\n## 使用者決定\n- 原出貨卡 {SHIP} 沿用目前部署，t_p3 尚未確認\n",
+            f"\n## 使用者決定\n- 核准追加補丁：{SHIP} t_p30\n",
+            "\n## 使用者決定\n- 核准追加補丁：t_other t_p3\n",
+            f"\n## 備註\n- 核准追加補丁：{SHIP} t_p3\n",
+        ):
+            cards[EPIC]["body"] = epic_body + bad_section
+            self.assertEqual([f.split(":")[0] for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f],
+                             [SHIP], bad_section)
+        # Positive case: exact `- 核准追加補丁：<SHIP> <PATCH>` under `## 使用者決定` authorizes only that patch card.
+        cards[EPIC]["body"] = epic_body + f"\n## 使用者決定\n- 核准追加補丁：{SHIP} t_p3\n"
         self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [])
+        # A 4th unapproved open post-hoc patch card still fires the cap even though t_p3 was authorized.
+        cards["t_p4"] = {
+            **cards["t_p3"], "id": "t_p4", "title": "[OPS] p4", "status": "ready", "created_at": 1400,
+        }
+        cards[SHIP]["parents"] = [*cards[SHIP]["parents"], "t_p4"]
+        self.assertEqual([f.split(":")[0] for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [SHIP])
         # When all post-hoc PR cards are already `done` (no open patch card holding [SHIP]), [SHIP] is not blocked.
         cards[EPIC]["body"] = epic_body
         cards["t_p3"]["status"] = "done"
+        cards["t_p4"]["status"] = "done"
         self.assertEqual([f for f in self.df.plan_rules("b", EPIC, cards) if "事後追加" in f], [])
 
     def test_work_card_opened_by_non_planner_is_a_finding(self):

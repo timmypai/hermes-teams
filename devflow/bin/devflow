@@ -917,63 +917,53 @@ def _candidate_worktrees(board: str, cards: dict[str, dict] | None, repo: str | 
 
 def repo_scenarios_for_rev(board: str, repo: str | None, epic: str, rev: str | None, *,
                            cards: dict[str, dict] | None = None, pr_number: int | None = None,
-                           total_prs: int = 0, allow_worktree: bool = False) -> dict[str, list[dict]]:
-    """Resolve `<repo>/.devflow/scenarios.json` for a verified commit `rev` (or PR worktree in non-git
-    fixtures). When the board checkout is a git repository, only committed tree objects at `rev` (or
-    GitHub's contents API at `ref=rev`, or a distinct PR feature worktree directory in `--review` when
-    `rev` is a synthetic non-git SHA) are trusted, never arbitrary local checkout files on `main`."""
+                           total_prs: int = 0) -> tuple[dict[str, list[dict]], str | None]:
+    """Resolve `<repo>/.devflow/scenarios.json` strictly from the verified commit `rev` (local git
+    committed object at `rev`, else GitHub's contents API at `ref=rev`). Never falls back to uncommitted
+    working-tree or non-git filesystem files; returns `(by_ac, error_or_none)` and fails closed when
+    `rev` cannot be resolved."""
     import base64
+    if not rev:
+        return {}, "無法取得驗證用的 commit SHA 以讀取 .devflow/scenarios.json"
     st = load_state()
     main_dir = Path(st[board]["path"]) if board in st and st[board].get("path") else None
     worktrees = _candidate_worktrees(board, cards, repo, pr_number, total_prs)
     git_dirs = [d for d in ([*worktrees, main_dir] if main_dir else worktrees) if d and d.is_dir()]
-    saw_git = False
-    if rev:
-        for d in git_dirs:
-            if subprocess.run(["git", "-C", str(d), "rev-parse", "--git-dir"],
-                              capture_output=True, text=True).returncode != 0:
-                continue
-            saw_git = True
-            if subprocess.run(["git", "-C", str(d), "cat-file", "-e", f"{rev}^{{commit}}"],
-                              capture_output=True, text=True).returncode == 0:
-                p = subprocess.run(["git", "-C", str(d), "show", f"{rev}:.devflow/scenarios.json"],
-                                   capture_output=True, text=True)
-                if p.returncode != 0:
-                    return {}
-                try:
-                    return _parse_repo_scenarios(json.loads(p.stdout), epic)
-                except ValueError:
-                    return {}
-        if repo:
-            data = gh_json(["api", f"repos/{repo}/contents/.devflow/scenarios.json?ref={rev}"], check=False)
+    for d in git_dirs:
+        if subprocess.run(["git", "-C", str(d), "rev-parse", "--git-dir"],
+                          capture_output=True, text=True).returncode != 0:
+            continue
+        if subprocess.run(["git", "-C", str(d), "cat-file", "-e", f"{rev}^{{commit}}"],
+                          capture_output=True, text=True).returncode == 0:
+            p = subprocess.run(["git", "-C", str(d), "show", f"{rev}:.devflow/scenarios.json"],
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                return {}, None
+            try:
+                return _parse_repo_scenarios(json.loads(p.stdout), epic), None
+            except ValueError as err:
+                return {}, f"commit {rev[:12]} 的 .devflow/scenarios.json 無法解析：{err}"
+    if repo:
+        p = run(["gh", "api", f"repos/{repo}/contents/.devflow/scenarios.json?ref={rev}"], gh="builder", check=False)
+        if p.returncode == 0:
+            try:
+                data = json.loads(p.stdout)
+            except ValueError as err:
+                return {}, f"GitHub commit {rev[:12]} 的 .devflow/scenarios.json 回應無法解析：{err}"
             if isinstance(data, dict):
                 if "content" in data and data.get("encoding") == "base64":
                     try:
                         raw = json.loads(base64.b64decode(data["content"]).decode())
-                    except (ValueError, OSError):
-                        raw = {}
+                    except (ValueError, OSError) as err:
+                        return {}, f"GitHub commit {rev[:12]} 的 .devflow/scenarios.json 解碼失敗：{err}"
                 else:
                     raw = data
-                return _parse_repo_scenarios(raw, epic)
-    if saw_git:
-        if allow_worktree:
-            for d in worktrees:
-                path = d / ".devflow" / "scenarios.json"
-                if path.is_file():
-                    try:
-                        return _parse_repo_scenarios(json.loads(path.read_text()), epic)
-                    except (OSError, ValueError):
-                        return {}
-        return {}
-    search_dirs = (worktrees + ([main_dir] if main_dir else [])) if allow_worktree else ([main_dir] if main_dir else [])
-    for d in search_dirs:
-        path = d / ".devflow" / "scenarios.json"
-        if path.is_file():
-            try:
-                return _parse_repo_scenarios(json.loads(path.read_text()), epic)
-            except (OSError, ValueError):
-                return {}
-    return {}
+                return _parse_repo_scenarios(raw, epic), None
+            return {}, f"GitHub commit {rev[:12]} 的 .devflow/scenarios.json 回應格式無效"
+        detail = (p.stderr or p.stdout or "").strip()[-160:]
+        return {}, (f"無法從本機 git 或 GitHub 解析 commit {rev[:12]} 的 .devflow/scenarios.json"
+                    + (f"（{detail}）" if detail else ""))
+    return {}, f"無法從本機 git 解析 commit {rev[:12]} 的 .devflow/scenarios.json"
 
 
 def repo_scenarios(board: str, epic: str, *, cards: dict[str, dict] | None = None) -> dict[str, list[dict]]:
@@ -1372,6 +1362,21 @@ def ship_post_hoc_parents(ship_id: str, cards: dict[str, dict]) -> list[str]:
     )
 
 
+PATCH_APPROVAL_RE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?核准追加補丁[：:][ \t]*(t_[0-9A-Za-z]+)[ \t]+(t_[0-9A-Za-z]+)[ \t]*$",
+    re.M,
+)
+
+
+def approved_ship_patches(epic_body: str | None) -> set[tuple[str, str]]:
+    """Exact `(ship_id, patch_id)` pairs explicitly authorized under the EPIC's `## 使用者決定` section
+    via `- 核准追加補丁：<SHIP卡號> <補丁卡號>`. Refusals, incidental mentions, and ID prefixes never match."""
+    m = re.search(r"^##\s*使用者決定[ \t]*\n(.*?)(?=^## |\Z)", epic_body or "", flags=re.M | re.S)
+    if not m:
+        return set()
+    return {(hit.group(1), hit.group(2)) for hit in PATCH_APPROVAL_RE.finditer(m.group(1))}
+
+
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     e = entry(board)
     found: list[str] = []
@@ -1393,8 +1398,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     body_by_tid = {}
     for msg in plan_body_rules(cards):
         body_by_tid[msg.split(":", 1)[0]] = msg
-    decided_m = re.search(r"^##\s*使用者決定[ \t]*\n(.*?)(?=^## |\Z)", cards[epic]["body"] or "", flags=re.M | re.S)
-    decided = decided_m.group(1) if decided_m else ""
+    approved_patches = approved_ship_patches(cards[epic]["body"])
     for tid, c in cards.items():
         kind = card_type(c["title"])
         if kind not in CARDS:
@@ -1410,12 +1414,12 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if (
             kind == "SHIP"
             and len(post_hoc := ship_post_hoc_parents(tid, cards)) > SHIP_PATCH_LIMIT
-            and tid not in decided
-            and any(cards[p]["status"] != "done" and p not in decided for p in post_hoc)
+            and any(cards[p]["status"] != "done" and (tid, p) not in approved_patches for p in post_hoc)
         ):
             found.append(f"{tid}: [SHIP] 開始執行後已事後追加 {len(post_hoc)} 張 [DEV]/[OPS] 補丁卡"
                          f"（{', '.join(post_hoc)}，上限 {SHIP_PATCH_LIMIT}）：停止繼續加開補丁 PR，"
-                         "請 orchestrator 透過 needs_input 交給使用者決定（作廢多出的補丁卡、將核准卡號記於 EPIC `## 使用者決定` 或另開新 EPIC）")
+                         "請 orchestrator 透過 needs_input 交給使用者決定（作廢多出的補丁卡、"
+                         "於 EPIC `## 使用者決定` 另起一行寫「- 核准追加補丁：<SHIP卡號> <補丁卡號>」或另開新 EPIC）")
         if kind == "ADJ" and c.get("created_by") and c["created_by"] not in ADJ_CREATORS:
             found.append(f"{tid}: [ADJ] 由 {c.get('created_by')} 建立；[ADJ] 只由 orchestrator、dispatcher tick、"
                          "advisor 建，其他角色照自己 skill 的失敗處理建卡或寫 followups（devflow skill「誰定流程」）")
@@ -3132,14 +3136,18 @@ def resolve_acceptance_spec(board: str, repo: str, epic: str, cards: dict[str, d
         return spec, [], set(), {}
     pr_by_ac: dict[int, dict[str, list[dict]]] = {}
     pr_scens: dict[int, dict[str, dict]] = {}
-    for n, pr in prs.items():
-        sha = pr.get("headRefOid") or ""
-        by_ac = repo_scenarios_for_rev(board, repo, epic, sha, cards=cards, pr_number=n,
-                                       total_prs=len(prs), allow_worktree=True)
-        pr_by_ac[n] = by_ac
-        pr_scens[n] = {s["id"]: s for scs in by_ac.values() for s in scs}
     conflicts: list[str] = []
     ac_conflicts: dict[str, list[str]] = {}
+    unresolved_errors: list[str] = []
+    for n, pr in prs.items():
+        sha = pr.get("headRefOid") or ""
+        by_ac, err = repo_scenarios_for_rev(board, repo, epic, sha, cards=cards, pr_number=n, total_prs=len(prs))
+        pr_by_ac[n] = by_ac
+        pr_scens[n] = {s["id"]: s for scs in by_ac.values() for s in scs}
+        if review and err:
+            msg = f"PR #{n}：{err}"
+            conflicts.append(msg)
+            unresolved_errors.append(msg)
     pr_nums = list(prs)
     for i, n1 in enumerate(pr_nums):
         for n2 in pr_nums[i + 1:]:
@@ -3176,7 +3184,10 @@ def resolve_acceptance_spec(board: str, repo: str, epic: str, cards: dict[str, d
             runs = workflow_runs(repo, "ci.yml", event="workflow_dispatch", branch=branch)
             r = pick_run(runs or [], "ci.yml", "workflow_dispatch", branch=branch, success=True)
             final_sha = (r or {}).get("head_sha") or ""
-        source_by_ac = repo_scenarios_for_rev(board, repo, epic, final_sha, cards=cards, allow_worktree=False)
+        source_by_ac, err = repo_scenarios_for_rev(board, repo, epic, final_sha, cards=cards)
+        if err:
+            conflicts.append(err)
+            unresolved_errors.append(err)
     for a in spec:
         if a["ac"] in repo_acs:
             if a["ac"] in source_by_ac:
@@ -3185,7 +3196,7 @@ def resolve_acceptance_spec(board: str, repo: str, epic: str, cards: dict[str, d
                     missing = [p.capitalize() for p in PHASES if not s[p]]
                     if missing:
                         a["problems"].append(f"情境 {s['id']} 缺少 {'/'.join(missing)}")
-            for msg in ac_conflicts.get(a["ac"], []):
+            for msg in ac_conflicts.get(a["ac"], []) + unresolved_errors:
                 if msg not in a["problems"]:
                     a["problems"].append(msg)
     return spec, conflicts, repo_acs, pr_scens

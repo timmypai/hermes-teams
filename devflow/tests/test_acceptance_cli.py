@@ -549,6 +549,57 @@ class CheckAcceptance(Case):
         self.assertTrue(any("定義衝突" in p for p in rep["problems"]), rep["problems"])
         self.assertTrue(any("定義衝突" in r for row in rep["criteria"] for r in row["reasons"]), rep["criteria"])
 
+    def test_unresolved_sha_never_falls_back_to_uncommitted_worktree_or_non_git_files(self) -> None:
+        """Missing local commit + failed GitHub contents API must return an explicit unresolved-spec failure
+        even when an uncommitted `.devflow/scenarios.json` sits in a feature worktree or a non-git directory."""
+        import subprocess
+        uncommitted = {
+            A1S1: {"description": "d", "smoke": False, "given": "g", "when": "w", "then": "uncommitted then"},
+        }
+        # Case 1: real git repo on main + modified uncommitted feature worktree + unresolved 40-char SHA + API failure.
+        repo_dir = self.root / "repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        git = lambda *args: subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True)
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test")
+        (repo_dir / "README.md").write_text("init\n")
+        git("add", "README.md")
+        git("commit", "-m", "init")
+        feat_wt = self.root / "feat-wt"
+        git("worktree", "add", "-b", "feat", str(feat_wt))
+        (feat_wt / ".devflow").mkdir(parents=True, exist_ok=True)
+        (feat_wt / ".devflow" / "scenarios.json").write_text(json.dumps(uncommitted, ensure_ascii=False))
+        missing_sha = "f" * 40
+        cards = {
+            EPIC: {"title": "[EPIC] e", "body": "## 目標\nx\n\n## 驗收\n- AC-1 [ui] 新增\n", "status": "todo"},
+            "t_dev": {"title": "[DEV] d", "status": "review", "workspace_path": str(feat_wt),
+                      "completion_contract": f"https://github.com/{REPO}/pull/5", "body": f"EPIC: {EPIC}", "result": ""},
+        }
+        self.df.plan_cards = lambda board, epic: cards
+        self.pr.update(state="OPEN", headRefOid=missing_sha, body=f"Covers: {A1S1}")
+        by_ac, err = self.df.repo_scenarios_for_rev("b", REPO, EPIC, missing_sha, cards=cards, pr_number=5, total_prs=1)
+        self.assertEqual(by_ac, {})
+        self.assertIsNotNone(err)
+        self.assertIn(missing_sha[:12], err)
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = self.df.check_acceptance("b", EPIC, [5], review=True, evidence=[], tmp=Path(tmp))
+        self.assertTrue(any(missing_sha[:12] in p for p in rep["problems"]), rep["problems"])
+
+        # Case 2: non-git main and feature directories with `.devflow/scenarios.json` on disk + API failure.
+        non_git_main = self.root / "plain-main"
+        non_git_feat = self.root / "plain-feat"
+        for d in (non_git_main, non_git_feat):
+            (d / ".devflow").mkdir(parents=True, exist_ok=True)
+            (d / ".devflow" / "scenarios.json").write_text(json.dumps(uncommitted, ensure_ascii=False))
+        (self.root / "state" / "repos.json").write_text(json.dumps(
+            {"b": {"slug": "b", "repo": REPO, "path": str(non_git_main), "port": 1, "default_branch": "main"}}))
+        cards["t_dev"]["workspace_path"] = str(non_git_feat)
+        by_ac2, err2 = self.df.repo_scenarios_for_rev("b", REPO, EPIC, missing_sha, cards=cards, pr_number=5, total_prs=1)
+        self.assertEqual(by_ac2, {})
+        self.assertIsNotNone(err2)
+        self.assertIn(missing_sha[:12], err2)
+
 
 class SourceExcerpts(Case):
     def write(self, name: str, text: str) -> Path:
