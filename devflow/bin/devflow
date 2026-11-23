@@ -1524,9 +1524,10 @@ def tick_board(board: str, st: dict) -> None:
                 plans[tid] = fp
     tick_prs(board, repo, tasks)
     release_held(board, st)
-    route_questions(board, st)
+    retry = route_questions(board, st)
     del applied[:-1000]
     del settled[:-1000]
+    return retry
 
 
 # Hermes holds a card for 24h once a comment carries a PR URL and no assignee handoff follows
@@ -1714,8 +1715,8 @@ def route_questions(board: str, st: dict) -> None:
     def readable(s: dict) -> bool:
         return (s["platform"], s["chat_id"]) in people
 
+    retry = stalled_triage(board, tasks, children, st)
     handled = flow_blocks(board, tasks, children, st)
-    stalled_triage(board, tasks, children, st)
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
@@ -1752,6 +1753,7 @@ def route_questions(board: str, st: dict) -> None:
         asked.append(key)
     del asked[:-1000]
     ask_assignees(board, {k: v for k, v in tasks.items() if k not in handled}, subs, st)
+    return retry
 
 
 # --- the question goes to the Bot Chat of the card's assignee -----------------------------------
@@ -1951,12 +1953,64 @@ def open_triage_adj(board: str, tid: str, t: dict, ev: int, blocked_children: li
     return m.group(0) if m else None
 
 
-def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> None:
+def mark_triage_needs_input(board: str, task_id: str, reason: str) -> tuple[int | None, bool]:
+    """Attach a durable needs_input question to a stalled triage card that hit ADJ_PER_CARD.
+    Hermes `block_task` refuses `triage`; setting `block_kind='needs_input'` and appending a `blocked`
+    event in Hermes' own `write_txn` reuses Hermes' notifier, `devflow pending`, `devflow answer` and `resume`.
+    Returns `(event_id, retry)` where `retry` is True only on transient write failure (not state change)."""
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from hermes_cli import kanban_db_connect as k, kanban_db as kb\n"
+        "c = k.connect(Path(sys.argv[1]))\n"
+        "try:\n"
+        "    with kb.write_txn(c):\n"
+        "        cur = c.execute(\n"
+        "            \"UPDATE tasks SET block_kind = 'needs_input' WHERE id = ? AND status = 'triage' \"\n"
+        "            \"AND (block_kind IS NULL OR block_kind NOT IN ('needs_input', 'capability'))\",\n"
+        "            (sys.argv[2],),\n"
+        "        )\n"
+        "        if cur.rowcount != 1:\n"
+        "            sys.exit(2)\n"
+        "        kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'needs_input', 'reason': sys.argv[3]})\n"
+        "        eid = c.execute('SELECT last_insert_rowid()').fetchone()[0]\n"
+        "    print(eid)\n"
+        "finally:\n"
+        "    c.close()\n"
+    )
+    p = run([HERMES_PY, "-c", code, str(BOARDS / board / "kanban.db"), task_id, reason], check=False)
+    if p.returncode != 0:
+        if p.returncode != 2:
+            print(f"devflow: stalled triage escalation for {board}/{task_id} failed: "
+                  f"{(p.stderr or p.stdout).strip()[-300:]}", file=sys.stderr)
+            return None, True
+        return None, False
+    out = p.stdout.strip()
+    return (int(out), False) if out.isdigit() else (None, True)
+
+
+def triage_cap_reason(tid: str, t: dict, blocked_children: list[str], laps: list[str]) -> str:
+    kids = ", ".join(sorted(blocked_children))
+    adjs = ", ".join(sorted(laps))
+    return (
+        f"問題：{tid} 歷經 {len(laps)} 輪 [ADJ] 仍停在 triage 並擋住下游，要移出 triage 繼續執行還是暫緩／封存？選項：A 移出 triage 繼續 / B 暫緩或改方向（建議 A）\n"
+        f"背景：{tid}（{t['title']}）停在 triage 且無 block 事件，下游 {kids} 正等待它完成；"
+        f"已有 {len(laps)} 張 [ADJ]（{adjs}）處理過，達每卡上限（{ADJ_PER_CARD}），tick 不再開第 {len(laps) + 1} 張 [ADJ]。\n"
+        f"A：回覆指派或補充要求，交由 `devflow answer` 移出 triage（進入 ready／todo）繼續執行。\n"
+        f"B：暫緩、縮小範圍或由 orchestrator 改卡／封存替代。\n"
+        f"建議：先確認 {adjs} 留言中的根因再選 A 或補充改卡指示。"
+    )
+
+
+def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> bool:
     """A non-waiting `triage` card with open downstream children stalls the dependency chain silently:
     Hermes never dispatches `triage`, and without a `needs_input`/`capability` block neither `flow_blocks`
     nor notifications fire (teams-transcription t_46ded1b5 -> t_12402f67, 2026-11-22). Open one [ADJ] for
-    the orchestrator (or comment on its live [ADJ]), bounded by ADJ_PER_CARD."""
+    the orchestrator (or comment on its live [ADJ]), bounded by ADJ_PER_CARD; once the cap is reached,
+    escalate as a durable `needs_input` question on the card so the user is notified and can recover it.
+    Returns True when a transient write failure requires retrying on the next tick."""
     seen = st.setdefault("triage", {})
+    retry = False
     for tid, t in tasks.items():
         if t["status"] != "triage" or waiting(t) or card_type(t["title"]) in ("EPIC", "ADJ"):
             continue
@@ -1975,16 +2029,25 @@ def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list]
             if res.returncode == 0:
                 seen[key] = live
             else:
+                retry = True
                 print(f"devflow: stalled triage notice for {board}/{tid} not posted to {live}: "
                       f"{(res.stderr or res.stdout).strip()[-300:]}", file=sys.stderr)
         elif len(laps) >= ADJ_PER_CARD:
-            seen[key] = "cap"
+            bev, failed = mark_triage_needs_input(board, tid, triage_cap_reason(tid, t, blocked_children, laps))
+            if bev is not None:
+                t["block_kind"] = "needs_input"
+                seen[key] = f"escalated:{bev}"
+            elif failed:
+                retry = True
         else:
             adj = open_triage_adj(board, tid, t, ev, blocked_children, next(owning_epics(tid, tasks, children), None))
             if adj:
                 seen[key] = adj
+            else:
+                retry = True
     for k in list(seen)[:-1000]:
         del seen[k]
+    return retry
 
 
 def chat_receipt(profile: str, chat_id: str, tid: str, since: float) -> dict:
@@ -2124,13 +2187,16 @@ def cmd_tick(a) -> None:
     st = json.loads(TICK.read_text()) if TICK.exists() else {}
     mtime = tick_key(a.board)
     try:
-        tick_board(a.board, st)
+        retry = bool(tick_board(a.board, st))
     except SystemExit:
         pass
     except Exception as err:  # noqa: BLE001 - logged; the next tick retries
         print(f"{time.strftime('%FT%T')} {a.board}: {err!r}", flush=True)
     else:
-        st.setdefault("mtime", {})[a.board] = mtime
+        if retry:
+            st.setdefault("mtime", {}).pop(a.board, None)
+        else:
+            st.setdefault("mtime", {})[a.board] = mtime
     # Atomic: the hook reads this file without the lock, and a torn write would stop every board's tick.
     tmp = TICK.with_name(TICK.name + ".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))

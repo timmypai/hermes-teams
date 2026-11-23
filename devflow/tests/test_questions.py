@@ -118,6 +118,7 @@ class RouteQuestions(unittest.TestCase):
         self.addCleanup(self.board.db.close)
         self.df.kanban = self.kanban
         self.df.replay_from = self.replay_from
+        self.df.mark_triage_needs_input = self.mark_triage_needs_input
         self.st: dict = {}
         # Decisions says "only the user can answer" unless a test says otherwise: no network in tests.
         self.df.decide = lambda content, questions: {"user_decision": {"probability": 0.9}}
@@ -166,6 +167,16 @@ class RouteQuestions(unittest.TestCase):
             (event_id - 1, sub["task_id"], sub["chat_id"], sub["last_event_id"]))
         self.board.db.commit()
         return cur.rowcount == 1
+
+    def mark_triage_needs_input(self, board, tid, reason):
+        cur = self.board.db.execute(
+            "UPDATE tasks SET block_kind='needs_input' WHERE id=? AND status='triage' "
+            "AND (block_kind IS NULL OR block_kind NOT IN ('needs_input', 'capability'))",
+            (tid,))
+        if cur.rowcount != 1:
+            return None, False
+        eid = self.board.event(tid, "blocked", {"kind": "needs_input", "reason": reason})
+        return eid, False
 
     def tick(self) -> None:
         self.df.route_questions("b", self.st)
@@ -685,26 +696,85 @@ class RouteQuestions(unittest.TestCase):
         self.assertIn("t_dev", self.comments[0][1])
         self.assertIn("t_ship", self.comments[0][1])
 
-    def test_a_stalled_triage_card_retries_create_failure_and_respects_adj_cap(self):
+    def test_a_stalled_triage_card_at_adj_cap_escalates_to_the_user_once_and_can_be_answered(self):
+        """PR #29 P1: hitting ADJ_PER_CARD must not silently strand the chain; notify the user once, no 3rd [ADJ]."""
         self._stalled_triage_chain()
+        self.board.card("t_a1", "[ADJ] 流程阻塞 t_dev", status="done", assignee="orchestrator")
+        self.board.card("t_a2", "[ADJ] 處理失敗卡 t_dev", status="done", assignee="orchestrator")
+        judged, created = self._flow(0.05)
+        self.tick()
+        self.tick()
+        self.assertEqual((judged, created), ([], []))
+        self.assertEqual(len(self.board.sent), 1)
+        sent_tid, sent_ev, sent_chat = self.board.sent[0]
+        self.assertEqual((sent_tid, sent_chat), ("t_dev", "local-inbox"))
+        self.df.TICK.write_text(json.dumps(self.st))
+        items = self.df.pending()
+        self.assertEqual(len(items), 1)
+        p = items[0]
+        self.assertEqual((p["task"], p["kind"], p["block_event"], p["handled_by"]), ("t_dev", "needs_input", sent_ev, None))
+        self.assertIn("t_a1", p["question"])
+        self.assertIn("t_a2", p["question"])
+        self.assertIn("t_ship", p["question"])
+        notes = self._resume_like_hermes()
+        self.df.answer("b", "t_dev", sent_ev, "A", "App 對話")
+        self.assertEqual(len(notes), 1)
+
+    def _hook_would_dispatch(self) -> bool:
+        """Run the real `cmd_tick --hook` against TICK state and report whether it spawns a tick for board `b`."""
+        spawned: list[list[str]] = []
+        orig_popen, orig_stdin = self.df.subprocess.Popen, self.df.sys.stdin
+        self.df.subprocess.Popen = lambda cmd, **kw: spawned.append(cmd)
+        self.df.sys.stdin = io.StringIO(json.dumps({"extra": {"board": "b"}}))
+        try:
+            self.df.cmd_tick(types.SimpleNamespace(hook=True, board=None))
+        finally:
+            self.df.subprocess.Popen, self.df.sys.stdin = orig_popen, orig_stdin
+        return bool(spawned)
+
+    def _run_cmd_tick(self) -> None:
+        orig_kanban, orig_prs = self.df.kanban, self.df.tick_prs
+        self.df.kanban = lambda board, cmd, *args: "[]" if cmd == "list" else orig_kanban(board, cmd, *args)
+        self.df.tick_prs = lambda board, repo, tasks: None
+        try:
+            self.df.cmd_tick(types.SimpleNamespace(hook=False, board="b"))
+        finally:
+            self.df.kanban, self.df.tick_prs = orig_kanban, orig_prs
+
+    def test_failed_stalled_triage_create_leaves_board_unsettled_so_hook_retries(self):
+        """PR #29 P2: a failed [ADJ] create on an idle subscribed board must not cache tick_key."""
+        epic, _ = self._stalled_triage_chain()
+        for tid in (epic, "t_ship", "t_dev"):
+            self.board.subscribe(tid, INBOX_CHAT)
         _, created_fail = self._flow(0.05, create_ok=False)
         with redirect_stderr(io.StringIO()):
-            self.tick()
+            self._run_cmd_tick()
         self.assertEqual(len(created_fail), 1)
-        self.assertEqual(self.st.get("triage"), {})                 # transient failure is retried next tick
+        self.assertTrue(self._hook_would_dispatch())                # no board mutation, hook still retries
         _, created_ok = self._flow(0.05, create_ok=True)
-        self.tick()
+        self._run_cmd_tick()
         self.assertEqual(len(created_ok), 1)
+        # Tick 2 creates the [ADJ] (mutates kanban.db); tick 3 subscribes it (mutates kanban.db); tick 4 settles.
+        self._run_cmd_tick()
+        self._run_cmd_tick()
+        self.assertEqual(len(created_ok), 1)
+        self.assertFalse(self._hook_would_dispatch())               # settled after recovery
 
-        # Second card already repaired by ADJ_PER_CARD [ADJ]s: do not open a third.
-        self.board.card("t_dev2", "[DEV] fix 2", status="triage", assignee="developer")
-        self.board.db.execute("INSERT INTO task_links VALUES ('t_dev2', 't_ship')")
-        self.board.card("t_a1", "[ADJ] 流程阻塞 t_dev2", status="done", assignee="orchestrator")
-        self.board.card("t_a2", "[ADJ] 處理失敗卡 t_dev2", status="done", assignee="orchestrator")
-        self.board.db.commit()
-        _, created_cap = self._flow(0.05, create_ok=True)
-        self.tick()
-        self.assertEqual(created_cap, [])
+    def test_failed_stalled_triage_comment_leaves_board_unsettled_so_hook_retries(self):
+        """PR #29 P2: a failed comment to an open [ADJ] on an idle subscribed board must not cache tick_key."""
+        epic, _ = self._stalled_triage_chain()
+        self.board.card("t_adj0", "[ADJ] 收斂", body=f"EPIC: {epic}\n處理：t_dev\n內文", status="running", assignee="orchestrator")
+        for tid in (epic, "t_ship", "t_dev", "t_adj0"):
+            self.board.subscribe(tid, INBOX_CHAT)
+        self._flow(0.05, create_ok=False)
+        with redirect_stderr(io.StringIO()):
+            self._run_cmd_tick()
+        self.assertEqual(self.comments, [])
+        self.assertTrue(self._hook_would_dispatch())                # no board mutation, hook still retries
+        self._flow(0.05, create_ok=True)
+        self._run_cmd_tick()
+        self.assertEqual([a for a, _ in self.comments], ["t_adj0"])
+        self.assertFalse(self._hook_would_dispatch())               # settled after recovery
 
 
 if __name__ == "__main__":
