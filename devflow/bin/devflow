@@ -1517,7 +1517,7 @@ def plan_risks(epic: str, cards: dict[str, dict], questions: list[tuple[str, str
     return {n: float(answers[n]["probability"]) for n, _ in questions}, ""
 
 
-SHIP_PENDING = ("todo", "ready", "triage", "scheduled")
+SHIP_PENDING = ("todo", "ready", "triage", "scheduled", "blocked")
 
 
 def pending_ships(cards: dict[str, dict]) -> list[str]:
@@ -1563,7 +1563,8 @@ def readiness_rules(board: str, cards: dict[str, dict]) -> list[str]:
 def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: list[str], risky: bool) -> str:
     import hashlib
     ships = pending_ships(cards) if risky else []
-    scope_ids = sorted(set(ships) | set(pending_work_cards(epic, cards)))
+    non_ship_work = [w for w in pending_work_cards(epic, cards) if card_type(cards[w]["title"]) != "SHIP"]
+    scope_ids = sorted(set(ships) | set(non_ship_work))
     # Pending work & gated [SHIP] cards are part of the key: a plan that gains a new work card or SHIP
     # gets a fresh [ADV] instead of colliding with an earlier done [ADV] on the same finding text.
     key = f"adv-{epic}-" + hashlib.sha1("\n".join(sorted(findings) + scope_ids).encode()).hexdigest()[:8]
@@ -1612,19 +1613,23 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     advisory = [f for f in rules if f in manual] + list(risk.values())
     ships = pending_ships(cards)
     work = pending_work_cards(epic, cards)
+    non_ship_work = [w for w in work if card_type(cards[w]["title"]) != "SHIP"]
+    gating_texts = {risk[n] for n in SHIP_GATING_RISKS if n in risk}
     keys: dict[str, list[str]] = {}
     for f in advisory:
         if f in manual:
             keys[f] = [f]
         elif f == risk.get("irreversible"):
             keys[f] = [f"{f} @ {s}" for s in ships] or [f]
+        elif f in gating_texts:
+            targets = sorted(set(non_ship_work) | set(ships))
+            keys[f] = [f"{f} @ {w}" for w in targets] or [f]
         else:
             keys[f] = [f"{f} @ {w}" for w in work] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings,
               "actionable_rules": actionable_rules, "risks": risks, "note": note,
               "advised": sorted({k for ks in keys.values() for k in ks})}
     new = [f for f in advisory if any(k not in advised for k in keys[f])]
-    gating_texts = {risk[n] for n in SHIP_GATING_RISKS if n in risk}
     gate_ships = any(f in gating_texts for f in new)
     if new and advise:
         report["advisor_card"] = open_advisor_card(board, epic, cards, new, gate_ships)
@@ -1722,6 +1727,8 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
                c["body"] if t == epic or card_type(c["title"]) != "ADV" else ""]
         if t == epic or card_type(c["title"]) == "ADJ":
             row.extend([c.get("status") or "", c.get("block_kind") or ""])
+        elif card_type(c["title"]) == "SHIP":
+            row.append(c.get("status") in SHIP_PENDING)
         rows.append(row)
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 

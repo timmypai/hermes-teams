@@ -892,6 +892,47 @@ class PlanShipGate(Case):
         self.assertNotEqual(self.created[0], self.created[1])
         self.assertIn(("t_00000002", "t_s1"), self.links)
 
+    def test_blocked_or_running_ship_cannot_bypass_scope_advisor_on_resume(self) -> None:
+        """A blocked SHIP must be linked to the scope advisor immediately (before resuming to ready/todo),
+        and a SHIP that was running when scope_creep fired must invalidate plan_fingerprint and get gated
+        once it transitions into a gateable state."""
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"name": q["name"], "probability": 0.99 if q["name"] == "scope_creep" else 0.0} for q in qs}
+        # Case 1: SHIP is blocked (capability) when scope_creep first fires -> linked immediately.
+        cards_blocked = {
+            EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator",
+                   "workspace_kind": "dir", "parents": ["t_s1"]},
+            "t_s1": {"title": "[SHIP] s1", "body": f"EPIC: {EPIC}", "status": "blocked", "block_kind": "capability",
+                     "assignee": "devops", "workspace_kind": "dir", "parents": []},
+        }
+        rep_b = self.df.check_plan("b", EPIC, advise=True, cards=cards_blocked)
+        self.assertEqual(rep_b.get("advisor_card"), "t_00000001")
+        self.assertIn(("t_00000001", "t_s1"), self.links)
+
+        # Case 2: SHIP is running when scope_creep fires (cannot be linked yet) -> not marked advised for t_s2;
+        # once t_s2 moves to ready/todo, plan_fingerprint changes and check_plan gates t_s2 before dispatch.
+        cards_running = {
+            EPIC: {"title": "[EPIC] e", "body": BODY, "status": "todo", "assignee": "orchestrator",
+                   "workspace_kind": "dir", "parents": ["t_s2"]},
+            "t_d2": {"title": "[DEV] d2", "body": f"EPIC: {EPIC}", "status": "ready", "assignee": "developer",
+                     "workspace_kind": "worktree", "parents": []},
+            "t_s2": {"title": "[SHIP] s2", "body": f"EPIC: {EPIC}", "status": "running", "assignee": "devops",
+                     "workspace_kind": "dir", "parents": []},
+        }
+        fp_running = self.df.plan_fingerprint(EPIC, cards_running, REPO)
+        rep_r = self.df.check_plan("b", EPIC, advise=True, cards=cards_running)
+        self.assertEqual(rep_r.get("advisor_card"), "t_00000002")
+        self.assertNotIn(("t_00000002", "t_s2"), self.links)
+        advised = set(rep_r["advised"])
+        self.assertFalse(any(k.endswith("@ t_s2") for k in advised), advised)
+
+        cards_ready = {**cards_running, "t_s2": {**cards_running["t_s2"], "status": "ready"}}
+        fp_ready = self.df.plan_fingerprint(EPIC, cards_ready, REPO)
+        self.assertNotEqual(fp_running, fp_ready)
+        rep_ready = self.df.check_plan("b", EPIC, advise=True, cards=cards_ready, advised=frozenset(advised))
+        self.assertEqual(rep_ready.get("advisor_card"), "t_00000003")
+        self.assertIn(("t_00000003", "t_s2"), self.links)
+
     def test_actionable_rules_exclude_body_length_and_manual_advisory(self) -> None:
         """Item 1: check_plan separates actionable structural rules from body-length and [manual] reminders."""
         self.df.decide = lambda content, qs: {q["name"]: {"name": q["name"], "probability": 0.0} for q in qs}
