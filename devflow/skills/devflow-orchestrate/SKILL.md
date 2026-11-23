@@ -61,8 +61,10 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    - `[DEV]` 一卡一 PR，能獨立合併；每張 `[DEV]`/`[OPS]` 後面接一張 `[SHIP]`（parent = 該卡）。
    - 依賴前一個 PR 程式碼的 `[DEV]`，parent 要指向前一張 `[SHIP]`（合併後 worktree 才會基於新 main）。互不相干的 `[DEV]` 並行。
    - 不需要部署的工作（純研究、文件）不用 `[SHIP]`。
-   - 有 `[SHIP]` 時先跑 `terminal: devflow repo doctor <slug>`，看 `deploy`：`contract-files` 或 `port` 沒過 → 加一張 `[OPS]` 用 PR 修，後面接它自己的 `[SHIP]`；其他 `[DEV]` 的 parent 指向這張 `[SHIP]`，讓每張 `[SHIP]` 都在這張 `[OPS]` 下游。`[OPS]` body 寫出這些項目 id 與 doctor 給的修法（`check plan` 會檢查）。`runner-online`／`runner-request`／`fork-approval` 沒過不用建卡：`[SHIP]` 合併前會擋下並問使用者。不設計新的部署方式或安全門檻。
-   - 每條 AC 至少一張卡負責；卡片 `## 驗收` 第一行寫「覆蓋：AC-1, AC-3」，只寫編號，不抄 AC 原文（全文在 EPIC，worker 用 `kanban_show` 讀得到；照抄的行 tick 會自動刪掉、留編號）。下面只加這張卡自己的技術驗收（最多 5 條）。
+   - 有 `[SHIP]` 時先做**終點反推的端到端前置盤點**（一次查清，禁止留到 `[SHIP]` 才逐一撞牆打地鼠）：
+     1. 跑 `terminal: devflow repo doctor <slug>` 看 `deploy`：`contract-files` 或 `port` 沒過 → 加一張 `[OPS]` 用 PR 修，後面接它自己的 `[SHIP]`；其他 `[DEV]` 的 parent 指向這張 `[SHIP]`，讓每張 `[SHIP]` 都在這張 `[OPS]` 下游。`[OPS]` body 寫出這些項目 id 與 doctor 給的修法（`check plan` 會檢查）。`runner-online`／`runner-request`／`fork-approval` 沒過不用建卡：`[SHIP]` 合併前會擋下並問使用者。
+     2. 跑 `terminal: gh secret list -R <OWNER/REPO>`（只看名稱，不讀值）並對照各 AC 的最終驗證步驟：若部署或正式環境操作需要特定腳本（如 `.devflow/ui/ops/<op>.spec.ts`），檢查 repo 是否已存在該腳本；還沒有就**在初始規劃一併排進 `[DEV]` 卡**，不要留給 `[SHIP]` 事後發現才連開補丁 PR。不設計新的部署方式或安全門檻。
+   - 每條 AC 至少一張卡負責；卡片 `## 驗收` 第一行寫「覆蓋：AC-1, AC-3」，只寫編號，不抄 AC 原文（全文在 EPIC，worker 用 `kanban_show` 讀得到；照抄的行 tick 會自動刪掉、留編號）。PR 卡（`[DEV]`/`[OPS]`）覆蓋的 AC 不可全為 `[manual]`（0 個可執行情境會導致 `check acceptance` 的 `Covers:` 核對失敗）。下面只加這張卡自己的技術驗收（最多 5 條）。
    - 卡片只寫目標與驗收，不寫實作細節；做法交給 architect / developer。
 4. 建卡：
    ```
@@ -77,8 +79,8 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
    goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。
 5. 把每條路徑的最後一張卡（通常是 `[SHIP]`）連成 EPIC 的 parent：`kanban_link(parent_id=<leaf>, child_id=<EPIC>)`。
-6. 自查：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`findings` 裡的規則問題（assignee、workspace、contract、缺 `[SHIP]`、AC 沒人負責、AC 沒類型、缺情境或 Given/When/Then、沒接到 EPIC）自己修掉再跑一次；`[manual]` 的提醒是給 advisor 判斷的，不用自己處理；`Decisions …` 開頭的是風險判斷，不用自己處理。
-7. `kanban_comment(EPIC, 計畫摘要：卡片清單、順序、AC 對應)`，然後 `kanban_block(kind="dependency", reason="等待子卡完成：t_a, t_b…")`。EPIC 等待期間，dispatcher tick 會在計畫有變動時跑 `devflow check plan`：有疑慮就自動建 `[ADV]`（Opus 5.5）並在 EPIC 留言；含不可回復操作時 `[ADV]` 會成為各 `[SHIP]` 的 parent。你不用等它。
+6. 自查（必做，0 錯誤才准進入等待）：`terminal: devflow check plan <slug> <EPIC>`（唯讀）。`actionable_rules`（或 `findings` 裡的確定性規則問題：assignee、workspace、contract、缺 `[SHIP]`、PR 卡只覆蓋 `[manual]` AC、AC 沒人負責、AC 沒類型、缺情境或 Given/When/Then、沒接到 EPIC、越權建卡、單一 `[SHIP]` 事後補丁卡超限）**必須當場修到 `actionable_rules` 為空（`[]`）再跑一次確認**；`[manual]` 的提醒與 `Decisions …` 風險是給 advisor 判斷的，不用自己處理。
+7. `kanban_comment(EPIC, 計畫摘要：卡片清單、順序、AC 對應)`，然後 `kanban_block(kind="dependency", reason="等待子卡完成：t_a, t_b…")`。EPIC 等待期間，dispatcher tick 會在計畫有變動時先原地補齊遺漏的 `goal_mode` 與固定 `## 本卡完成`，再跑 `devflow check plan`：若有未解決的確定性規則錯誤，tick 會建立／通知 `[ADJ] 計畫規則修正 <EPIC>` 立刻喚醒你修正；若有顧問／風險疑慮則自動建 `[ADV]`（Opus 5.5），且當疑慮包含不可回復操作（`irreversible`）或超出範圍（`beyond_said`、`scope_creep`）時，`[ADV]` 會自動成為各待出貨 `[SHIP]` 的 parent 擋下出貨。
 8. 想主動請 advisor 看（目標有多種解讀、架構取捨）：`kanban_create(title="[ADV] ...", assignee="default", workspace_kind="scratch", model="claude-opus-5.5", provider="copilot", body="EPIC: <id>\n<要它判斷什麼>")`，不加 parent、不連到 EPIC。
 
 ## B. 驗收

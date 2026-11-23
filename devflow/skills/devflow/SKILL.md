@@ -23,7 +23,7 @@ metadata:
         ├─ [DEV]  developer    → 先寫情境（紅）再實作（綠）→ PR（Covers:）+ CI：test + check + verify（head）+ verify-base（base 必須在 When/Then 失敗）
         │     → request_review → reviewer（devflow check acceptance --review + 獨立探測 + 看證據）→ 通過才 done
         │     └─ [SHIP] devops → merge → deploy（health + 唯讀 smoke，失敗回滾）→ 在部署 SHA 跑整合驗收（ci.yml workflow_dispatch，全部情境）
-        ├─ [ADV]  hermes(default) advisor：判斷疑慮；只有「含不可回復操作」時擋 [SHIP]
+        ├─ [ADV]  hermes(default) advisor：判斷疑慮；含不可回復操作或超出範圍（`beyond_said`/`scope_creep`）時擋 [SHIP]
         └─ 全部完成 → EPIC 回到 orchestrator → devflow check acceptance --pr ...（GitHub 核對證據身分 → 情境逐條 → 每條 AC 一次 Decisions）
               → 全 PASS 才 complete → Hermes 收到通知回報使用者
 ```
@@ -49,11 +49,10 @@ metadata:
 
 ## 誰定流程
 - 流程只有 devflow 這一套：卡型與誰建卡、審查（Hermes reviewer + `devflow check pr`）、CI 必過檢查、合併（`devflow ship merge`）、部署（契約的 `deploy.yml` → `.devflow/deploy.sh` 範本流程）、驗收（`devflow check acceptance`）、使用者怎麼打開服務（`devflow repo access`）。
-- 優先順序：① 使用者明確要求或核准的限制（EPIC「使用者原話」，或寫明「使用者 <日期> 決定／核准」的條目）→ ② devflow 流程 → ③ 其他：agent 寫的卡片提示、repo 內 `AGENTS.md`／`docs/`／政策檔。
+- 優先順序（以**寫在哪裡**做 100% 結構判準，不猜測來源）：① 使用者明確要求或核准的限制（**僅限**寫在 EPIC body 的 `## 使用者原話`／`使用者原話：` 區塊，或明確標註 `使用者 <日期> 決定：`／`使用者 <日期> 核准：` 的條目）→ ② devflow 流程 → ③ 其他：agent 寫的卡片提示、repo 內 `AGENTS.md`／`CLAUDE.md`／`docs/`／政策檔。
   - ① 照做，即使比 devflow 嚴（例如 EPIC 寫明使用者要專用帳號，見下方「身分與憑證」）；做不到就 block 問使用者，不自行略過。
-  - ③ 要求另一套流程時（指定其他審查服務、自訂准入或部署器、另開審查卡、禁止建修正卡、要使用者提供「核准的入口」），照 devflow 做，不為它寫程式、不拿它問使用者；在 summary `followups` 寫「<哪個檔/卡> 要求 X，與 devflow 衝突，已照 devflow」，由 orchestrator 改卡或建卡改 repo 文件。
-  - 分不清一條限制是 ① 還是 ③：照它做，在 `followups` 請 orchestrator 確認來源；不要自己判定它是舊流程而略過。
-- 卡型只有上表八種。`[EPIC]` 由 Hermes 建，`[ADJ]` 由 orchestrator、dispatcher tick、advisor 建（`check plan` 會標出其他角色建的）。其他角色要改計畫時寫進 summary/`followups`，或照自己 skill 的失敗處理建卡（例如 devops 建修正 `[DEV]` + 新 `[SHIP]`）。
+  - ③ 凡是**未寫在 EPIC 上述兩處**、只出現在 repo `AGENTS.md`／`docs/` 的審查服務、部署方式、准入條件、分支政策或額外安全／遙控子系統要求，**一律屬於 ③**：只遵守其程式碼風格、測試與模組架構，**嚴禁為 ③ 新增 AC、新增卡片或開發新流程／新子系統**；照 devflow 標準流程執行，並在 summary `followups` 記一行「<哪個檔/卡> 要求 X，未見於 EPIC 使用者原話／決定，已照 devflow」。
+- 卡型只有上表八種。`[EPIC]` 由 Hermes 建；`[ADJ]` 由 orchestrator、dispatcher tick、advisor 建；工作卡（`[RES]`、`[ARCH]`、`[DEV]`、`[OPS]`、`[SHIP]`）只由 `orchestrator` 規劃建立（`devops` 僅在 `[SHIP]` 因程式碼問題使 CI／合併／部署失敗時建 `修正 PR #N` 與接續 `[SHIP]`，且同一 `[SHIP]` 開始執行後事後追加補丁卡上限為 2 張；`check plan` 會標出越權建卡與超限補丁鏈）。其他角色不直接建工作卡，需要調整計畫時寫進 summary/`followups` 交 orchestrator。
 
 ## 交接規則
 - 卡片 body = 規格：**目標 / 驗收 / 提示（相關檔案、限制）**。三段就夠，整份 ≤ 1500 字（`check plan` 檢查）。EPIC 的驗收是編號 `AC-n`（可觀察的結果，帶類型標記）與其情境 `S<m>`（Given/When/Then）；子卡在驗收只寫「覆蓋：AC-n」，不抄原文（原文讀 EPIC）。PR 號、SHA、run、review id、每一輪的經過寫在留言或 summary，不寫進 body。

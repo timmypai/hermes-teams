@@ -271,6 +271,17 @@ class Plan(unittest.TestCase):
         self.assertEqual([f.split(":")[0] for f in found], [SHIP])
         self.assertIn("t_p1, t_p2, t_p3", found[0])
 
+    def test_work_card_opened_by_non_planner_is_a_finding(self):
+        """Work cards ([RES]/[ARCH]/[DEV]/[OPS]/[SHIP]) must be planned by orchestrator (or devops for
+        ship-failure fix cards), never spawned directly by `default` chat or other worker profiles."""
+        self.creators[DEV] = "default"
+        self.board({DEV})
+        found = self.findings("工作卡只由 orchestrator")
+        self.assertEqual([f.split(":")[0] for f in found], [DEV])
+        for allowed in ("orchestrator", "devops"):
+            self.creators[DEV] = allowed
+            self.assertEqual(self.findings("工作卡只由 orchestrator"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

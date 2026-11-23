@@ -958,7 +958,8 @@ class RouteQuestions(unittest.TestCase):
         self.df.release_held = lambda *a: None
         self.df.release_rate_limited_advisors = lambda *a: False
         self.df.route_questions = lambda *a: False
-        self.df.plan_cards = lambda board, eid: {"t_ep01": epic, "t_dev1": dev}
+        plan = {"t_ep01": epic, "t_dev1": dev}
+        self.df.plan_cards = lambda board, eid: plan
         self.df.repair_bodies = lambda board, eid, cards: []
         self.df.check_plan = lambda board, eid, **kw: {
             "findings": ["t_dev1: [DEV] assignee 應為 developer，現在是 devops"],
@@ -970,16 +971,30 @@ class RouteQuestions(unittest.TestCase):
         def fake_run(cmd, **kw):
             if "create" in cmd:
                 created.append(cmd)
-                return types.SimpleNamespace(returncode=0, stdout="Created t_adj00001\n", stderr="")
+                return types.SimpleNamespace(returncode=0, stdout=f"Created t_adj{len(created):05d}\n", stderr="")
             return orig_run(cmd, **kw)
         self.df.run = fake_run
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 1)
         self.assertIn("[ADJ] 計畫規則修正 t_ep01", created[0])
-        # Plan fingerprint changes (body edit) with identical actionable_rules: must NOT open a duplicate [ADJ].
+        # Plan fingerprint changes (body edit) while t_adj00001 is still ready: must NOT open a duplicate [ADJ].
         self.st["plans"].clear()
         self.assertFalse(self.df.tick_board("b", self.st))
         self.assertEqual(len(created), 1)
+        # If t_adj00001 finishes (`done`) WITHOUT fixing the rule, open_plan_adj must schedule a 2nd repair [ADJ].
+        plan["t_adj00001"]["status"] = "done"
+        self.st["plans"].clear()
+        self.assertFalse(self.df.tick_board("b", self.st))
+        self.assertEqual(len(created), 2)
+        # Once 2 plan-repair [ADJ] cards complete without resolving (or a new rule like SHIP patch-limit fires),
+        # open_plan_adj escalates to a durable needs_input block on the EPIC instead of silently caching.
+        plan["t_adj00002"]["status"] = "done"
+        self.board.card("t_ep01", "[EPIC] e", status="todo", assignee="orchestrator")
+        res = self.df.open_plan_adj("b", "t_ep01", plan, ["t_ship1: [SHIP] 開始執行後已事後追加 3 張 [DEV]/[OPS] 補丁卡"], self.st)
+        self.assertEqual(res, ("user", False))
+        self.assertEqual(plan["t_ep01"]["block_kind"], "needs_input")
+        row = self.board.db.execute("SELECT status, block_kind FROM tasks WHERE id='t_ep01'").fetchone()
+        self.assertEqual(row, ("blocked", "needs_input"))
         # Body-length-only findings (actionable_rules=[]) never open an [ADJ].
         self.st["plans"].clear()
         self.st["plan_adj"].clear()
@@ -988,20 +1003,20 @@ class RouteQuestions(unittest.TestCase):
             "actionable_rules": [], "advised": [], "note": "",
         }
         self.assertFalse(self.df.tick_board("b", self.st))
-        self.assertEqual(len(created), 1)
+        self.assertEqual(len(created), 2)
         # An existing dependency-waiting `todo` [ADJ] cannot wake on a comment: open_plan_adj must schedule
         # a new runnable [ADJ] instead of commenting on the sleeping `todo` [ADJ].
         calls = []
         self.df.run = lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(
-            returncode=0, stdout="Created t_adj00002\n", stderr="")
+            returncode=0, stdout="Created t_adj00003\n", stderr="")
         cards_with_sleeping_adj = {
-            "t_ep01": epic,
-            "t_dev1": dev,
+            "t_ep01": dict(epic),
+            "t_dev1": dict(dev),
             "t_adj_sleep": {"id": "t_adj_sleep", "title": "[ADJ] existing", "status": "todo", "parents": ["t_dev1"]},
         }
         st2 = {}
         res = self.df.open_plan_adj("b", "t_ep01", cards_with_sleeping_adj, ["t_dev1: wrong assignee"], st2)
-        self.assertEqual(res, ("t_adj00002", False))
+        self.assertEqual(res, ("t_adj00003", False))
         self.assertEqual(len(calls), 1)
         self.assertIn("create", calls[0])
 

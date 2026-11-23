@@ -92,7 +92,7 @@ devflow operate <slug> look --arg path=/login     # 唯讀看一頁：result.tex
 devflow operate <slug> <op> --arg key=value       # repo 裡的 .devflow/ui/ops/<op>.spec.ts
 ```
 - 輸出 JSON：`conclusion`、`result`（腳本寫的結果）、`images`（截圖路徑）、`failures`、`run`。用 `vision_analyze` 看截圖確認畫面真的是預期結果，不只看 `conclusion`。結束碼非 0 = 操作失敗：看 `failures` 與截圖。
-- 只跑 default branch 最新 commit 上的腳本。需要的操作還沒有腳本 → 建 `[DEV]`（developer 寫 `ops/<op>.spec.ts`，形狀照 `ops/look.spec.ts`，走 PR review），合併後再用；repo 還沒有 `operate.yml`／`operate.sh` → 同一張 `[DEV]` 跑 `devflow contract <slug> . --ui` 補上。
+- 只跑 default branch 最新 commit 上**已存在**的腳本。`[SHIP]` 卡的職責是合併、部署與執行既有正式驗證，**禁止在 `[SHIP]` 為了缺少操作腳本或新功能而自己連續建 `[DEV]`／`[OPS]` 卡串在自己上游**（避免打地鼠式無限開 PR）：若規劃時漏了必要的 `ops/<op>.spec.ts` 或功能，在 summary `followups` 寫明缺哪支腳本並完成目前已部署範圍的交接（或由 orchestrator 在規劃／調整階段統一排卡）。
 - 秘密（管理密碼等）在 repo secret `DEVFLOW_OPS_ENV`（dotenv）。先用 `gh secret list -R <repo>` 看名稱（不讀值）；沒有 → `kanban_block(kind="capability")`，第一行 `問題：請你在 GitHub 為 <repo> 設 secret DEVFLOW_OPS_ENV（一行 ADMIN_PASSWORD=<管理密碼>），做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`（使用者自己動手的題型，見 `devflow` 推進規則），不要在聊天收密碼。重跑後第一件事重查名稱；仍沒有就照實說明後再 block，題目寫明「上次回覆後仍未看到 DEVFLOW_OPS_ENV」。`--arg` 會出現在 run 的 inputs，不放秘密。
 - 會寫入正式資料的操作，照卡片與 EPIC 的授權做；不可回復的操作（刪資料等）仍先 `needs_input`。
 - 只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料（例如會議要排在哪一天）。問的時候說清楚其餘步驟由你做。
@@ -100,7 +100,7 @@ devflow operate <slug> <op> --arg key=value       # repo 裡的 .devflow/ui/ops/
 ## 6. 失敗處理（程式問題改建卡；只有人能修的主機或權限問題才 block）
 | 狀況 | 做法 |
 |---|---|
-| CI 紅（程式碼）、merge 衝突、部署失敗且是程式碼問題 | 建 `[DEV] 修正 PR #N：<原因>`（assignee developer、`workspace_kind="worktree"`、`workspace_path`=原 DEV 卡的 worktree、`completion_contract` 照 `devflow repo list`、body 附錯誤摘要與 run URL、`EPIC: ...`）→ 建新 `[SHIP]`（parent = 修正卡）→ `kanban_link(parent_id=<新 SHIP>, child_id=<EPIC>)` → 本卡 `kanban_complete(summary="未出貨：<原因>；改由 t_x → t_y", created_cards=[...])` |
+| CI 紅（程式碼）、merge 衝突、部署失敗且是程式碼問題 | 建 `[DEV] 修正 PR #N：<原因>`（assignee developer、`workspace_kind="worktree"`、`workspace_path`=原 DEV 卡的 worktree、`completion_contract` 照 `devflow repo list`、body 附錯誤摘要與 run URL、`EPIC: ...`）→ 建新 `[SHIP]`（parent = 修正卡）→ `kanban_link(parent_id=<新 SHIP>, child_id=<EPIC>)` → 本卡 `kanban_complete(summary="未出貨：<原因>；改由 t_x → t_y", created_cards=[...])`。注意：不要把新修正卡 link 回原本已開始執行的 `[SHIP]` 反覆重跑同一張 `[SHIP]`（同一張未完成 `[SHIP]` 開始執行後事後追加的 `[DEV]`/`[OPS]` 補丁卡上限為 2 張，超限時 `check plan` 會強制交 orchestrator 向使用者確認收斂） |
 | runner offline / 主機 Docker 問題 | `devflow repo doctor <slug>` 看 `runner-online`／`runner-request` 的 `detail`；沒有 runner 就 `devflow runner request`。修好後部署最新版：`gh workflow run deploy.yml --ref <default>`（不要 `gh run rerun` 舊 run：期間有新合併時，它在 `default branch tip only` 失敗，不會部署）。容器內修不了（主機沒處理申請、runner 服務停了）→ `kanban_block(kind="capability")`，問題寫成誰在 VM 做什麼；不建卡、不設計其他部署方式 |
 | 部署 run 在 `default branch tip only` 失敗 | 不是程式問題：這個 SHA 已不是 default branch 最新版。追最新 commit 的部署 run（沒有就用上一列的 `gh workflow run`）；要回到舊版用 revert PR |
 | 部署 health、verify 或 up 失敗 | deploy.sh 已先採證再回滾。`gh run view <id> --log-failed` 看哪一步、哪個情境；`gh run download <id> -n devflow-diagnostics-deploy-<sha> -D /tmp/diag-<id>` 讀 `candidate/`（失敗版本的 `state.jsonl`、`logs/`、`health.json`、`host.txt`）與 `rollback/`（回滾後狀態）。判定是程式問題 → 照第一列建修正卡，body 附 run URL 與關鍵證據（不貼整段 log）；主機資源或 runner 問題 → 照第二列 |
