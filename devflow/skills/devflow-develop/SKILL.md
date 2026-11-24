@@ -18,7 +18,8 @@ metadata:
 2. `git status && git log --oneline -3`；讀 `AGENTS.md` / README / `.devflow/`。
 3. `git fetch origin` 後若 main 已前進且會影響你的改動，`git rebase origin/<default>`。
 
-## 2. 實作
+## 2. 實作（先定案、再改碼）
+- **Plan-Before-Edit**：動手改第一行程式前，先確認本卡的「改動檔案清單、對應 AC、不在 `Out-of-Scope`／未授權保護路徑內、針對性測試指令」，避免改歪或順手重構無關模組。
 - 寫程式的規則是 Codex skill `ub-mode`（Make it Work → Make it Right → Practice；devflow 的覆寫寫在 Codex `AGENTS.md`）。流程細節可用 `implement`、`tdd`。
 - bug 卡（`pstack` bug-fix playbook）：先用一個會失敗的測試或情境重現；用證據二分找原因，不猜；只交付證據支持的最小修正，被證據推翻的改動要撤掉。
 - 架構卡有 `adr_markdown` 時放到 `docs/adr/NNNN-<slug>.md` 一起提交。
@@ -43,8 +44,9 @@ metadata:
 - repo 還沒有任何可腳本化的驗證方式時：`skill_view pstack:create-verification-skill`，照它的方法盤點啟動/操作/證據，但產物寫成 `.devflow/verify.sh` 的 `scenario` 與 `.devflow/ui/`（不是 `.cursor/skills`）。
 - 卡片要你寫「操作腳本」（Bot 對正式服務的 UI 操作，例如登入管理頁後建立或選擇資料、讀出 id）：寫在 `.devflow/ui/ops/<op>.spec.ts`，一個檔一個 `test`，形狀照 `ops/look.spec.ts`：參數讀 `DEVFLOW_OP_ARGS`（JSON），秘密讀環境變數（來自 repo secret `DEVFLOW_OPS_ENV`），結果寫 `DEVFLOW_OP_RESULT`（JSON），關鍵畫面截圖到 `/evidence/<名稱>.png`。每一步用 `expect` 斷言畫面真的到了（找不到就失敗，不要默默略過），寫入前先確認不是重複建立（同名資料已存在就選它）。秘密不寫進結果、截圖或 console。操作腳本不是情境：驗收不會跑 `ops/`，它的正確性另外用一個情境證明（在 CI 的一次性服務上跑同一套步驟）。
 
-## 4. 驗證
-- 跑 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）與 `bash .devflow/check.sh`（規則與教訓，CI 的必過 `check` job）。Hermes 容器內沒有 Docker：映像建置、`verify.sh`、base 紅綠證明與部署驗證交給 CI；要先看情境在 base 是否紅燈，push 後用 `repro.yml`（見 5.5）或直接看 PR CI 的 `verify-base`。
+## 4. 驗證（Preflight 一站式自檢）
+- push／開 PR 前，先跑 `devflow preflight <slug> <task-id> --dir . --pr-title "<標題>"`：一次做完確定性自檢（worktree 乾淨度、`Allowed-Scope`/`Out-of-Scope` 範圍、變更檔數上限、保護／gate 檔 hash 變更、`fix:`/`Lesson:` 與 `Covers:` 格式、`.devflow/check.sh` 及針對性測試）。未通過就當場修到 exit 0，不要把低級錯誤丟給 CI 或 reviewer。
+- 若需另外跑完整測試：執行 `.devflow/test.sh`（沒有就用 repo 慣用的測試/lint/build）與 `bash .devflow/check.sh`。Hermes 容器內沒有 Docker：映像建置、`verify.sh`、base 紅綠證明與部署驗證交給 CI；要先看情境在 base 是否紅燈，push 後用 `repro.yml`（見 5.5）或直接看 PR CI 的 `verify-base`。
 - 失敗就修根因，不刪測試、不 skip、不加壓警告註解（這些都由 `check` 擋）。規則確實誤判時，才在該行或上一行加 `devflow: allow <rule-id> L-NNNN`，並在同一個 PR 新增那筆教訓。
 - 修 bug、修退件或處理部署失敗時，若同類錯誤可能再發生，新增教訓 `.devflow/lessons/L-NNNN.toml`（`id`、`title`、`event`＝PR／run／卡片連結、`root_cause`、`category` 為 `code-pattern`／`architecture`／`verification`／`process`／`kit` 之一、`[enforcement] kind/ref`）。選最能擋住**這個錯誤的語意**的方式：
   - `rule`：錯誤在**單一行**就看得出來（禁用的呼叫、匯入、註解、設定值）。新增 `.devflow/rules/<id>.toml`，附 `expect = "fail"`（這次的錯誤那一行）與 `"pass"` 範例。規則逐行比對，不能跨行，不懂語意；範例先跑 `bash .devflow/check.sh` 確認自測通過。
@@ -109,7 +111,7 @@ kanban_request_review(
             "log": ["<做了什麼> — <為什麼>", ...], "followups": [...]})
 ```
 reviewer 會被自動派工。退件時這張卡回到你手上（同一 worktree、同一 PR），修正 → push → 等 CI → 再 `kanban_request_review(reviewer="reviewer", ...)`。
-作者只用 `kanban_request_review` 交出這張卡，不呼叫 `kanban_complete`：卡片 `## 本卡完成` 的「完成條件」是送審的條件，審查在這張卡自己的 review 欄，由 reviewer 核准後完成；`[SHIP]` 不審查。自己 complete 的卡不能再回 review 欄，PR 就沒人審、合併不了（teams-transcription t_48d094f6、t_1463bbcb）。
+作者只用 `kanban_request_review` 交出這張卡，不呼叫 `kanban_complete`：卡片 `## 本卡完成` 的「完成條件」是送審的條件，審查在這張卡自己的 review 欄，由 reviewer 核准後完成；`[SHIP]` 不審查。自己 complete 的卡不能再回 review 欄，PR 就沒人審、合併不了。
 
 ## 不做
 不 merge、不部署、不 push 到 main、不改 `.github/workflows` 的部署目標（`[OPS]` 卡除外）。範圍外問題寫進 `followups`。

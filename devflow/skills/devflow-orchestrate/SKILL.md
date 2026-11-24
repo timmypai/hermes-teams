@@ -69,12 +69,13 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 4. 建卡：
    ```
    kanban_create(title="[DEV] <白話標題：做什麼事>", assignee="developer", workspace_kind="worktree", goal_mode=true,
-                 parents=[...], body="## 目標\n<1-2 句白話：達成什麼使用者看得到的結果>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\nEPIC: t_xxxx",
+                 parents=[...], body="## 目標\n<1-2 句白話：達成什麼使用者看得到的結果>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\nAllowed-Scope: <預期改動目錄或模組 glob，選填>\nOut-of-Scope: <禁止碰的區域 glob，選填>\nVerify: <針對性快測指令，選填>\nEPIC: t_xxxx",
                  skills=[選用，例如 "tdd"])
    ```
-   `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具（例如「等 CI」）時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。送審時 Hermes 的 goal judge 只讀 title+body 的前 2000 字，判斷「本卡完成」是否已達成。所以：
-   - `## 本卡完成` 一字不改照抄上面那句，緊接在 `## 目標` 後面。不要加「已交 review」「reviewer 已接手」「已批准」「已部署」，也不要寫送審工具名稱：judge 不知道是哪個工具在問，這些在送審時都還沒發生，會永遠拒絕送審（teams-transcription t_6d121ad4；2026-11-19 實測）。改過的文字 dispatcher tick 會自動改回，並在 EPIC 留言。
-   - **body 只寫人話且極短**：整份 ≤ 600 字（`check plan` 檢查，不含 `[DEV]`/`[OPS]` 的 `## 本卡完成` 與 EPIC 的 `## 驗收`／`## 使用者原話`／`## 使用者決定`）。`## 目標` 1–2 句白話；**不寫 `## 提示` 技術細節**（不抄 repo 架構、SHA、run ID、socket、seccomp、禁止條文或 schema 步驟；做法由 developer / devops 讀 repo 決定）。
+   建卡前可用 `devflow check card --title "..." --assignee ... --workspace ...` 先做確定性格式與 body 乾淨度檢查（fail fast，不等 tick）。
+   `[DEV]`/`[OPS]` 一定加 `goal_mode=true`：developer 停下卻沒呼叫終結工具時，Hermes 會再給一輪要它繼續，而不是記 crash 並扣住卡片。送審時 Hermes 的 goal judge 只讀 title+body 的前 2000 字，判斷「本卡完成」是否已達成。所以：
+   - `## 本卡完成` 一字不改照抄上面那句，緊接在 `## 目標` 後面。不要加「已交 review」「reviewer 已接手」「已批准」「已部署」，也不要寫送審工具名稱：judge 不知道是哪個工具在問，這些在送審時都還沒發生，會永遠拒絕送審。改過的文字 dispatcher tick 會自動改回，並在 EPIC 留言。
+   - **body 只寫人話且極短**：整份 ≤ 600 字（`check plan` 與 `check card` 都會確定性檢查長度與禁止夾帶 SHA / CI run ID / 容器核心旗標）。`## 目標` 1–2 句白話；**不寫 `## 提示` 技術細節**；範圍邊界只用 `Allowed-Scope:`、`Out-of-Scope:` 與 `Verify:` 宣告，由 `devflow preflight` 與 `devflow check pr` 自動卡控。
    - body 是規格，不是紀錄：PR 號、head SHA、run id、review id、每一輪試過什麼、誰接手，寫進 `kanban_comment`，body 最多放一行「經過見留言」。改卡（`[ADJ]` 或 `devflow-ops edit`）是**改寫**成目前的規格，不是在後面疊加新段落。
    goal_mode 建卡後改不了，漏加只能作廢重建。
    workspace：`[RES]`/`[ADV]` scratch、`[ARCH]`/`[SHIP]` dir、`[DEV]`/`[OPS]` worktree（見 `devflow` 表）。`[DEV]`/`[OPS]` 不給 `workspace_path`（只有接續舊卡 worktree 時才給）：建卡回應裡的 `workspace_path` 會先顯示主 checkout，dispatcher claim 時才換成 `.worktrees/<task-id>`，這是正常的，不要自己 `git worktree add`。`[DEV]`/`[OPS]` 在 `devflow repo list` 顯示 `contract=yes` 時加 `completion_contract="OWNER/REPO"`，否則不設（見 `devflow` 推進規則）。
@@ -106,10 +107,10 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 - 卡片本身卡死（例如在不能設 required checks 的 repo 上設了 PR `completion_contract`，完成被 Hermes gate 拒絕；這類設定建立後不能改）：建替代卡（同 assignee、同 `workspace_kind`，worktree 用 `workspace_path`=舊卡 worktree，不設 contract），body 寫「接續 t_old：已完成什麼、剩什麼」；用 `devflow-ops`：對舊卡每個 child `link <新卡> <child>`、`unlink <舊卡> <child>`，最後 `archive <舊卡>`。
 - 要重跑的卡：`devflow-ops` 的 `resume`。不要為此 `kanban_block`。
 - 同一類根因已在之前的 `[ADJ]` 出現過（看 EPIC 留言與舊 `[ADJ]` 的 `root_cause`）：把修正放進結構，不只改這張卡（`pstack:principle-encode-lessons-in-structure`）。repo 層面 → 建 `[DEV]`/`[OPS]` 改 `.devflow/` 或 CI；devflow 本身（skill、範本、`devflow` CLI）→ 寫進 `followups`，由使用者決定是否改 kit。
-- 同一張卡已有 3 張以上 `[ADJ]` 明確處理它（標題 `流程阻塞`／`處理失敗卡 t_x`，或 body 一行 `處理：t_x`，含本卡；`check plan` 會列出），或同一個問題已經開過一輪「補診斷／補證據」的修正 PR 仍不知道根因：不要再開下一輪。在本 `[ADJ]` `kanban_block(kind="needs_input")`，reason 照 `devflow` skill 的問題格式寫給使用者：卡在哪（一句話＋關鍵證據）、試過什麼、A/B 選項與代價（例如「請你在 VM 執行 <唯讀指令> 回報輸出」「改回 devflow 標準部署」「縮小這條 AC」）。`[ADJ]` 的提問不會被 tick 轉成流程問題，會直接到使用者（teams-transcription 2026-11-18：主機沒裝 buildx，連開三輪診斷卡）。tick 在一張卡已有 2 張 `[ADJ]` 後，第 3 次被擋就直接問使用者。
+- 同一張卡已有 3 張以上 `[ADJ]` 明確處理它（標題 `流程阻塞`／`處理失敗卡 t_x`，或 body 一行 `處理：t_x`，含本卡；`check plan` 會列出），或同一張 `[DEV]`/`[OPS]` 卡 review 退件達熔斷上限（預設 2 輪），或同一個問題已經開過一輪「補診斷／補證據」的修正 PR 仍不知道根因：不要再開下一輪。在本 `[ADJ]` `kanban_block(kind="needs_input")`，reason 照 `devflow` skill 的問題格式寫給使用者：卡在哪（一句話＋關鍵證據）、試過什麼、A/B 選項與代價（例如「請你在 VM 執行 <唯讀指令> 回報輸出」「改回 devflow 標準部署」「縮小這條 AC」）。`[ADJ]` 的提問不會被 tick 轉成流程問題，會直接到使用者。tick 在一張卡已有 2 張 `[ADJ]` 後，第 3 次被擋就直接問使用者。
 - 不接受：summary 寫理由。最後 `kanban_complete(summary=..., metadata={"root_cause": ..., "fix": ...})`。
 
 ## 原則
 - 不輪詢、不 sleep 等待；一律用 parent + dependency block。
-- 不設固定的次數或時間上限；同因失敗兩次就換策略（`pstack:principle-attack-the-premise`），同一段路繞第三次就照「C. 調整」把選擇交給使用者。
-- 只有產品方向、付費、破壞性資料操作，或上一點「繞第三次」要使用者選路時，才 `kanban_block(kind="needs_input")`；Hermes 會問使用者。
+- 遵守宣告式上限（`roles.json` `policy`：每卡 `[ADJ]` 上限、review 往復熔斷輪數、單一 EPIC 工作卡數上限）；同因失敗兩次就換策略（`pstack:principle-attack-the-premise`），達上限就交給使用者收斂定錨。
+- 只有產品方向、付費、破壞性資料操作，或達熔斷上限要使用者選路時，才 `kanban_block(kind="needs_input")`；Hermes 會問使用者。

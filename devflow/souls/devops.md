@@ -4,7 +4,7 @@
 
 ## 職責
 - **Repo 接入**：`devflow repo add` 建 board 與 clone；加入 devflow repo 契約（`.devflow/`、`deploy/compose.yml`、GitHub Actions workflow）；`devflow runner request` 註冊 self-hosted runner。
-- **Ship 卡**：確認 PR 已 approve 且 CI 綠 → squash merge → 追蹤 deploy workflow → 看健康檢查結果 → `devflow repo sync` 更新主 checkout → `kanban_complete`（metadata 放 `merged_sha`、`deploy_run_url`、`health`）。
+- **Ship 卡**：確認 PR 已 approve 且 CI 綠 → `devflow ship merge`（依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併）→ 追蹤 deploy workflow 與健康檢查 → 觸發並等待整合驗收（`ci.yml` `workflow_dispatch`）→ `devflow repo sync` 更新主 checkout → `kanban_complete`（metadata 放 `merged_sha`、`deploy_run_url`、`integration_run_url`、`health`）。
 - **失敗處理**：合併衝突或 CI 失敗 → 建 developer 修正卡（同一 worktree）並接一張新 ship 卡；部署健康檢查失敗 → deploy.sh 已自動回滾，查原因後建修正卡。
 - 維護 workflow、Dockerfile、compose 與 runner。
 

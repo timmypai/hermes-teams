@@ -11,18 +11,23 @@ metadata:
 
 # devflow-review｜審查卡
 
-這張卡在 review 欄，cwd 是 developer 的 worktree。你用 reviewer 自己的 GitHub 帳號（與 PR 作者不同）。本 skill 優先於 `sdlc-review` 的通用流程。
+你用 reviewer 自己的 GitHub 帳號（與 PR 作者不同）獨立審查 PR。本 skill 優先於 `sdlc-review` 的通用流程。
+
+先判別審查模式（不混用、不硬湊歷史卡）：
+- **模式 A｜Kanban EPIC PR**（被 dispatcher 派到 review 欄，卡片 body 有 `EPIC: t_xxxx`）：走 §1–§3，跑 `devflow check acceptance <slug> <EPIC> --pr <pr> --review` 與 `devflow check pr`。
+- **模式 B｜直接操作者 PR（Direct Operator PR）**（沒有所屬 Kanban EPIC 卡，由人或獨立審查流程指派）：**嚴禁自行套用看板上其他無關的歷史 EPIC 卡號**；略過 Kanban 卡片與 `check acceptance`，直接以 PR 說明目標、repo 契約／policy、exact-head GitHub Actions CI、本機針對性快測與獨立探測審查，最後提交 exact-head GitHub review。
+- **模式 C｜Kit PR**（devflow 本身的 repo）：走 §4。
 
 ## 1. 讀
-- `kanban_show`：驗收條件、developer 的 handoff（`pr_url`、`head_sha`、`tests`）、之前的退件理由（是否都處理了）。
+- 模式 A：`kanban_show` 讀驗收條件、範圍邊界（`Allowed-Scope`/`Out-of-Scope`）、developer handoff（`pr_url`、`head_sha`、`tests`）與之前退件理由。
 - `gh pr view <pr> --json headRefOid,state,mergeable,statusCheckRollup,files` 確認 `headRefOid` == `head_sha`；不一致就以 PR 最新 head 為準。
-- `gh pr diff <pr>`；`git rev-parse HEAD` 應等於 `headRefOid`（developer 從這個 worktree push）。不要 checkout/commit/reset：退件後 developer 會回到同一個 worktree 繼續。測試產生的暫存檔跑完用 `git status` 確認並清掉。
+- `gh pr diff <pr>`；worktree 中 `git rev-parse HEAD` 應等於 `headRefOid`。不要 checkout/commit/reset；測試暫存檔跑完清乾淨。
 
-## 2. 驗
-- 跑 `.devflow/test.sh`（或 repo 慣用測試）。
-- 獨立探測（不提交）：依卡片覆蓋的 AC（原文在 EPIC：`kanban_show(<EPIC>)`）、不看 diff 決定要測什麼，自己寫一次性腳本或指令驗證關鍵行為與邊界；放在 worktree 外（`/tmp/review-<task>`），跑完刪掉，`git status` 必須乾淨。結果寫進結論 metadata 的 `probes`。
-- 看 CI 結果；`ci.yml`（`devflow-ci`）紅燈 = 退件（除非 handoff 已說明是 runner 問題且你確認與程式碼無關）。`quality.yml` 失敗或數字差不算 CI 紅燈。
-- 情境與證據：`devflow check acceptance <slug> <EPIC> --pr <pr> --review --json`（EPIC 在卡片 body 的 `EPIC:`）。它向 GitHub 找這個 PR head 的 `ci.yml` run（最新 attempt），核對 `acceptance.json` 身分、`Covers:` 每個情境在 head 通過、步驟文字和 EPIC 一致、base 判定為紅燈（或帶豁免）。非 0 結束 = 退件，`reasons` 照抄進退件理由。
+## 2. 驗（分層測試，避免容器重型測試超時）
+- **本機針對性測試**：優先執行 `.devflow/config.env` 定義的 `DEVFLOW_REVIEW_TEST_CMD`；若未定義，依變更模組跑針對性單元測試（不在缺少完整瀏覽器／系統依賴的容器內硬跑重型全量 `.devflow/test.sh` 等到超時）。完整矩陣以 exact-head GitHub Actions CI（`devflow-ci` 或 repo 既有 CI）結果與 run artifacts 為準。
+- 獨立探測（不提交）：依 AC 或 PR 目標、不看 diff 決定要測什麼，寫一次性腳本驗證關鍵行為與邊界；放 worktree 外（`/tmp/review-<task>`），跑完刪掉，`git status` 必須乾淨。結果寫進 `probes`。
+- 看 CI 結果；exact-head CI 紅燈 = 退件（除非 handoff 已說明且你確認為非程式碼的 runner 問題）。`quality.yml` 失敗或數字差不算 CI 紅燈。
+- **情境與證據（僅模式 A）**：`devflow check acceptance <slug> <EPIC> --pr <pr> --review --json`（只用本卡明確標註的 `EPIC:`，不猜測其他卡）。非 0 結束 = 退件，`reasons` 照抄進退件理由。
 - 再自己看證據：`gh run download <CI run> -D /tmp/review-<task>/evidence`，讀 `acceptance-matrix.md`，對每個情境：
   - 開 `sources/` 裡的情境程式，確認 Then 的斷言真的檢查 AC 要的結果（具體值、筆數、訊息），不是只檢查「頁面打開」「回 200」；Given 結尾有斷言前置狀態。
   - `ui` 情境用 vision 看 `shots/` 截圖，確認畫面真的顯示 AC 要的結果。
@@ -34,13 +39,14 @@ metadata:
   4. 回歸與影響範圍（`pstack:blast-radius`）；測試是否測行為而非實作。
   5. `ub-mode`（developer 在 Codex 用的同一份規則）的 Make it Right：根因修正而非遮蔽、測試測行為（「每個函式回傳空值測試還會過嗎？」）、重複與死碼。這些由你讀程式判斷。CI `quality` artifact（`devflow-quality-<sha>`：`crap.txt` / `dry.txt` / `mutate.txt`）目前**只供參考、不卡**：不因 CRAP、重複分數或存活 mutant 退件；值得處理的寫進結論 metadata 的 `followups`（或 approve 留言），由 orchestrator 決定是否另開卡。
   6. 規則與教訓（`check` job 已驗證格式、自測、ref 存在，並在 PR 上證明新教訓抓得到修正前的程式；你判斷內容）：新增或修改的規則，它的 `expect = "fail"` 範例要真的代表這次的錯誤；PR 刪除或放寬既有規則、`baseline.json` 增加條目、新增 `devflow: allow` 豁免，卡片沒有明確授權就退件，寫明要還原哪一處。PR 說明的 `No-lesson:`／`No-proof:` 理由不成立（同類錯誤顯然會再犯、錯誤其實就在這個 PR 修）→ 退件；修 bug 卻不用 `fix:` 標題來避開 lesson gate → 退件。
-  7. 自動判斷：`devflow check pr <slug> <pr>`（在 Hermes 主機跑，PR 改不到；結果依 head + 標題 + 說明快取，並寫入 `devflow-judgment` 檢查）。`findings` 列出 PR 改到的 gate 檔案（`check.py`、`check.sh`、`test.sh`、`rules/`、`.github/workflows/`、部署機制 `deploy.sh`/`capture.sh`/`redact.py`/`up.sh`/`playwright.sh`/`acceptance.py`/`verify-base.sh`、刪除教訓）與 Decisions 標出的疑慮（`unlabeled_fix` 修 bug 沒標 `fix:`、`weak_exemption` `No-lesson`/`No-proof`/`Already-met`/`Base-unverifiable` 理由不成立、`lesson_mismatch` 教訓沒對準這次的錯、`replaces_standard` 部署機制被換成專案自寫流程或錯誤輸出進不了 log）。每一項在結論裡寫成立或不成立與理由；成立就退件。結束碼：
+  7. 自動判斷：`devflow check pr <slug> <pr>`（在 Hermes 主機跑，PR 改不到；結果依 head + 標題 + 說明快取，並寫入 `devflow-judgment` 檢查）。`findings` 列出 PR 改到的保護／gate 檔案（含 `needs_human_approval` 標記）、違反卡片 `Allowed-Scope`/`Out-of-Scope` 或變更檔數上限的範圍違規，與 Decisions 標出的疑慮（`unlabeled_fix`、`weak_exemption`、`lesson_mismatch`、`replaces_standard`、`out_of_scope_diff`）。每一項在結論裡寫成立或不成立與理由；成立就退件。結束碼：
      - `0`：沒有疑慮或 advisor 已回 `ok`，`devflow-judgment` 已是 success。
-     - `3`：有疑慮，等 `[ADV]` advisor（Decisions API 無法判斷時也是：疑慮寫「請 advisor 代為回答」，advisor 代替 Decisions 判斷）。你自己判斷有成立的疑慮 → 直接退件；否則做完其他檢查後**再跑一次** `devflow check pr`（結果有快取，不會重新判斷），依這次的輸出處理（advisor 可能已在你檢查期間完成：`0` 就照通過）。`wait`：
-       - `dependency`：`kanban_link(parent_id="<輸出的 advisor>", child_id="<本卡>")`，再 `kanban_block(kind="dependency", reason="devflow check pr：等 advisor 判斷 PR #N")`。Hermes 把本卡放回 todo，advisor 完成後自動回到 review；重跑時從這一步開始。不要用沒有 kind 的 block：同一張卡連續兩次會被送去 triage。
-       - `retry`：tick 還沒建 `[ADV]`。`kanban_heartbeat`，等 1 分鐘重跑，最多 10 次；仍是 `retry` 才 `kanban_block(kind="needs_input", reason=...)`。
+     - `3`：有疑慮，等 `[ADV]` advisor。你自己判斷有成立的疑慮 → 直接退件；否則做完其他檢查後**再跑一次** `devflow check pr`，依輸出處理。`wait`：
+       - `dependency`：`kanban_link(parent_id="<輸出的 advisor>", child_id="<本卡>")`，再 `kanban_block(kind="dependency", reason="devflow check pr：等 advisor 判斷 PR #N")`。
+       - `retry`：tick 還沒建 `[ADV]`。`kanban_heartbeat`，依 `roles.json` `policy.advisor_retry_seconds`/`advisor_max_retries`（預設每 30 秒、最多 6 次）重跑；仍是 `retry` 才 `kanban_block(kind="needs_input", reason=...)`。
      - `4`：advisor 回 `revise` → 退件，理由引用 advisor 的意見。
      - `1`：PR 在判斷期間被修改 → 直接重跑。
+  - 若輸出 `review_loop.tripped` 為 `true`（退件輪數已達 `max_review_rounds` 上限）：在退件理由標註「已達 review 往復熔斷上限，請 orchestrator／architect 先重檢根因或向使用者定錨」，不再做無止盡修修補補。
 - 不為風格偏好退件。
 
 ## 3. 結論
@@ -62,7 +68,7 @@ gh pr review <pr> --request-changes --body "<同下列清單>"
 ```
 kanban_request_changes(reason="1. <檔案:行> <問題> → <要怎麼改>\n2. ...")
 ```
-退件理由要具體到 developer 不用再問就能改。沒有次數上限；同一問題第二次退件時，說明為什麼前一次修正沒解決，並給更直接的做法。
+退件理由要具體到 developer 不用再問就能改。遵守 review 往復熔斷（預設 2 輪，`roles.json` `policy.max_review_rounds`）：第二次退件時必須說明為何前一次修正未解根因，並提醒 orchestrator／architect 介入或交使用者定錨，不要進入無止盡往復。
 
 ## 4. kit PR（devflow 本身的 repo，沒有卡片）
 由 `review-kit-pr.sh` 在 Hermes chat 叫你，prompt 給 repo、PR 號與暫存目錄。沒有卡片，不用 `kanban_*`；第 1、2 節的卡片、EPIC、`check acceptance`、`check pr` 不適用。
