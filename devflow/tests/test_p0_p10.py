@@ -402,6 +402,40 @@ class PreflightCli(unittest.TestCase):
         self.assertNotEqual(pc["base_sha256"], pc["head_sha256"])
         self.assertTrue(pc["hash_changed"])
 
+    def test_preflight_parses_non_ascii_and_tab_newline_paths_without_git_c_quoting(self) -> None:
+        (self.repo / "ops").mkdir(exist_ok=True)
+        unicode_rel = "ops/憑證.der"
+        ctrl_rel = "ops/tab\tline\n.der"
+        raw_u = b"\xff\x00unicode-cert"
+        raw_c = b"\xff\x01ctrl-cert"
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        (self.repo / unicode_rel).write_bytes(raw_u)
+        (self.repo / ctrl_rel).write_bytes(raw_c)
+        subprocess.run(["git", "add", "--", unicode_rel, ctrl_rel], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add non-ascii and control-char paths"], cwd=self.repo, check=True)
+
+        rep = self.df.preflight_lib.run_preflight(
+            self.repo,
+            policy=self.df.POLICY,
+            base_ref=base,
+            card_body="Out-of-Scope: ops/**",
+            run_tests=False,
+        )
+        self.assertFalse(rep["ok"], rep)
+        self.assertEqual(rep["checks"]["scope"], "fail")
+        self.assertTrue(rep["needs_human_approval"])
+        self.assertIn(unicode_rel, rep["files"])
+        self.assertIn(ctrl_rel, rep["files"])
+        by_name = {pc["filename"]: pc for pc in rep["protected_changes"]}
+        self.assertIn(unicode_rel, by_name)
+        self.assertIn(ctrl_rel, by_name)
+        self.assertEqual(by_name[unicode_rel]["head_sha256"], self.df.trust_lib.sha256_text(raw_u))
+        self.assertEqual(by_name[ctrl_rel]["head_sha256"], self.df.trust_lib.sha256_text(raw_c))
+        self.assertTrue(any("Out-of-Scope" in f and unicode_rel in f for f in rep["findings"]), rep["findings"])
+        self.assertTrue(any("Out-of-Scope" in f and ctrl_rel in f for f in rep["findings"]), rep["findings"])
+
 
 class ReviewFindingsRegression(unittest.TestCase):
     """Regression tests reproducing all 3 blocking findings from PR #33 review."""

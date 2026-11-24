@@ -65,12 +65,12 @@ def match_glob(path: str, pattern: str) -> bool:
 
 
 def touched_paths(files: list[dict]) -> list[str]:
-    """Return every repo-relative path touched by `files`, preserving both `filename` and `previous_filename`."""
+    """Return every repo-relative path touched by `files`, preserving exact `filename` and `previous_filename`."""
     paths: list[str] = []
     for f in files:
-        if prev := (f.get("previous_filename") or "").strip():
+        if prev := f.get("previous_filename"):
             paths.append(prev)
-        if name := (f.get("filename") or "").strip():
+        if name := f.get("filename"):
             paths.append(name)
     return sorted(set(paths))
 

@@ -57,7 +57,7 @@ def protected_file_changes(
     out: list[dict] = []
     for f in sorted(files, key=lambda x: (x.get("previous_filename") or "", x["filename"])):
         name = f["filename"]
-        prev = (f.get("previous_filename") or "").strip() or None
+        prev = f.get("previous_filename") or None
         name_protected = is_protected_file(name, extra_patterns)
         prev_protected = bool(prev and is_protected_file(prev, extra_patterns))
         if not (name_protected or prev_protected):

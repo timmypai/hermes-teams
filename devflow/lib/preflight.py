@@ -1,6 +1,7 @@
 """Developer preflight CLI gate (`devflow preflight`): deterministic local checks before PR/review."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -20,9 +21,68 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo_dir), *args], text=True, capture_output=True)
 
 
+def _git_bytes(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True)
+
+
+def _parse_status_porcelain_z(raw: bytes) -> list[str]:
+    """Parse `git status --porcelain -z` records without C-quoting or line splitting."""
+    if not raw:
+        return []
+    tokens = raw.split(b"\x00")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+    entries: list[str] = []
+    i = 0
+    while i < len(tokens):
+        rec = os.fsdecode(tokens[i])
+        if rec:
+            entries.append(rec)
+            # In porcelain v1 -z, renames/copies (XY has R or C) emit an extra orig_path token.
+            if len(rec) >= 2 and ("R" in rec[:2] or "C" in rec[:2]):
+                i += 2
+                continue
+        i += 1
+    return entries
+
+
+def _parse_name_status_z(raw: bytes) -> list[dict]:
+    """Parse `git diff --name-status -z` NUL-delimited records, preserving exact paths (Unicode/tabs/newlines)."""
+    if not raw:
+        return []
+    tokens = raw.split(b"\x00")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+    status_map = {"A": "added", "M": "modified", "D": "removed", "R": "renamed", "C": "copied"}
+    files: list[dict] = []
+    i = 0
+    while i < len(tokens):
+        code = os.fsdecode(tokens[i])
+        if not code:
+            i += 1
+            continue
+        st = code[0]
+        if st in ("R", "C") and i + 2 < len(tokens):
+            files.append({
+                "previous_filename": os.fsdecode(tokens[i + 1]),
+                "filename": os.fsdecode(tokens[i + 2]),
+                "status": status_map[st],
+            })
+            i += 3
+        elif i + 1 < len(tokens):
+            files.append({
+                "filename": os.fsdecode(tokens[i + 1]),
+                "status": status_map.get(st, "modified"),
+            })
+            i += 2
+        else:
+            break
+    return files
+
+
 def _git_blob_hash(repo_dir: Path, rev: str, path: str) -> str | None:
     """Hash raw git blob bytes at `rev:path` without text decoding or newline normalization."""
-    p = subprocess.run(["git", "-C", str(repo_dir), "show", f"{rev}:{path}"], capture_output=True)
+    p = _git_bytes(repo_dir, "show", f"{rev}:{path}")
     return sha256_text(p.stdout) if p.returncode == 0 else None
 
 
@@ -62,38 +122,27 @@ def run_preflight(
             "protected_changes": [],
         }
 
-    # 1. Clean worktree check
-    status_p = _git(repo_dir, "status", "--porcelain")
-    dirty_lines = [ln for ln in status_p.stdout.splitlines() if ln.strip()]
-    if dirty_lines and not allow_dirty:
+    # 1. Clean worktree check (NUL-delimited, handles non-ASCII and control characters)
+    status_p = _git_bytes(repo_dir, "status", "--porcelain", "-z")
+    dirty_entries = _parse_status_porcelain_z(status_p.stdout) if status_p.returncode == 0 else []
+    if dirty_entries and not allow_dirty:
         checks["clean_worktree"] = "fail"
-        findings.append(f"worktree 有 {len(dirty_lines)} 個未提交變更，請先 commit 或清除暫存檔再送審")
+        findings.append(f"worktree 有 {len(dirty_entries)} 個未提交變更，請先 commit 或清除暫存檔再送審")
     else:
         checks["clean_worktree"] = "ok"
 
-    # 2. Resolve changed files relative to base_ref (preserving rename/copy source paths)
-    diff_p = _git(repo_dir, "diff", "--name-status", f"{base_ref}...HEAD")
+    # 2. Resolve changed files relative to base_ref using -z (no C-quoting; preserves exact paths & renames)
+    diff_p = _git_bytes(repo_dir, "diff", "--name-status", "-z", f"{base_ref}...HEAD")
     if diff_p.returncode != 0:
-        diff_p = _git(repo_dir, "diff", "--name-status", base_ref, "HEAD")
+        diff_p = _git_bytes(repo_dir, "diff", "--name-status", "-z", base_ref, "HEAD")
     files: list[dict] = []
     if diff_p.returncode == 0:
-        for ln in diff_p.stdout.splitlines():
-            parts = ln.split("\t")
-            if len(parts) >= 2:
-                st = parts[0][0]
-                status_map = {"A": "added", "M": "modified", "D": "removed", "R": "renamed", "C": "copied"}
-                if st in ("R", "C") and len(parts) >= 3:
-                    files.append({
-                        "filename": parts[2].strip(),
-                        "previous_filename": parts[1].strip(),
-                        "status": status_map[st],
-                    })
-                else:
-                    files.append({"filename": parts[-1].strip(), "status": status_map.get(st, "modified")})
+        files = _parse_name_status_z(diff_p.stdout)
         checks["git_diff"] = "ok"
     else:
         checks["git_diff"] = "fail"
-        findings.append(f"無法比對 base ref {base_ref!r}：{(diff_p.stderr or diff_p.stdout).strip()[-200:]}")
+        err = (diff_p.stderr or diff_p.stdout).decode("utf-8", errors="replace").strip()[-200:]
+        findings.append(f"無法比對 base ref {base_ref!r}：{err}")
 
     # 3. Scope contract + diff file count cap (checks BOTH rename source and destination paths)
     repo_cfg = load_repo_config(repo_dir)
