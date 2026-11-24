@@ -8,7 +8,7 @@ from typing import Any
 
 from .policy import load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
 from .scope import check_files_against_scope, parse_card_contract, touched_paths
-from .trust import protected_file_changes, sha256_text
+from .trust import is_protected_file, protected_file_changes, sha256_text
 
 FIX_TITLE_RE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)
 LESSON_LINE_RE = re.compile(r"^\s*(Lesson:\s*L-\d+|No-lesson:\s*\S.{9,})", re.M)
@@ -21,7 +21,8 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _git_blob_hash(repo_dir: Path, rev: str, path: str) -> str | None:
-    p = _git(repo_dir, "show", f"{rev}:{path}")
+    """Hash raw git blob bytes at `rev:path` without text decoding or newline normalization."""
+    p = subprocess.run(["git", "-C", str(repo_dir), "show", f"{rev}:{path}"], capture_output=True)
     return sha256_text(p.stdout) if p.returncode == 0 else None
 
 
@@ -109,14 +110,16 @@ def run_preflight(
     findings.extend(scope_findings)
     checks["scope"] = "fail" if scope_findings else "ok"
 
-    # 4. Protected / trusted harness hash lock (old blob at previous_filename/filename vs new blob at filename)
+    # 4. Protected / trusted harness hash lock (raw bytes, only for protected paths)
     extra_protected = repo_protected_paths(repo_cfg)
-    base_hashes = {}
-    head_hashes = {}
+    base_hashes: dict[str, str | None] = {}
+    head_hashes: dict[str, str | None] = {}
     for f in files:
         old_path = f.get("previous_filename") or f["filename"]
-        base_hashes[old_path] = _git_blob_hash(repo_dir, base_ref, old_path)
-        head_hashes[f["filename"]] = _file_hash(repo_dir, f["filename"])
+        new_path = f["filename"]
+        if is_protected_file(old_path, extra_protected) or is_protected_file(new_path, extra_protected):
+            base_hashes[old_path] = _git_blob_hash(repo_dir, base_ref, old_path)
+            head_hashes[new_path] = _file_hash(repo_dir, new_path)
     protected = protected_file_changes(
         files,
         extra_patterns=extra_protected,

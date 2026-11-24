@@ -361,6 +361,47 @@ class PreflightCli(unittest.TestCase):
         self.assertTrue(any("Out-of-Scope" in f and ".devflow/check.py" in f for f in rep["findings"]), rep["findings"])
         self.assertTrue(any("Allowed-Scope" in f and ".devflow/check.py" in f for f in rep["findings"]), rep["findings"])
 
+    def test_preflight_handles_binary_asset_and_protected_binary_exact_bytes_without_decode_error(self) -> None:
+        (self.repo / "assets").mkdir()
+        png1 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x01"
+        png2 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x02"
+        (self.repo / "assets" / "logo.png").write_bytes(png1)
+        (self.repo / "ops").mkdir(exist_ok=True)
+        bin1 = b"\x89BIN\r\n\x00v1"
+        bin2 = b"\x89BIN\n\x00v1"  # differs ONLY by CRLF vs LF
+        (self.repo / "ops" / "cert.der").write_bytes(bin1)
+        subprocess.run(["git", "add", "assets/logo.png", "ops/cert.der"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add binary assets"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+        # 1. Unprotected binary PNG modification must not crash with UnicodeDecodeError
+        (self.repo / "assets" / "logo.png").write_bytes(png2)
+        subprocess.run(["git", "add", "assets/logo.png"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "chore: update logo"], cwd=self.repo, check=True)
+        rep1 = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False,
+        )
+        self.assertTrue(rep1["ok"], rep1)
+        self.assertEqual(rep1["protected_changes"], [])
+
+        # 2. Protected binary modification hashes exact raw bytes (CRLF vs LF produces distinct hashes)
+        (self.repo / "ops" / "cert.der").write_bytes(bin2)
+        subprocess.run(["git", "add", "ops/cert.der"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "chore: update protected binary"], cwd=self.repo, check=True)
+        rep2 = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False,
+        )
+        self.assertTrue(rep2["ok"], rep2)
+        self.assertTrue(rep2["needs_human_approval"])
+        pc = rep2["protected_changes"][0]
+        self.assertEqual(pc["filename"], "ops/cert.der")
+        self.assertEqual(pc["base_sha256"], self.df.trust_lib.sha256_text(bin1))
+        self.assertEqual(pc["head_sha256"], self.df.trust_lib.sha256_text(bin2))
+        self.assertNotEqual(pc["base_sha256"], pc["head_sha256"])
+        self.assertTrue(pc["hash_changed"])
+
 
 class ReviewFindingsRegression(unittest.TestCase):
     """Regression tests reproducing all 3 blocking findings from PR #33 review."""
@@ -508,6 +549,42 @@ class ReviewFindingsRegression(unittest.TestCase):
         rec4 = self.df.judgment("b", REPO, 7)
         self.assertNotEqual(rec4["fingerprint"], rec3["fingerprint"])
         self.assertTrue(any("超過上限 1 檔" in f for f in rec4["scope_findings"]), rec4)
+
+    def test_completed_dev_owner_is_not_shadowed_by_active_ship_or_adv_and_ambiguous_dev_fails_closed(self) -> None:
+        epic_body = "## 目標\n安全改動\n## 驗收\n- AC-1 [cli] ok\n"
+        dev_body = "## 目標\n只改 app\n## 驗收\n覆蓋：AC-1\nOut-of-Scope: secret/**\nEPIC: t_ep01\n"
+        pr_url = f"https://github.com/{REPO}/pull/7"
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_ep01", "[EPIC] s", epic_body, "todo", None, None))
+            # Completed DEV owner with Out-of-Scope restriction
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_dev1", "[DEV] d1", dev_body, "done", pr_url, "wt/t_dev1"))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_dev1", "done", json.dumps({"published_pr": pr_url})))
+            # Active downstream SHIP and ADV cards referencing the exact same PR URL
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_ship1", "[SHIP] s1", "EPIC: t_ep01\n", "running", None, None))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_ship1", "running", json.dumps({"pr_url": pr_url})))
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_adv1", "[ADV] PR 判斷", f"PR: {pr_url}\n", "ready", None, None))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_adv1", "running", json.dumps({"pr_url": pr_url})))
+
+        ctx = self.df.pr_goal_context("b", REPO, 7, self.f.pr)
+        self.assertIsNotNone(ctx)
+        self.assertEqual(ctx["card_id"], "t_dev1")
+        self.assertEqual(ctx["out_of_scope"], ["secret/**"])
+        self.f.files = [{"filename": "secret/key.py", "status": "modified", "patch": "+k=1"}]
+        rec = self.df.judgment("b", REPO, 7)
+        self.assertTrue(any("Out-of-Scope" in f and "secret/key.py" in f for f in rec["scope_findings"]), rec)
+
+        # Adding a second non-archived DEV card bound to the same PR must fail closed on ambiguous ownership
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_dev2", "[DEV] d2", "EPIC: t_ep01\n", "review", REPO, "wt/t_dev2"))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_dev2", "done", json.dumps({"published_pr": pr_url})))
+        ctx_amb = self.df.pr_goal_context("b", REPO, 7, self.f.pr)
+        self.assertEqual(ctx_amb.get("ambiguous_owners"), ["t_dev1", "t_dev2"])
+        rec_amb = self.df.judgment("b", REPO, 7)
+        self.assertTrue(any("同時對應多張未封存開發卡" in f for f in rec_amb["scope_findings"]), rec_amb)
 
 
 if __name__ == "__main__":
