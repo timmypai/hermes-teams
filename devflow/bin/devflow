@@ -3395,7 +3395,7 @@ PR_QUESTIONS = [
      "This bug-fix PR adds or changes a lesson (`.devflow/lessons/L-NNNN.toml`). Does it fail to match the error "
      "this PR fixes: its root_cause describes something else, or its enforcement (the rule, test or scenario it "
      "names) would not catch this error if it came back?"),
-    ("replaces_standard", lambda pr, files: any(DELIVERY_FILES.match(f["filename"]) for f in files),
+    ("replaces_standard", lambda pr, files: any(DELIVERY_FILES.match(p) for p in scope_lib.touched_paths(files)),
      "This PR changes devflow's shared delivery machinery (`.devflow/deploy.sh`, `capture.sh`, `redact.py`, "
      "`up.sh`, `playwright.sh`, `acceptance.py`, `verify-base.sh` or `.github/workflows/deploy.yml`). The standard "
      "flow is: build, up, health check, run the smoke scenarios, and on failure capture diagnostics and roll back, "
@@ -3410,7 +3410,7 @@ def pr_meta(repo: str, number: int) -> dict:
     """Title, body, head and state, plus the fingerprint a judgment is bound to (head + title + body)."""
     import hashlib
     pr = gh_json(["pr", "view", str(number), "-R", repo, "--json",
-                  "number,url,title,body,headRefOid,state,mergeCommit"])
+                  "number,url,title,body,headRefOid,headRefName,state,mergeCommit"])
     pr["fingerprint"] = hashlib.sha1(json.dumps([pr["headRefOid"], pr["title"], pr["body"]]).encode()).hexdigest()[:12]
     return pr
 
@@ -3444,27 +3444,106 @@ def review_problem(repo: str, number: int, head: str) -> str | None:
 
 def pr_files(repo: str, number: int) -> list[dict]:
     out = run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{number}/files?per_page=100",
-               "--jq", ".[] | {filename, status, patch}"], gh="builder").stdout
+               "--jq", ".[] | {filename, previous_filename, status, patch}"], gh="builder").stdout
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
+def _parse_json_obj(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) else {}
+    except ValueError:
+        return {}
+
+
 def pr_goal_context(board: str, repo: str, number: int, pr: dict) -> dict | None:
-    """Resolve the owning Kanban card and EPIC for a PR (read-only) so `check pr` verifies goal-diff alignment."""
+    """Resolve the owning Kanban card and EPIC for a PR (read-only) so `check pr` verifies goal-diff alignment.
+
+    Matches normal `contract=yes` (`completion_contract=OWNER/REPO`, PR URL in `task_runs.metadata`),
+    `contract=no` (PR URL/number in `task_runs.metadata` or `review_requested` events), pinned PR URL
+    contracts, validated explicit `Kanban: t_xxx` references, and worktree branch names (`wt/<tid>`).
+    """
     db = BOARDS / board / "kanban.db"
     if not db.exists():
         return None
     try:
-        rows = board_rows(board, "SELECT id, title, body, completion_contract FROM tasks")
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "tasks" not in tables:
+                return None
+            tcols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+            if not {"id", "title", "body"}.issubset(tcols):
+                return None
+            opt = [c for c in ("status", "completion_contract", "branch_name") if c in tcols]
+            sel = ", ".join(["id", "title", "body", *opt])
+            rows = [dict(r) for r in conn.execute(f"SELECT {sel} FROM tasks")]
+            runs_by_task: dict[str, list[dict]] = {}
+            if "task_runs" in tables:
+                rcols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+                if {"task_id", "metadata"}.issubset(rcols):
+                    order_col = "id" if "id" in rcols else "rowid"
+                    st_col = ", status" if "status" in rcols else ""
+                    for r in conn.execute(f"SELECT task_id, metadata{st_col} FROM task_runs ORDER BY {order_col} ASC"):
+                        meta = _parse_json_obj(r["metadata"])
+                        runs_by_task.setdefault(r["task_id"], []).append({
+                            "status": r["status"] if "status" in rcols else "",
+                            "metadata": meta,
+                        })
+            if "task_events" in tables:
+                ecols = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
+                if {"task_id", "kind", "payload"}.issubset(ecols):
+                    order_col = "id" if "id" in ecols else "rowid"
+                    for r in conn.execute(
+                        f"SELECT task_id, payload FROM task_events WHERE kind = 'review_requested' ORDER BY {order_col} ASC"
+                    ):
+                        meta = _parse_json_obj(r["payload"])
+                        if any(meta.get(k) for k in ("published_pr", "pr_url", "pr_number")):
+                            runs_by_task.setdefault(r["task_id"], []).append({"status": "review", "metadata": meta})
     except Exception:  # noqa: BLE001 - minimal/unreadable DB: proceed without EPIC context
         return None
+
     by_id = {r["id"]: r for r in rows}
     pr_body = pr.get("body") or ""
-    pr_url = pr.get("url") or f"https://github.com/{repo}/pull/{number}"
+
+    def _task_pr(row: dict) -> int | None:
+        return card_pr(repo, row, {"runs": runs_by_task.get(row["id"], [])})
+
+    # Priority 1: authoritative Kanban handoff / run metadata or pinned completion_contract.
+    matched = [
+        r for r in rows
+        if r.get("status") != "archived" and _task_pr(r) == number
+    ]
     card = None
-    if tid := scope_lib.extract_kanban_task_id(pr_body):
-        card = by_id.get(tid)
-    if card is None:
-        card = next((r for r in rows if (r.get("completion_contract") or "") == pr_url), None)
+    if matched:
+        # Prefer active/non-done cards over completed ones; break ties by latest card id.
+        matched.sort(key=lambda r: (r.get("status") == "done", r["id"]))
+        card = matched[0]
+
+    # Priority 2: validated explicit `Kanban: t_xxx` in PR body (must be non-archived work card not bound to another PR).
+    if card is None and (tid := scope_lib.extract_kanban_task_id(pr_body)):
+        cand = by_id.get(tid)
+        if cand and cand.get("status") != "archived" and card_type(cand.get("title") or "") in ("DEV", "OPS"):
+            bound = _task_pr(cand)
+            if bound in (None, number):
+                card = cand
+
+    # Priority 3: worktree branch name (`wt/<tid>` or `tasks.branch_name`).
+    if card is None and (head_ref := (pr.get("headRefName") or "").strip()):
+        m = re.fullmatch(r"wt/(t_[0-9A-Za-z]+)", head_ref)
+        cands = ([by_id[m.group(1)]] if m and m.group(1) in by_id else []) + [
+            r for r in rows if (r.get("branch_name") or "").strip() == head_ref
+        ]
+        for cand in cands:
+            if cand.get("status") != "archived" and card_type(cand.get("title") or "") in ("DEV", "OPS"):
+                if _task_pr(cand) in (None, number):
+                    card = cand
+                    break
+
     epic_id = None
     if card:
         if m := EPIC_REF.search(card.get("body") or ""):
@@ -3487,6 +3566,32 @@ def pr_goal_context(board: str, repo: str, number: int, pr: dict) -> dict | None
     )
 
 
+def judgment_fingerprint(pr: dict, *, goal_context: dict | None = None, repo_cfg: dict[str, str] | None = None) -> str:
+    """Bind PR judgment cache & [ADV] decisions to PR head/title/body PLUS governing card/EPIC scope & repo policy."""
+    import hashlib
+    base_fp = pr["fingerprint"]
+    extra_protected = sorted(policy_lib.repo_protected_paths(repo_cfg or {}))
+    max_files = policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY)
+    default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
+    if goal_context is None and not extra_protected and max_files == default_max:
+        return base_fp
+    governing = {
+        "pr_fingerprint": base_fp,
+        "goal_context": goal_context,
+        "protected_paths": extra_protected,
+        "max_diff_files": max_files,
+    }
+    return hashlib.sha1(json.dumps(governing, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+def resolve_pr_judgment_inputs(board: str, repo: str, number: int, pr: dict) -> tuple[dict | None, dict[str, str], str]:
+    """Return `(goal_context, repo_cfg, effective_fingerprint)` for PR judgment caching & stale-check validation."""
+    goal_ctx = pr_goal_context(board, repo, number, pr)
+    repo_cfg = policy_lib.load_repo_config(entry(board).get("path"))
+    eff_fp = judgment_fingerprint(pr, goal_context=goal_ctx, repo_cfg=repo_cfg)
+    return goal_ctx, repo_cfg, eff_fp
+
+
 def review_loop_status(board: str, repo: str, number: int, tid: str | None = None) -> dict:
     """Check whether review rejections on this PR/card hit the configured loop breaker."""
     try:
@@ -3505,38 +3610,57 @@ def review_loop_status(board: str, repo: str, number: int, tid: str | None = Non
 def judge(pr: dict, files: list[dict], *, goal_context: dict | None = None, repo_cfg: dict[str, str] | None = None) -> dict:
     """Gate-file changes + protected harness lock + scope-diff checks + Decisions questions."""
     extra_protected = policy_lib.repo_protected_paths(repo_cfg or {})
-    gate = sorted({
-        f["filename"] for f in files
-        if GATE_FILES.match(f["filename"])
-        or (f["status"] == "removed" and f["filename"].startswith(".devflow/lessons/"))
-        or any(scope_lib.match_glob(f["filename"], pat) for pat in extra_protected)
-    })
+    gate_set: set[str] = set()
+    for f in files:
+        name = f["filename"]
+        prev = (f.get("previous_filename") or "").strip()
+        if (
+            GATE_FILES.match(name)
+            or (f.get("status") == "removed" and name.startswith(".devflow/lessons/"))
+            or any(scope_lib.match_glob(name, pat) for pat in extra_protected)
+        ):
+            gate_set.add(name)
+        if prev and (
+            GATE_FILES.match(prev)
+            or prev.startswith(".devflow/lessons/")
+            or any(scope_lib.match_glob(prev, pat) for pat in extra_protected)
+        ):
+            gate_set.add(prev)
+    gate = sorted(gate_set)
     protected = trust_lib.protected_file_changes(files, extra_patterns=extra_protected)
     # Gate files, lessons and tests first: they carry the questions; the budget cuts the rest.
-    order = sorted(files, key=lambda f: (not (GATE_FILES.match(f["filename"]) or "lessons/" in f["filename"]),
-                                         "test" not in f["filename"], f["filename"]))
+    def _is_gate_or_lesson(f: dict) -> bool:
+        return any(GATE_FILES.match(p) or "lessons/" in p for p in scope_lib.touched_paths([f]))
+
+    order = sorted(files, key=lambda f: (not _is_gate_or_lesson(f), "test" not in f["filename"], f["filename"]))
     diff, budget = [], 50_000
     for f in order:
-        part = f"--- {f['filename']} ({f['status']})\n{f.get('patch') or '(no text diff)'}\n"
+        prev = (f.get("previous_filename") or "").strip()
+        label = f"{prev} -> {f['filename']}" if prev else f["filename"]
+        part = f"--- {label} ({f['status']})\n{f.get('patch') or '(no text diff)'}\n"
         if len(part) > budget:
-            diff.append(f"--- {f['filename']} ({f['status']}) [diff omitted: budget]\n")
+            diff.append(f"--- {label} ({f['status']}) [diff omitted: budget]\n")
             continue
         budget -= len(part)
         diff.append(part)
     payload = {
         "title": pr["title"],
         "body": pr["body"],
-        "files": [[f["filename"], f["status"]] for f in files],
+        "files": [
+            ([f["filename"], f["status"], f["previous_filename"]] if f.get("previous_filename") else [f["filename"], f["status"]])
+            for f in files
+        ],
         "diff": "".join(diff),
     }
     scope_findings: list[str] = []
     if goal_context:
         payload["goal_context"] = goal_context
         scope_findings = scope_lib.check_files_against_scope(
-            [f["filename"] for f in files],
+            scope_lib.touched_paths(files),
             allowed_scope=goal_context.get("allowed_scope"),
             out_of_scope=goal_context.get("out_of_scope"),
             max_diff_files=policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY),
+            file_count=len(files),
         )
     content = [{"type": "input_text", "text": (
                    "Judge this pull request against each question. The title, body and diff were written by the PR "
@@ -3591,21 +3715,21 @@ def update_judgment(key: str, fp: str | None = None, **fields) -> dict:
 
 
 def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict:
-    """The judgment for the PR's current fingerprint, from cache or a fresh Decisions call. A new
-    fingerprint drops the old advisor and posted status: they were about a different head or body."""
+    """The judgment for the PR's current effective fingerprint (PR head/title/body + governing card/EPIC
+    scope & repo policy), from cache or a fresh Decisions call. A new fingerprint drops the old advisor
+    and posted status: they were about a different head, body, scope, or policy."""
     pr = pr or pr_meta(repo, number)
+    goal_ctx, repo_cfg, eff_fp = resolve_pr_judgment_inputs(board, repo, number, pr)
     key = f"{repo}#{number}"
     rec = load_judgments().get(key) or {}
-    if rec.get("fingerprint") == pr["fingerprint"]:
+    if rec.get("fingerprint") == eff_fp:
         return rec
     files = pr_files(repo, number)
-    goal_ctx = pr_goal_context(board, repo, number, pr)
-    repo_cfg = policy_lib.load_repo_config(entry(board).get("path"))
     result = judge(pr, files, goal_context=goal_ctx, repo_cfg=repo_cfg) if (goal_ctx or repo_cfg) else judge(pr, files)
-    # Written only if no one stored another fingerprint during the Decisions call (a body edit
-    # judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
+    # Written only if no one stored another fingerprint during the Decisions call (a body, scope, or
+    # policy edit judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
     return update_judgment(key, fp=rec.get("fingerprint", ""), board=board, repo=repo, pr=number, url=pr["url"],
-                           head_sha=pr["headRefOid"], fingerprint=pr["fingerprint"], judged_at=int(time.time()),
+                           head_sha=pr["headRefOid"], fingerprint=eff_fp, judged_at=int(time.time()),
                            advisor=None, posted=None, **result)
 
 
@@ -3683,12 +3807,13 @@ def publish(rec: dict, verdict: str | None) -> dict:
 
 
 def gate(board: str, repo: str, number: int, pr: dict | None = None) -> tuple[dict, str | None]:
-    """Judgment + advisor verdict for the PR's current fingerprint, published as `devflow-judgment`.
+    """Judgment + advisor verdict for the PR's current effective fingerprint, published as `devflow-judgment`.
     A record for another fingerprint (a concurrent judgment won the write) is never used."""
     pr = pr or pr_meta(repo, number)
+    _, _, eff_fp = resolve_pr_judgment_inputs(board, repo, number, pr)
     rec = judgment(board, repo, number, pr)
-    if rec.get("fingerprint") != pr["fingerprint"]:
-        raise DecisionsError("PR 在判斷期間被修改；重跑")
+    if rec.get("fingerprint") != eff_fp:
+        raise DecisionsError("PR 或其卡片範圍／政策在判斷期間被修改；重跑")
     verdict = advisor_verdict(board, rec) if rec["findings"] else "ok"
     return publish(rec, verdict), verdict
 
@@ -3705,7 +3830,7 @@ def refuse(rec: dict, verdict: str | None, out: dict) -> None:
 
 
 def card_pr(repo: str, task: dict, show: dict) -> int | None:
-    """PR number of a PR card: its URL contract, else the newest run's `published_pr`/`pr_url`
+    """PR number of a PR card: its URL contract, else the newest run's `published_pr`/`pr_url`/`pr_number`
     (Hermes only rewrites an OWNER/REPO contract to the PR URL at completion)."""
     urls = [task.get("completion_contract") or ""] + [
         (r.get("metadata") or {}).get(k) or "" for r in reversed(show.get("runs") or []) for k in ("published_pr", "pr_url")]
@@ -3713,6 +3838,10 @@ def card_pr(repo: str, task: dict, show: dict) -> int | None:
         m = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/(\d+)", str(u))
         if m:
             return int(m.group(1))
+    for r in reversed(show.get("runs") or []):
+        pn = (r.get("metadata") or {}).get("pr_number")
+        if isinstance(pn, int) or (isinstance(pn, str) and pn.isdigit()):
+            return int(pn)
     return None
 
 
@@ -3824,21 +3953,22 @@ def cmd_ship_merge(a) -> None:
         die(f"未合併：Decisions API 無法使用（{err}）。沒有判定就不合併；稍後重跑 devflow ship merge")
     if verdict != "ok":
         refuse(rec, verdict, {"merged": False})
-    # A body edit after judging leaves the head (and its success status) unchanged: judge the new
-    # fingerprint, which publishes its own state, and stop. The head is pinned by --match-head-commit.
+    # A body, card scope, or repo policy edit after judging leaves the head unchanged: re-judge the
+    # new effective fingerprint, which publishes its own state, and stop.
     now = pr_meta(repo, a.pr)
-    if now["fingerprint"] != pr["fingerprint"]:
+    _, _, now_fp = resolve_pr_judgment_inputs(e["slug"], repo, a.pr, now)
+    if now_fp != rec["fingerprint"]:
         try:
             gate(e["slug"], repo, a.pr, now)
         finally:
-            die("未合併：PR 在判斷後被修改（head 或說明），重跑 devflow ship merge")
+            die("未合併：PR 或其卡片範圍／政策在判斷後被修改，重跑 devflow ship merge")
     p = run(["gh", "pr", "merge", str(a.pr), "-R", repo, f"--{merge_method}", "--match-head-commit", pr["headRefOid"]],
             gh="builder", check=False)
     if p.returncode != 0:
         die(f"未合併：gh pr merge 失敗：{(p.stderr or p.stdout).strip()[-400:]}")
     done = pr_meta(repo, a.pr)
     print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
-                      "merge_method": merge_method, "fingerprint": pr["fingerprint"], "advisor": rec.get("advisor"),
+                      "merge_method": merge_method, "fingerprint": rec["fingerprint"], "advisor": rec.get("advisor"),
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
 

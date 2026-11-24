@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .policy import load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
-from .scope import check_files_against_scope, parse_card_contract
+from .scope import check_files_against_scope, parse_card_contract, touched_paths
 from .trust import protected_file_changes, sha256_text
 
 FIX_TITLE_RE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)
@@ -70,7 +70,7 @@ def run_preflight(
     else:
         checks["clean_worktree"] = "ok"
 
-    # 2. Resolve changed files relative to base_ref
+    # 2. Resolve changed files relative to base_ref (preserving rename/copy source paths)
     diff_p = _git(repo_dir, "diff", "--name-status", f"{base_ref}...HEAD")
     if diff_p.returncode != 0:
         diff_p = _git(repo_dir, "diff", "--name-status", base_ref, "HEAD")
@@ -80,31 +80,43 @@ def run_preflight(
             parts = ln.split("\t")
             if len(parts) >= 2:
                 st = parts[0][0]
-                fname = parts[-1].strip()
-                status_map = {"A": "added", "M": "modified", "D": "removed", "R": "renamed"}
-                files.append({"filename": fname, "status": status_map.get(st, "modified")})
+                status_map = {"A": "added", "M": "modified", "D": "removed", "R": "renamed", "C": "copied"}
+                if st in ("R", "C") and len(parts) >= 3:
+                    files.append({
+                        "filename": parts[2].strip(),
+                        "previous_filename": parts[1].strip(),
+                        "status": status_map[st],
+                    })
+                else:
+                    files.append({"filename": parts[-1].strip(), "status": status_map.get(st, "modified")})
         checks["git_diff"] = "ok"
     else:
         checks["git_diff"] = "fail"
         findings.append(f"無法比對 base ref {base_ref!r}：{(diff_p.stderr or diff_p.stdout).strip()[-200:]}")
 
-    # 3. Scope contract + diff file count cap
+    # 3. Scope contract + diff file count cap (checks BOTH rename source and destination paths)
     repo_cfg = load_repo_config(repo_dir)
     contract = parse_card_contract(card_body)
     max_files = repo_max_diff_files(repo_cfg, policy)
+    all_touched = touched_paths(files)
     scope_findings = check_files_against_scope(
-        [f["filename"] for f in files],
+        all_touched,
         allowed_scope=contract["allowed_scope"],
         out_of_scope=contract["out_of_scope"],
         max_diff_files=max_files,
+        file_count=len(files),
     )
     findings.extend(scope_findings)
     checks["scope"] = "fail" if scope_findings else "ok"
 
-    # 4. Protected / trusted harness hash lock (base vs HEAD)
+    # 4. Protected / trusted harness hash lock (old blob at previous_filename/filename vs new blob at filename)
     extra_protected = repo_protected_paths(repo_cfg)
-    base_hashes = {f["filename"]: _git_blob_hash(repo_dir, base_ref, f["filename"]) for f in files}
-    head_hashes = {f["filename"]: _file_hash(repo_dir, f["filename"]) for f in files}
+    base_hashes = {}
+    head_hashes = {}
+    for f in files:
+        old_path = f.get("previous_filename") or f["filename"]
+        base_hashes[old_path] = _git_blob_hash(repo_dir, base_ref, old_path)
+        head_hashes[f["filename"]] = _file_hash(repo_dir, f["filename"])
     protected = protected_file_changes(
         files,
         extra_patterns=extra_protected,
@@ -165,6 +177,7 @@ def run_preflight(
         "checks": checks,
         "findings": findings,
         "files": [f["filename"] for f in files],
+        "touched_files": all_touched,
         "file_count": len(files),
         "max_diff_files": max_files,
         "protected_changes": protected,

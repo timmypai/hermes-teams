@@ -53,18 +53,27 @@ def protected_file_changes(
     base_hashes: dict[str, str | None] | None = None,
     head_hashes: dict[str, str | None] | None = None,
 ) -> list[dict]:
-    """Inspect changed files against trusted harness + repo protected paths, with base/head hashes when known."""
+    """Inspect changed files (including rename source paths) against trusted harness + repo protected paths."""
     out: list[dict] = []
-    for f in sorted(files, key=lambda x: x["filename"]):
+    for f in sorted(files, key=lambda x: (x.get("previous_filename") or "", x["filename"])):
         name = f["filename"]
-        if not is_protected_file(name, extra_patterns):
+        prev = (f.get("previous_filename") or "").strip() or None
+        name_protected = is_protected_file(name, extra_patterns)
+        prev_protected = bool(prev and is_protected_file(prev, extra_patterns))
+        if not (name_protected or prev_protected):
             continue
-        item = {"filename": name, "status": f.get("status", "modified")}
-        if base_hashes is not None and name in base_hashes:
-            item["base_sha256"] = base_hashes[name]
+        item: dict[str, Any] = {"filename": name, "status": f.get("status", "modified")}
+        if prev:
+            item["previous_filename"] = prev
+        old_key = prev or name
+        if base_hashes is not None and old_key in base_hashes:
+            item["base_sha256"] = base_hashes[old_key]
         if head_hashes is not None and name in head_hashes:
             item["head_sha256"] = head_hashes[name]
-        if item.get("base_sha256") and item.get("head_sha256"):
+        if prev and prev != name:
+            # Moving a file into or out of a protected path always alters the protected tree.
+            item["hash_changed"] = True
+        elif item.get("base_sha256") and item.get("head_sha256"):
             item["hash_changed"] = item["base_sha256"] != item["head_sha256"]
         else:
             item["hash_changed"] = True

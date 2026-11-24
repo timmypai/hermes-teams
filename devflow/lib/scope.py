@@ -64,12 +64,24 @@ def match_glob(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(p, pat) or p == pat or p.startswith(pat.rstrip("/") + "/")
 
 
+def touched_paths(files: list[dict]) -> list[str]:
+    """Return every repo-relative path touched by `files`, preserving both `filename` and `previous_filename`."""
+    paths: list[str] = []
+    for f in files:
+        if prev := (f.get("previous_filename") or "").strip():
+            paths.append(prev)
+        if name := (f.get("filename") or "").strip():
+            paths.append(name)
+    return sorted(set(paths))
+
+
 def check_files_against_scope(
     filenames: list[str],
     *,
     allowed_scope: list[str] | None = None,
     out_of_scope: list[str] | None = None,
     max_diff_files: int | None = None,
+    file_count: int | None = None,
 ) -> list[str]:
     """Deterministic diff scope checks: Out-of-Scope forbidden, Allowed-Scope bounded, file count capped."""
     findings: list[str] = []
@@ -93,9 +105,10 @@ def check_files_against_scope(
                 f"改動超出卡片宣告範圍（Allowed-Scope={', '.join(allowed_scope)}）：{', '.join(outside[:10])}"
                 + (f" 等共 {len(outside)} 檔" if len(outside) > 10 else "")
             )
-    if max_diff_files and max_diff_files > 0 and len(files) > max_diff_files:
+    effective_count = len(files) if file_count is None else int(file_count)
+    if max_diff_files and max_diff_files > 0 and effective_count > max_diff_files:
         findings.append(
-            f"單一 PR 改動 {len(files)} 個檔案，超過上限 {max_diff_files} 檔（請拆小或確認是否夾帶無關重構）"
+            f"單一 PR 改動 {effective_count} 個檔案，超過上限 {max_diff_files} 檔（請拆小或確認是否夾帶無關重構）"
         )
     return findings
 

@@ -330,6 +330,185 @@ class PreflightCli(unittest.TestCase):
         self.assertTrue(any("Lesson:" in f for f in rep["findings"]))
         self.assertTrue(any("與本卡 EPIC" in f for f in rep["findings"]))
 
+    def test_preflight_real_git_rename_of_protected_file_cannot_bypass_scope_or_protection(self) -> None:
+        (self.repo / ".devflow" / "check.py").write_text("print('gate')\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".devflow/check.py"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "add check.py"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        subprocess.run(["git", "mv", ".devflow/check.py", "app/check.py"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "refactor: move check.py"], cwd=self.repo, check=True)
+
+        rep = self.df.preflight_lib.run_preflight(
+            self.repo,
+            policy=self.df.POLICY,
+            base_ref=base,
+            card_body="Allowed-Scope: app/**\nOut-of-Scope: .devflow/**",
+            pr_title="refactor: move check.py",
+            pr_body="",
+            run_tests=False,
+        )
+        self.assertFalse(rep["ok"], rep)
+        self.assertTrue(rep["needs_human_approval"])
+        self.assertEqual(len(rep["protected_changes"]), 1)
+        pc = rep["protected_changes"][0]
+        self.assertEqual(pc["previous_filename"], ".devflow/check.py")
+        self.assertEqual(pc["filename"], "app/check.py")
+        self.assertTrue(pc["base_sha256"])
+        self.assertTrue(pc["head_sha256"])
+        self.assertTrue(pc["hash_changed"])
+        self.assertTrue(any("Out-of-Scope" in f and ".devflow/check.py" in f for f in rep["findings"]), rep["findings"])
+        self.assertTrue(any("Allowed-Scope" in f and ".devflow/check.py" in f for f in rep["findings"]), rep["findings"])
+
+
+class ReviewFindingsRegression(unittest.TestCase):
+    """Regression tests reproducing all 3 blocking findings from PR #33 review."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="devflow-revfix-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        shutil.copy(KIT / "roles.json", self.root / "roles.json")
+        (self.root / "state").mkdir()
+        self.repo_dir = self.root / "repo"
+        (self.repo_dir / ".devflow").mkdir(parents=True)
+        (self.root / "state" / "repos.json").write_text(json.dumps({
+            "b": {"slug": "b", "repo": REPO, "path": str(self.repo_dir), "port": 18105, "default_branch": "main"}
+        }))
+        os.environ["DEVFLOW_HERMES_DATA"] = str(self.root / "data")
+        self.addCleanup(os.environ.pop, "DEVFLOW_HERMES_DATA", None)
+        self.df = load_devflow(self.root)
+        self.f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(self.f, name))
+        self.df.pr_files = lambda repo, n: self.f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+        self.db = self.root / "data" / "kanban" / "boards" / "b" / "kanban.db"
+        self.db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT,
+                    completion_contract TEXT, branch_name TEXT, goal_mode INTEGER DEFAULT 1);
+                CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
+                    status TEXT, metadata TEXT);
+                CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
+                    kind TEXT, payload TEXT, created_at INTEGER);
+            """)
+
+    def test_judge_catches_github_renamed_protected_file_and_delivery_file(self) -> None:
+        goal_ctx = self.df.scope_lib.build_goal_context(
+            epic_id="t_ep01", epic_title="[EPIC] e", epic_body="## 目標\n只改 app\n",
+            card_id="t_dev1", card_title="[DEV] d", card_body="Allowed-Scope: app/**\nOut-of-Scope: .devflow/**",
+        )
+        renamed = [{
+            "filename": "app/check.py",
+            "previous_filename": ".devflow/check.py",
+            "status": "renamed",
+            "patch": "",
+        }]
+        res = self.df.judge(self.f.pr, renamed, goal_context=goal_ctx)
+        self.assertIn(".devflow/check.py", res["gate_files"])
+        self.assertTrue(res["needs_human_approval"])
+        self.assertEqual(res["protected_changes"][0]["previous_filename"], ".devflow/check.py")
+        self.assertTrue(any("Out-of-Scope" in f for f in res["scope_findings"]))
+        self.assertTrue(any("Allowed-Scope" in f for f in res["scope_findings"]))
+
+        # Renaming a delivery file out of .devflow/ must still trigger `replaces_standard`
+        asked: list[str] = []
+        self.df.decide = lambda content, qs: asked.extend(q["name"] for q in qs) or {
+            q["name"]: {"probability": 0.05} for q in qs
+        }
+        renamed_deploy = [{
+            "filename": "scripts/deploy.sh",
+            "previous_filename": ".devflow/deploy.sh",
+            "status": "renamed",
+            "patch": "",
+        }]
+        self.df.judge(self.f.pr, renamed_deploy)
+        self.assertIn("replaces_standard", asked)
+
+    def test_pr_goal_context_resolves_normal_contract_yes_and_contract_no_handoffs(self) -> None:
+        epic_body = "## 目標\n功能 A\n## 驗收\n- AC-1 [cli] 輸出正常\n## 使用者原話\n只要功能 A\n"
+        dev_body = "## 目標\n實作 A\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nOut-of-Scope: secret/**\nEPIC: t_ep01\n"
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_ep01", "[EPIC] A", epic_body, "todo", None, None))
+            # Normal contract=yes: completion_contract is OWNER/REPO, NOT PR URL; PR URL is in task_runs.metadata
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_dev_yes", "[DEV] yes", dev_body, "review", REPO, "wt/t_dev_yes"))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_dev_yes", "done", json.dumps({"published_pr": f"https://github.com/{REPO}/pull/7"})))
+            # Normal contract=no: completion_contract is NULL; PR is recorded via pr_url / pr_number in task_runs
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_dev_no", "[DEV] no", dev_body, "review", None, "wt/t_dev_no"))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_dev_no", "done", json.dumps({"pr_url": f"https://github.com/{REPO}/pull/8", "pr_number": 8})))
+            # Archived decoy card must never be chosen via spoofed Kanban: line
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_arch", "[DEV] old", "## 目標\nold", "archived", None, None))
+
+        # PR #7 has Covers: only (no Kanban: line) -> resolves t_dev_yes via task_runs.metadata.published_pr
+        pr7 = {**self.f.pr, "number": 7, "body": "Implements A.\n\nCovers: t_ep01/AC-1.S1\n"}
+        ctx7 = self.df.pr_goal_context("b", REPO, 7, pr7)
+        self.assertIsNotNone(ctx7)
+        self.assertEqual(ctx7["card_id"], "t_dev_yes")
+        self.assertEqual(ctx7["epic_id"], "t_ep01")
+        self.assertEqual(ctx7["out_of_scope"], ["secret/**"])
+
+        # PR #8 (contract=no) has Covers: only -> resolves t_dev_no via task_runs.metadata.pr_url
+        pr8 = {**self.f.pr, "number": 8, "url": f"https://github.com/{REPO}/pull/8", "body": "Covers: t_ep01/AC-1.S1\n"}
+        ctx8 = self.df.pr_goal_context("b", REPO, 8, pr8)
+        self.assertIsNotNone(ctx8)
+        self.assertEqual(ctx8["card_id"], "t_dev_no")
+        self.assertEqual(ctx8["allowed_scope"], ["app/**"])
+
+        # Spoofed Kanban: t_dev_yes on unrelated PR #99 must be rejected because t_dev_yes is bound to PR #7
+        pr99 = {**self.f.pr, "number": 99, "url": f"https://github.com/{REPO}/pull/99", "body": "Kanban: t_dev_yes\n"}
+        self.assertIsNone(self.df.pr_goal_context("b", REPO, 99, pr99))
+        # Archived Kanban: t_arch must also be rejected
+        pr98 = {**self.f.pr, "number": 98, "url": f"https://github.com/{REPO}/pull/98", "body": "Kanban: t_arch\n"}
+        self.assertIsNone(self.df.pr_goal_context("b", REPO, 98, pr98))
+
+    def test_judgment_cache_invalidates_on_card_scope_or_repo_policy_edit_with_unchanged_pr(self) -> None:
+        epic_body = "## 目標\n改 app\n## 驗收\n- AC-1 [cli] ok\n"
+        dev_body = "## 目標\n改 x\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep01\n"
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_ep01", "[EPIC] e", epic_body, "todo", None, None))
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,1)", ("t_dev1", "[DEV] d", dev_body, "review", REPO, "wt/t_dev1"))
+            c.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES (?,?,?)",
+                      ("t_dev1", "done", json.dumps({"published_pr": f"https://github.com/{REPO}/pull/7"})))
+        self.f.files = [{"filename": "app/x.py", "status": "modified", "patch": "+x = 1"}]
+
+        # Initial judgment: clean
+        rec1 = self.df.judgment("b", REPO, 7)
+        self.assertEqual(rec1["scope_findings"], [])
+        self.assertEqual(self.f.decide_calls, 1)
+        # Simulate an [ADV] verdict attached to rec1's fingerprint
+        self.df.update_judgment(f"{REPO}#7", fp=rec1["fingerprint"], advisor="t_adv1")
+        self.f.cards["t_adv1"] = {"status": "done", "verdict": "ok", "body": f"fingerprint: {rec1['fingerprint']}"}
+
+        # Edit governing card to add Out-of-Scope: app/** WITHOUT touching the PR at all
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", (dev_body + "Out-of-Scope: app/**\n",))
+
+        rec2 = self.df.judgment("b", REPO, 7)
+        self.assertNotEqual(rec2["fingerprint"], rec1["fingerprint"])
+        self.assertIsNone(rec2["advisor"])  # old [ADV] invalidated
+        self.assertEqual(self.f.decide_calls, 2)
+        self.assertTrue(any("Out-of-Scope" in f for f in rec2["scope_findings"]), rec2)
+
+        # Now change repo protected paths in .devflow/config.env WITHOUT touching PR or card
+        (self.repo_dir / ".devflow" / "config.env").write_text("DEVFLOW_PROTECTED_PATHS=app/**\n", encoding="utf-8")
+        rec3 = self.df.judgment("b", REPO, 7)
+        self.assertNotEqual(rec3["fingerprint"], rec2["fingerprint"])
+        self.assertEqual(self.f.decide_calls, 3)
+        self.assertIn("app/x.py", rec3["gate_files"])
+        self.assertTrue(rec3["needs_human_approval"])
+
+        # Now tighten policy max_diff_files WITHOUT touching PR, card, or protected paths
+        (self.repo_dir / ".devflow" / "config.env").write_text("DEVFLOW_PROTECTED_PATHS=app/**\nDEVFLOW_MAX_DIFF_FILES=1\n", encoding="utf-8")
+        self.f.files.append({"filename": "app/y.py", "status": "added", "patch": "+y = 2"})
+        rec4 = self.df.judgment("b", REPO, 7)
+        self.assertNotEqual(rec4["fingerprint"], rec3["fingerprint"])
+        self.assertTrue(any("超過上限 1 檔" in f for f in rec4["scope_findings"]), rec4)
+
 
 if __name__ == "__main__":
     unittest.main()
