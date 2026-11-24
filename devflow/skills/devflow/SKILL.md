@@ -64,11 +64,13 @@ metadata:
 - 不寫額外交接文件；需要給人看的長內容用 `artifacts` 附檔。
 - 外部 skill 說的 "issue tracker / tickets / issues" 一律指這個 board 的 Kanban 卡；"PR" 指 GitHub PR。
 
-## 推進規則（不設卡控）
+## 推進規則與熔斷上限
+- **權威層級**：`安全紅線（不洩密、不破壞正式資料、不未核准部署） > 本次 EPIC 使用者原話／明確決定 > 專案 .devflow 契約與 devflow 流程 > repo 風格／通用方法論`。衝突時不自行腦補，交 `needs_input` 或記進 `followups`。
 - 可逆的事自己決定並記在 summary，不停下來問。
-- review 退件用 `kanban_request_changes`，不是 block；沒有次數上限。同一原因再失敗時換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
+- **Review 往復熔斷**：review 退件用 `kanban_request_changes`；同一張卡退件達上限（預設 2 輪，`roles.json` `policy.max_review_rounds`）時觸發熔斷，停止盲目互踢，由 orchestrator／architect 重檢根因或以 `needs_input` 請使用者定錨。同因再失敗必須換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
+- **卡片與預算上限**：單一 EPIC 工作卡數上限與 worker 回合／時間預算由 `roles.json` `policy`／`worker_config` 宣告控制，超限自動要求收斂。
 - 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason **必須是給人直接判讀的純白話**（禁止寫 commit SHA、CI run ID、artifact 編號或內部參數代號）。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句白話問題>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後只寫簡潔白話，使用者只看這段就能決定：`背景：` 目前完成到哪、只缺哪一件事（1–2 句白話）；`A：` / `B：` 各選項的白話結果與影響；`建議：` 一句話理由。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
-- 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後你重查仍缺、再 block 同一題，Hermes 會判定重複阻擋，把卡轉進 triage（teams-transcription t_12402f67 2026-11-22）。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
+- 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後重查仍缺、再 block 同一題會觸發重複阻擋並被轉進 triage。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。
 - 長時間操作（CI、部署）期間呼叫 `kanban_heartbeat`。
 - 每次 run 結束前一定要呼叫一個終結工具（complete / request_review / request_changes / block）。
@@ -124,6 +126,10 @@ metadata:
 | `devflow resume SLUG TASK [--note TEXT]` | 只限聊天（不是 worker）：重跑 blocked/卡住的卡（解除已開 PR 卡的 24h 重派保護、重設失敗計數） |
 | `devflow pending [PROFILE]` | 等使用者回答的卡（board、task、question、card、`block_event`）、在哪個 Bot Chat 問（`ask_in`）、各對話紀錄是否已有通知與回覆（`chats[].woken`/`replied`） |
 | `devflow answer SLUG TASK --event N --where WHERE TEXT` | 交使用者對問題事件 N 的回答（一題只收一次；卡已不在等這題時回 `not applied` 與原因），再照 `resume` 重跑 |
+| `devflow check card --title TITLE [--body-file F]` | 建卡／改卡前確定性檢查卡型、assignee、workspace、固定完成條件、body 長度與技術資訊洩漏 |
+| `devflow preflight SLUG [TASK] [--dir DIR]` | developer 送審前一站式確定性自檢：範圍（`Allowed-Scope`/`Out-of-Scope`）、變更檔數、保護檔 hash、PR 格式與快速測試 |
+| `devflow check pr SLUG PR` | PR 判斷：保護／gate 檔變更、EPIC 目標與 diff 範圍對齊（`out_of_scope_diff`）、review 往復熔斷與 Decisions 檢查 |
+| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve 與 judgment 後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能

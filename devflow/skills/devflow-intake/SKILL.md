@@ -57,8 +57,8 @@ metadata:
   3. 拿到答案 → `devflow answer <slug> <task> --event <block_event> --where "App 對話" "<回答>"`，回一句「已交回 <assignee> 繼續」。
   問題可能出現在收件聊天，不是建 EPIC 的聊天；照樣處理。同一張卡已經回覆過、卡片不再 blocked 時不要再問。
 - **capability**（缺權限或資源，只有人給得了：主機管理權、帳號、金鑰、付費服務）：從 block reason 找出「缺什麼、誰能給」，照 needs_input 的 1–3 問使用者。先分清楚誰動手：
-  - 由 Bot 做、只要使用者核准（例「t_xxxx（teams-transcription）：缺主機上的部署 runner，要我用 devflow 共用 runner 註冊嗎？」）：選項「同意，由 <Bot> 做」和「先不要」；回「同意」就是答案。
-  - 要使用者自己動手（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：照 block reason 的步驟寫成「請你 <動作>，做完回覆『完成』」，選項「已完成」和「暫緩」，不要改寫成「是否同意」。他只回「同意」「好」時**不要** `devflow answer`：卡片會重跑、重查仍缺、再 block 同一題，Hermes 判定重複阻擋把卡轉進 triage（teams-transcription t_12402f67 2026-11-22）。回他「做完回覆『完成』，我再交回」，卡片繼續等；他說做完了或暫緩才交。
+  - 由 Bot 做、只要使用者核准（例「t_xxxx（<repo>）：缺主機上的部署 runner，要我用 devflow 共用 runner 註冊嗎？」）：選項「同意，由 <Bot> 做」和「先不要」；回「同意」就是答案。
+  - 要使用者自己動手（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：照 block reason 的步驟寫成「請你 <動作>，做完回覆『完成』」，選項「已完成」和「暫緩」，不要改寫成「是否同意」。他只回「同意」「好」時**不要** `devflow answer`：卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage。回他「做完回覆『完成』，我再交回」，卡片繼續等；他說做完了或暫緩才交。
   缺的是 worker 工具或卡片設定（不是人給得了的）時，tick 會自動建 `[ADJ]`（`handled_by`），你不用另建。
 - **gave_up / crashed / timed_out**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="EPIC: <id>\n處理：<task id>\n<失敗原因摘要>")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。`處理：` 一行只寫這張 `[ADJ]` 要修的卡（devflow 用它判斷同一張卡繞了幾圈、新的阻塞該交給誰），其他相關卡寫在內文。
 
