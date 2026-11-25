@@ -755,9 +755,9 @@ def channel_question(slug: str, failing: list[dict]) -> str:
 
 
 def cmd_resume(a) -> None:
-    """Re-run a blocked/held card from Hermes chat (workers: `board_ops` resume in the handoff)."""
+    """Re-run a blocked/held card from Hermes chat (workers: `devflow-ops` block in a card comment)."""
     if os.environ.get("HERMES_KANBAN_TASK"):
-        die("resume runs from Hermes chat, not inside a kanban worker; put it in metadata.board_ops")
+        die("resume runs from Hermes chat, not inside a kanban worker; put a ```devflow-ops``` block in your card comment")
     print(resume(a.slug, a.task, a.note))
 
 
@@ -1229,6 +1229,7 @@ MAX_REVIEW_ROUNDS = int(POLICY["max_review_rounds"])
 MAX_EPIC_CARDS = int(POLICY["max_epic_cards"])
 MAX_DIFF_FILES = int(POLICY["max_diff_files"])
 AUTO_PLAN_ADVISOR = bool(POLICY.get("auto_plan_advisor", False))
+PLAN_RISK_MODE = policy_lib.effective_plan_risk_mode(POLICY)
 AUTO_FLOW_ADJ = bool(POLICY.get("auto_flow_adj", False))
 
 
@@ -1599,12 +1600,12 @@ def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: l
 
 
 def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | None = None,
-               advised: frozenset[str] = frozenset()) -> dict:
-    """Rules + Decisions risks. With `advise`, advisory findings ([manual] AC confirmations and
-    Decisions risks) not in `advised` open an [ADV] card; deterministic schema findings stay in
+               advised: frozenset[str] = frozenset(), run_llm: bool = True) -> dict:
+    """Rules + optional Decisions risks. With `advise`, advisory findings ([manual] AC confirmations
+    and Decisions risks) not in `advised` open an [ADV] card; deterministic schema findings stay in
     `findings` and `actionable_rules` (excluding body-length reminders) without spending an Opus
-    advisor run. `report["advised"]` keys `irreversible` per pending [SHIP] and other Decisions
-    risks per pending work card so newly added cards re-arm scope/goal checks."""
+    advisor run. When `run_llm=False` (e.g. `plan_risk_mode="off"` in tick), skips Decisions calls
+    and never populates `advised` so un-advised risks are not silently suppressed."""
     cards = cards or plan_cards(board, epic)
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
@@ -1615,16 +1616,19 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     actionable_rules = [f for f in (rules + readiness) if f not in manual and f not in body_notes]
     findings = rules + readiness
     questions = plan_questions(cards[epic]["body"])
-    risks, note = plan_risks(epic, cards, questions)
-    if note:
-        # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
-        # [SHIP] because an irreversible or out-of-scope operation cannot be ruled out. Stable text
-        # (no error message) so a later failure does not open another [ADV] for the same plan.
-        flagged = {n for n, _ in questions}
-        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
+    if run_llm:
+        risks, note = plan_risks(epic, cards, questions)
+        if note:
+            # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
+            # [SHIP] because an irreversible or out-of-scope operation cannot be ruled out. Stable text
+            # (no error message) so a later failure does not open another [ADV] for the same plan.
+            flagged = {n for n, _ in questions}
+            risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
+        else:
+            flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
+            risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
     else:
-        flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
-        risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
+        risks, note, risk = {}, "", {}
     findings += list(risk.values())
     advisory = [f for f in rules if f in manual] + list(risk.values())
     ships = pending_ships(cards)
@@ -1643,8 +1647,9 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         else:
             keys[f] = [f"{f} @ {w}" for w in work] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings,
-              "actionable_rules": actionable_rules, "risks": risks, "note": note,
-              "advised": sorted({k for ks in keys.values() for k in ks})}
+              "actionable_rules": actionable_rules, "gating_risks": sorted(gating_texts),
+              "risks": risks, "note": note, "llm_skipped": not run_llm,
+              "advised": sorted({k for ks in keys.values() for k in ks}) if advise else []}
     new = [f for f in advisory if any(k not in advised for k in keys[f])]
     gate_ships = any(f in gating_texts for f in new)
     if new and advise:
@@ -2070,23 +2075,54 @@ def tick_board(board: str, st: dict) -> bool:
                 )
             )
             if plans.get(tid) != fp or repair_ended:
-                rep = check_plan(board, tid, advise=AUTO_PLAN_ADVISOR, cards=cards, advised=frozenset(advised.get(tid, [])))
-                advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
+                risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+                run_llm = risk_mode != "off"
+                advise_on = risk_mode == "advisor"
+                rep = check_plan(board, tid, advise=advise_on, cards=cards,
+                                 advised=frozenset(advised.get(tid, [])), run_llm=run_llm)
+                if advise_on and rep.get("advised"):
+                    advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
                 retry = adj_retry or retry
+                risk_escalated = False
+                if risk_mode == "needs_input" and (gating := rep.get("gating_risks") or []):
+                    import hashlib
+                    rhash = hashlib.sha1("\n".join(sorted(gating)).encode()).hexdigest()[:8]
+                    esc_map = st.setdefault("plan_risk_escalated", {})
+                    if esc_map.get(tid) != rhash and not waiting(cards.get(tid, {})):
+                        reason = (
+                            f"問題：{tid} 計畫偵測到高風險或超出範圍疑慮，要繼續執行還是收斂調整？"
+                            "選項：A 調整並縮減範圍 / B 確認可接受並繼續（建議 A）\n"
+                            f"背景：自動風險檢查發現：{'; '.join(gating)[:800]}\n"
+                            "A：由 orchestrator 依你的指示刪除多餘卡片或縮小範圍。\n"
+                            "B：確認這些項目屬於你本次需求並繼續執行。\n"
+                            "建議：先確認沒有多做未要求項目再繼續。"
+                        )
+                        bev, esc_failed = mark_plan_needs_input(board, tid, reason)
+                        if bev is not None:
+                            esc_map[tid] = rhash
+                            risk_escalated = True
+                        elif esc_failed:
+                            retry = True
                 suffix = []
                 if rep.get("advisor_card"):
                     suffix.append(f"已建 {rep['advisor_card']}")
+                if risk_escalated:
+                    suffix.append("高風險／範圍疑慮已轉 needs_input 通知使用者定錨")
                 if adj_id == "user":
                     suffix.append("已達 [ADJ] 修正上限，已轉 needs_input 通知使用者決定")
                 elif adj_id:
                     suffix.append(f"已交 {adj_id} 喚醒 orchestrator 修正")
-                note_tail = ("\n" + "；".join(suffix)) if suffix else (
-                    "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）")
+                if suffix:
+                    note_tail = "\n" + "；".join(suffix)
+                elif not run_llm:
+                    note_tail = "（plan_risk_mode=off：僅執行確定性規則檢查，未啟用自動計畫顧問）"
+                else:
+                    note_tail = "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）"
                 kanban(board, "comment", tid, "devflow check plan：" + (
                     "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
-                if not adj_retry:
+                if not adj_retry and not retry:
                     plans[tid] = plan_fingerprint(tid, cards, repo)
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
@@ -3415,12 +3451,12 @@ def cmd_check_acceptance(a) -> None:
 # GitHub. The tick runs the same judgment early (cards in review) so [ADV] is usually done first.
 
 JUDGMENTS = ROOT / "state" / "pr-judgments.json"
+HUMAN_APPROVALS = ROOT / "state" / "human-approvals.json"
 JUDGMENT_CHECK = "devflow-judgment"
 PR_ADVISOR_TITLE = "[ADV] PR 判斷 "
-# Delivery machinery every devflow repo shares (template). Changing these is judged, not only reviewed.
-DELIVERY_FILES = re.compile(r"^(\.devflow/(deploy\.sh|capture\.sh|redact\.py|up\.sh|playwright\.sh|acceptance\.py|"
-                            r"verify-base\.sh)|\.github/workflows/deploy\.yml)$")
-GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)|" + DELIVERY_FILES.pattern)
+# Single source of truth in `lib/trust.py` so preflight, check pr, and ship merge never drift.
+DELIVERY_FILES = trust_lib.DELIVERY_FILES_RE
+GATE_FILES = trust_lib.TRUSTED_HARNESS_RE
 FIX_TITLE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)   # same as the template check.py
 EXEMPTION = re.compile(r"^\s*(No-(lesson|proof)|Already-met|Base-unverifiable):\s*\S", re.M)
 PR_SCOPE_QUESTION = (
@@ -4139,10 +4175,62 @@ def cmd_check_pr(a) -> None:
                       "judgment_token_isolated": j_isolated}, ensure_ascii=False, indent=2))
 
 
+def _epic_body_for_pr(board: str, goal_ctx: dict | None) -> str | None:
+    if not goal_ctx:
+        return None
+    epic_id = goal_ctx.get("epic_id")
+    if epic_id and (BOARDS / board / "kanban.db").exists():
+        try:
+            rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (epic_id,))
+            if rows and rows[0].get("body"):
+                return rows[0]["body"]
+        except sqlite3.Error:
+            pass
+    if ud := goal_ctx.get("user_decisions"):
+        return f"## 使用者決定\n{ud}\n"
+    return None
+
+
+def protected_approval_question(repo: str, number: int, rec: dict) -> str:
+    paths = sorted({p.get("filename") or "" for p in (rec.get("protected_changes") or []) if p.get("filename")})
+    shown = "、".join(paths[:5]) + (f" 等 {len(paths)} 檔" if len(paths) > 5 else "")
+    return (
+        f"問題：{repo} PR #{number} 改動了受保護檔案（{shown}），確認核准合併嗎？選項：A 核准合併 / B 退回修改（建議 B）\n"
+        f"背景：PR #{number} 已通過 CI 與審查，但觸及保護／設定／交付檔，需由你確認沒有放寬檢查或未授權變更。\n"
+        "A：由你確認後透過 `devflow approve` 記錄本次 exact-head 核准並繼續合併。\n"
+        "B：退回修改或還原受保護檔案。\n"
+        "建議：先確認受保護檔案改動符合本次需求再選 A。"
+    )
+
+
+def cmd_approve(a) -> None:
+    """Record exact-head human approval for a PR touching protected files (Hermes chat only)."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("approve runs from Hermes chat after explicit user confirmation, not inside a kanban worker")
+    e = entry(a.board)
+    repo = e["repo"]
+    pr = pr_meta(repo, a.pr)
+    head = pr["headRefOid"]
+    want = (a.head or "").strip().lower()
+    if want and not head.lower().startswith(want):
+        die(f"PR #{a.pr} 目前 head 是 {head[:12]}，與指定 --head {want} 不符；請重新確認最新 PR 內容")
+    with locked("human-approvals"):
+        rec = trust_lib.record_human_approval(
+            HUMAN_APPROVALS,
+            repo=repo,
+            pr_number=a.pr,
+            head_sha=head,
+            note=a.note or "",
+            approved_by=a.by or "operator",
+        )
+    print(json.dumps({"approved": True, **rec}, ensure_ascii=False, indent=2))
+
+
 def cmd_ship_merge(a) -> None:
     """Exit 0 merged (or already merged); 3 waiting for the [ADV] verdict; 4 advisor says revise;
-    5 the shared deploy channel is not ready (output: capability question); 1 anything else (no
-    judgment, PR changed meanwhile, invalid merge method, merge refused)."""
+    5 the shared deploy channel is not ready (output: capability question); 6 PR touches protected
+    files and lacks exact-head human approval; 1 anything else (no judgment, PR changed meanwhile,
+    invalid merge method, merge refused)."""
     e = entry(a.board)
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
@@ -4175,12 +4263,32 @@ def cmd_ship_merge(a) -> None:
     # A body, card scope, or repo policy edit after judging leaves the head unchanged: re-judge the
     # new effective fingerprint, which publishes its own state, and stop.
     now = pr_meta(repo, a.pr)
-    _, _, now_fp = resolve_pr_judgment_inputs(e["slug"], repo, a.pr, now)
+    goal_ctx, now_cfg, now_fp = resolve_pr_judgment_inputs(e["slug"], repo, a.pr, now)
     if now_fp != rec["fingerprint"]:
         try:
             gate(e["slug"], repo, a.pr, now)
         finally:
             die("未合併：PR 或其卡片範圍／政策在判斷後被修改，重跑 devflow ship merge")
+    if rec.get("needs_human_approval") and policy_lib.repo_require_human_approval(now_cfg, POLICY):
+        approved, approval_source = trust_lib.is_human_approved(
+            HUMAN_APPROVALS,
+            repo=repo,
+            pr_number=a.pr,
+            head_sha=pr["headRefOid"],
+            epic_body=_epic_body_for_pr(e["slug"], goal_ctx),
+        )
+        if not approved:
+            print(json.dumps({
+                "merged": False,
+                "needs_human_approval": True,
+                "head_sha": pr["headRefOid"],
+                "protected_changes": rec.get("protected_changes") or [],
+                "gate_files": rec.get("gate_files") or [],
+                "question": protected_approval_question(repo, a.pr, rec),
+            }, ensure_ascii=False, indent=2))
+            sys.exit(6)
+    else:
+        approval_source = ""
     p = run(["gh", "pr", "merge", str(a.pr), "-R", repo, f"--{merge_method}", "--match-head-commit", pr["headRefOid"]],
             gh="builder", check=False)
     if p.returncode != 0:
@@ -4188,6 +4296,7 @@ def cmd_ship_merge(a) -> None:
     done = pr_meta(repo, a.pr)
     print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
                       "merge_method": merge_method, "fingerprint": rec["fingerprint"], "advisor": rec.get("advisor"),
+                      **({"human_approval": approval_source} if approval_source else {}),
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
 
@@ -4321,6 +4430,12 @@ def main() -> None:
     p.add_argument("--no-test", action="store_true", help="skip local check.sh / test command")
     p.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes in worktree")
     p.set_defaults(fn=cmd_preflight)
+    p = sub.add_parser("approve", help="record exact-head human approval for a PR touching protected files (Hermes chat only)")
+    p.add_argument("board"); p.add_argument("pr", type=int)
+    p.add_argument("--head", help="expected PR head SHA or prefix (verified against current GitHub PR head)")
+    p.add_argument("--note", default="", help="reason or operator confirmation summary")
+    p.add_argument("--by", default="operator", help="approver label (default: operator)")
+    p.set_defaults(fn=cmd_approve)
     ship = sub.add_parser("ship").add_subparsers(dest="sub", required=True)
     p = ship.add_parser("merge", help="merge a PR only with a judgment (and [ADV] ok) for its current head + body")
     p.add_argument("board"); p.add_argument("pr", type=int); p.set_defaults(fn=cmd_ship_merge)

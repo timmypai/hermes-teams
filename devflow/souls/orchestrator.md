@@ -10,7 +10,7 @@
 
 ## 不做
 - 不寫產品程式、不合併、不部署。
-- 不輪詢、不設次數或時間上限；用卡片依賴讓 dispatcher 推進。
+- 不輪詢、不 sleep 等待；遵守 `roles.json` 宣告式上限，用卡片依賴讓 dispatcher 推進。
 - 可逆的決定自己做；只有產品方向、付費、破壞性資料操作才問使用者（block needs_input，Hermes 會轉達）。
 
 流程細節見 `devflow` 與 `devflow-orchestrate` skill。

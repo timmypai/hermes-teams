@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 VALID_MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
+VALID_PLAN_RISK_MODES = frozenset({"off", "needs_input", "advisor"})
 
 DEFAULT_POLICY: dict[str, Any] = {
     "port_base": 18100,
@@ -32,7 +33,9 @@ DEFAULT_POLICY: dict[str, Any] = {
     "advisor_max_retries": 6,
     "default_merge_method": "squash",
     "auto_plan_advisor": False,
+    "plan_risk_mode": "off",
     "auto_flow_adj": False,
+    "require_human_approval_for_protected": True,
 }
 
 
@@ -85,12 +88,17 @@ def load_policy(root: Path, roles: dict[str, Any]) -> dict[str, Any]:
     for env_key, pol_key in (
         ("DEVFLOW_AUTO_PLAN_ADVISOR", "auto_plan_advisor"),
         ("DEVFLOW_AUTO_FLOW_ADJ", "auto_flow_adj"),
+        ("DEVFLOW_REQUIRE_HUMAN_APPROVAL_FOR_PROTECTED", "require_human_approval_for_protected"),
     ):
         raw = os.environ.get(env_key, "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
             cfg[pol_key] = True
         elif raw in ("0", "false", "no", "off"):
             cfg[pol_key] = False
+    if (prm := os.environ.get("DEVFLOW_PLAN_RISK_MODE", "").strip().lower()) in VALID_PLAN_RISK_MODES:
+        cfg["plan_risk_mode"] = prm
+    elif str(cfg.get("plan_risk_mode") or "").strip().lower() not in VALID_PLAN_RISK_MODES:
+        cfg["plan_risk_mode"] = "off"
     return cfg
 
 
@@ -154,3 +162,21 @@ def repo_deploy_manual_only(repo_cfg: dict[str, str]) -> bool:
 
 def repo_allow_custom_delivery(repo_cfg: dict[str, str]) -> bool:
     return (repo_cfg.get("DEVFLOW_ALLOW_CUSTOM_DELIVERY") or "").strip().lower() in ("1", "true", "yes")
+
+
+def repo_require_human_approval(repo_cfg: dict[str, str], policy: dict[str, Any]) -> bool:
+    """Whether protected-file PRs require explicit exact-head human approval before `ship merge`."""
+    raw = (repo_cfg.get("DEVFLOW_REQUIRE_HUMAN_APPROVAL") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(policy.get("require_human_approval_for_protected", True))
+
+
+def effective_plan_risk_mode(policy: dict[str, Any]) -> str:
+    """Resolve `off` | `needs_input` | `advisor` (`auto_plan_advisor=true` implies `advisor`)."""
+    if bool(policy.get("auto_plan_advisor", False)):
+        return "advisor"
+    mode = str(policy.get("plan_risk_mode") or "off").strip().lower()
+    return mode if mode in VALID_PLAN_RISK_MODES else "off"

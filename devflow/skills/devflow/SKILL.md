@@ -80,7 +80,7 @@ metadata:
 - 有 contract 的卡，`kanban_request_review` / `kanban_complete` 的 metadata 一定帶 `published_pr`（PR URL）。
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
-- worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：dispatcher tick 會判斷是流程問題，自動建 `[ADJ]` 交 orchestrator。
+- worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限、受保護檔合併核准）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：啟用 `auto_flow_adj=true` 時 tick 會自動建 `[ADJ]` 交 orchestrator；預設 `auto_flow_adj=false` 時不跑額外 LLM 元循環，直接依 `devflow pending` 呈現或由 orchestrator 接手。
 - 已部署服務的畫面操作（登入管理頁、建立或選擇資料、按按鈕、讀出 id 或畫面文字）由 Bot 自己做：`devflow operate <slug> <op>`（`devflow-devops` §5，經 VM runner 的 Playwright；Bot 的容器連不到服務），不要請使用者開瀏覽器代做。只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料。問的時候寫清楚其餘步驟由 Bot 做。
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
@@ -131,7 +131,8 @@ metadata:
 | `devflow check card --title TITLE [--body-file F]` | 建卡／改卡前確定性檢查卡型、assignee、workspace、固定完成條件、body 長度與技術資訊洩漏 |
 | `devflow preflight SLUG [TASK] [--dir DIR]` | developer 送審前一站式確定性自檢：範圍（`Allowed-Scope`/`Out-of-Scope`）、變更檔數、保護檔 hash、PR 格式與快速測試 |
 | `devflow check pr SLUG PR` | PR 判斷：保護／gate 檔變更、EPIC 目標與 diff 範圍對齊（`out_of_scope_diff`）、review 往復熔斷與 Decisions 檢查 |
-| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve 與 judgment 後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
+| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment 與受保護檔人類 exact-head 核准（必要時 exit 6）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
+| `devflow approve SLUG PR [--head SHA] [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確確認後，記錄 PR 目前 exact-head 的受保護檔核准 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能
