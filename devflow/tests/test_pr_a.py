@@ -92,36 +92,55 @@ class UnifiedTrustAndHumanApproval(unittest.TestCase):
         self.assertFalse(out["merged"])
         self.assertTrue(out["needs_human_approval"])
         self.assertTrue(out["question"].startswith("問題："))
+        req_id = out["request_id"]
+        self.assertIn(f"核准請求碼：{req_id}", out["question"])
+        self.assertEqual(self.df.trust_lib.extract_approval_request_id(out["question"]), req_id)
+        self.assertEqual(self.df.trust_lib.get_pending_approval(self.df.HUMAN_APPROVALS, req_id)["head_sha"], "a" * 40)
         self.assertEqual(self.f.merges, [])
 
         # Worker cannot run `devflow approve`
         os.environ["HERMES_KANBAN_TASK"] = "t_ship"
         self.addCleanup(os.environ.pop, "HERMES_KANBAN_TASK", None)
         with self.assertRaises(SystemExit) as cm_w:
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="try", by="bot"))
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, request=req_id, head=None, note="try", by="bot"))
         self.assertEqual(cm_w.exception.code, 1)
         os.environ.pop("HERMES_KANBAN_TASK", None)
 
-        # Omitted, empty, short prefix, or malformed --head MUST fail closed without writing approval
+        # Omitted, empty, short prefix, or malformed --head (without --request) MUST fail closed
         for bad_head in (None, "", "a" * 12, "not-a-sha", "g" * 40):
             with self.subTest(bad_head=bad_head), self.assertRaises(SystemExit) as cm_bad:
-                self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head=bad_head, note="bad", by="operator"))
+                self.df.cmd_approve(SimpleNamespace(board="b", pr=7, request=None, head=bad_head, note="bad", by="operator"))
             self.assertEqual(cm_bad.exception.code, 1)
-        self.assertEqual(self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS), {})
+        self.assertNotIn(f"{REPO}#7", self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS))
 
-        # Head changed between question (a*40) and approval (PR moved to b*40) MUST fail closed
+        # Stale reply: question was asked for head A (req_id), then head B arrives before the user answers.
+        # Approving with `--request <req_id>` MUST fail closed (exit 1) and NEVER authorize or merge head B!
         self.f.pr["headRefOid"] = "b" * 40
-        with self.assertRaises(SystemExit) as cm_moved:
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="stale head", by="operator"))
-        self.assertEqual(cm_moved.exception.code, 1)
-        self.assertEqual(self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS), {})
-        self.f.pr["headRefOid"] = "a" * 40
+        self.f.reviews = [self.f.review("APPROVED", commit="b" * 40)]
+        with self.assertRaises(SystemExit) as cm_stale_req:
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, request=req_id, head=None, note="late reply for A", by="operator"))
+        self.assertEqual(cm_stale_req.exception.code, 1)
+        self.assertNotIn(f"{REPO}#7", self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS))
+        rec_b = self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", fp=rec_b["fingerprint"], advisor="t_adv_b")
+        self.f.cards["t_adv_b"] = {"status": "done", "verdict": "ok", "body": f"fingerprint: {rec_b['fingerprint']}"}
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm_b_blocked:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertEqual(cm_b_blocked.exception.code, 6)
+        self.assertEqual(self.f.merges, [])
 
-        # Exact 40-char head approval via `devflow approve` unblocks ship merge
+        # Restore head A and approve via `--request <req_id>`: matches original head A and unblocks ship merge!
+        self.f.pr["headRefOid"] = "a" * 40
+        self.f.reviews = [self.f.review("APPROVED", commit="a" * 40)]
+        rec_a = self.df.judgment("b", REPO, 7)
+        self.df.update_judgment(f"{REPO}#7", fp=rec_a["fingerprint"], advisor="t_adv_a")
+        self.f.cards["t_adv_a"] = {"status": "done", "verdict": "ok", "body": f"fingerprint: {rec_a['fingerprint']}"}
         buf_app = io.StringIO()
         with redirect_stdout(buf_app):
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="ok", by="timmy"))
-        self.assertTrue(json.loads(buf_app.getvalue())["approved"])
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, request=req_id, head=None, note="ok", by="timmy"))
+        app_out = json.loads(buf_app.getvalue())
+        self.assertTrue(app_out["approved"])
+        self.assertEqual(app_out["head_sha"], "a" * 40)
 
         buf_ok = io.StringIO()
         with redirect_stdout(buf_ok):
@@ -679,6 +698,8 @@ class DocAndContractConsistency(unittest.TestCase):
         shared_skill = (KIT / "skills" / "devflow" / "SKILL.md").read_text(encoding="utf-8")
         chat_section = shared_skill.split("## 在自己的 Bot Chat 回答卡片問題")[1].split("## 身分與憑證")[0]
         self.assertIn("devflow approve ", chat_section)
+        self.assertIn("--request", chat_section)
+        self.assertIn("嚴禁改查", chat_section)
         self.assertIn("絕不執行 `devflow approve`", chat_section)
         self.assertIn("devflow approve-plan ", chat_section)
         self.assertIn("絕不執行 `devflow approve-plan`", chat_section)

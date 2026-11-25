@@ -3087,11 +3087,14 @@ def pending(profile: str | None = None) -> list[dict]:
                                                    "AND created_at >= ? AND author IS NOT ? ORDER BY id",
                                             (t["id"], since, t["assignee"]))]
             handled = flow.get(f"{board}/{t['id']}/{bev}")
+            req_id = trust_lib.extract_approval_request_id(reason)
+            pending_app = trust_lib.get_pending_approval(HUMAN_APPROVALS, req_id) if req_id else None
             if profile is None or ask_in == profile:
                 out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
                             "kind": t["block_kind"], "question": reason, "card": (t["body"] or "")[:1500],
                             "ask_in": ask_in, "block_event": bev, "chats": chats,
                             "handled_by": handled if handled and handled != "user" else None,
+                            **({"pending_approval": pending_app} if pending_app else {}),
                             "comments_since": comments})
     return out
 
@@ -4581,13 +4584,14 @@ def _epic_body_for_pr(board: str, goal_ctx: dict | None) -> str | None:
     return None
 
 
-def protected_approval_question(repo: str, number: int, rec: dict) -> str:
+def protected_approval_question(repo: str, number: int, rec: dict, *, request_id: str) -> str:
     paths = sorted({p.get("filename") or "" for p in (rec.get("protected_changes") or []) if p.get("filename")})
     shown = "、".join(paths[:5]) + (f" 等 {len(paths)} 檔" if len(paths) > 5 else "")
     return (
         f"問題：{repo} PR #{number} 改動了受保護檔案（{shown}），確認核准合併嗎？選項：A 核准合併 / B 退回修改（建議 B）\n"
         f"背景：PR #{number} 已通過 CI 與審查，但觸及保護／設定／交付檔，需由你確認沒有放寬檢查或未授權變更。\n"
-        "A：由你確認後透過 `devflow approve` 記錄本次 exact-head 核准並繼續合併。\n"
+        f"核准請求碼：{request_id}\n"
+        f"A：由你確認後透過 `devflow approve <board> {number} --request {request_id}` 記錄原提交核准並繼續合併。\n"
         "B：退回修改或還原受保護檔案。\n"
         "建議：先確認受保護檔案改動符合本次需求再選 A。"
     )
@@ -4595,19 +4599,30 @@ def protected_approval_question(repo: str, number: int, rec: dict) -> str:
 
 def cmd_approve(a) -> None:
     """Record exact-head human approval for a PR touching protected files (Hermes chat only).
-    Requires an explicit full 40-char hex `--head` SHA matching the live PR head so a newer
-    unreviewed commit can never inherit approval for an older commit."""
+    Binds approval to the original head SHA presented in the question (`--request <request_id>`
+    and/or full 40-char `--head <sha>`) and fails closed if the live PR head has moved."""
     if os.environ.get("HERMES_KANBAN_TASK"):
         die("approve runs from Hermes chat after explicit user confirmation, not inside a kanban worker")
-    want = (a.head or "").strip().lower()
-    if not trust_lib.FULL_SHA_RE.fullmatch(want):
-        die("--head 必須提供使用者本次確認的完整 40 碼 commit SHA（不得省略或使用過短前綴）")
     e = entry(a.board)
     repo = e["repo"]
+    req_id = (getattr(a, "request", None) or "").strip().lower()
+    want = (getattr(a, "head", None) or "").strip().lower()
+    if req_id:
+        pending_rec = trust_lib.get_pending_approval(HUMAN_APPROVALS, req_id)
+        if not pending_rec:
+            die(f"找不到核准請求碼 {req_id!r} 的待確認紀錄；請重新向使用者確認再核准")
+        if pending_rec.get("repo") != repo or int(pending_rec.get("pr") or 0) != int(a.pr):
+            die(f"核准請求碼 {req_id} 對應 {pending_rec.get('repo')}#{pending_rec.get('pr')}，與 {repo}#{a.pr} 不符")
+        req_head = str(pending_rec.get("head_sha") or "").strip().lower()
+        if want and want != req_head:
+            die(f"--head {want[:12]} 與核准請求碼 {req_id} 原記錄提交 {req_head[:12]} 不符；請重新確認")
+        want = req_head
+    if not trust_lib.FULL_SHA_RE.fullmatch(want):
+        die("必須提供 --request <12碼核准請求碼> 或完整 40 碼 --head SHA（不得省略或查最新 head 代填）")
     pr = pr_meta(repo, a.pr)
     head = (pr.get("headRefOid") or "").strip().lower()
     if head != want:
-        die(f"PR #{a.pr} 目前 head 是 {head[:12]}，與指定 --head {want[:12]} 不符；PR 已有新提交，請重新確認再核准")
+        die(f"PR #{a.pr} 目前 head 是 {head[:12]}，與原提問確認的提交 {want[:12]} 不符；PR 已有新提交，請重新確認再核准")
     with locked("human-approvals"):
         rec = trust_lib.record_human_approval(
             HUMAN_APPROVALS,
@@ -4617,7 +4632,7 @@ def cmd_approve(a) -> None:
             note=a.note or "",
             approved_by=a.by or "operator",
         )
-    print(json.dumps({"approved": True, **rec}, ensure_ascii=False, indent=2))
+    print(json.dumps({"approved": True, **({"request_id": req_id} if req_id else {}), **rec}, ensure_ascii=False, indent=2))
 
 
 def cmd_approve_plan(a) -> None:
@@ -4712,13 +4727,23 @@ def cmd_ship_merge(a) -> None:
             epic_body=_epic_body_for_pr(e["slug"], goal_ctx),
         )
         if not approved:
+            prot_paths = sorted({p.get("filename") or "" for p in (rec.get("protected_changes") or []) if p.get("filename")})
+            with locked("human-approvals"):
+                pending_req = trust_lib.record_pending_approval(
+                    HUMAN_APPROVALS,
+                    repo=repo,
+                    pr_number=a.pr,
+                    head_sha=pr["headRefOid"],
+                    protected_files=prot_paths,
+                )
             print(json.dumps({
                 "merged": False,
                 "needs_human_approval": True,
+                "request_id": pending_req["request_id"],
                 "head_sha": pr["headRefOid"],
                 "protected_changes": rec.get("protected_changes") or [],
                 "gate_files": rec.get("gate_files") or [],
-                "question": protected_approval_question(repo, a.pr, rec),
+                "question": protected_approval_question(repo, a.pr, rec, request_id=pending_req["request_id"]),
             }, ensure_ascii=False, indent=2))
             sys.exit(6)
     else:
@@ -4866,7 +4891,8 @@ def main() -> None:
     p.set_defaults(fn=cmd_preflight)
     p = sub.add_parser("approve", help="record exact-head human approval for a PR touching protected files (Hermes chat only)")
     p.add_argument("board"); p.add_argument("pr", type=int)
-    p.add_argument("--head", required=True, help="exact 40-char PR head SHA confirmed by the operator")
+    p.add_argument("--request", help="12-char approval request ID from the block question (`核准請求碼：`) / `devflow pending`")
+    p.add_argument("--head", help="exact 40-char PR head SHA confirmed by the operator (or verified against --request)")
     p.add_argument("--note", default="", help="reason or operator confirmation summary")
     p.add_argument("--by", default="operator", help="approver label (default: operator)")
     p.set_defaults(fn=cmd_approve)

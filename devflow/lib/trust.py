@@ -46,6 +46,8 @@ PLAN_RISK_APPROVAL_RE = re.compile(
 
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PLAN_HASH_RE = re.compile(r"^[0-9a-f]{12}$")
+APPROVAL_REQ_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+APPROVAL_REQ_LINE_RE = re.compile(r"核准請求碼[：:]\s*([0-9a-fA-F]{12})\b")
 
 
 def sha256_text(text: str | bytes) -> str:
@@ -137,6 +139,55 @@ def load_human_approvals(path: Path) -> dict[str, dict[str, Any]]:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def record_pending_approval(
+    path: Path,
+    *,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    protected_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Durably bind an approval prompt to the exact `head_sha` presented to the user, returning a
+    12-char `request_id` so a late reply can never silently approve a newer replacement commit."""
+    head = (head_sha or "").strip().lower()
+    if not FULL_SHA_RE.fullmatch(head):
+        raise ValueError(f"head_sha must be a full 40-char lowercase hex SHA, got {head_sha!r}")
+    req_id = hashlib.sha256(f"{repo}#{int(pr_number)}:{head}".encode("utf-8")).hexdigest()[:12]
+    data = load_human_approvals(path)
+    pending = data.get("_pending") if isinstance(data.get("_pending"), dict) else {}
+    rec: dict[str, Any] = {
+        "request_id": req_id,
+        "repo": repo,
+        "pr": int(pr_number),
+        "head_sha": head,
+        "protected_files": sorted(set(protected_files or [])),
+        "asked_at": int(time.time()),
+    }
+    pending[req_id] = rec
+    data["_pending"] = pending
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return rec
+
+
+def get_pending_approval(path: Path, request_id: str) -> dict[str, Any] | None:
+    rid = (request_id or "").strip().lower()
+    if not APPROVAL_REQ_ID_RE.fullmatch(rid):
+        return None
+    pending = load_human_approvals(path).get("_pending")
+    if not isinstance(pending, dict):
+        return None
+    rec = pending.get(rid)
+    return rec if isinstance(rec, dict) else None
+
+
+def extract_approval_request_id(text: str | None) -> str | None:
+    m = APPROVAL_REQ_LINE_RE.search(text or "")
+    return m.group(1).lower() if m else None
 
 
 def record_human_approval(

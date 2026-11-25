@@ -100,7 +100,7 @@ metadata:
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
 3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後依題型處理再呼叫 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
-   - **受保護檔合併核准題**：**只有使用者明確確認核准合併（選 A／同意）時**，先核對本次受審 PR 的完整 40 碼 `head_sha`（取自卡片 `metadata.head_sha` 或 `devflow check pr <board> <pr>`，不可猜測或省略），先執行 `terminal: devflow approve <board> <pr> --head <完整40碼SHA>` 記錄核准，再執行 `devflow answer`；若使用者拒絕或選 B 退回，**絕不執行 `devflow approve`**，直接以 `devflow answer` 交回拒絕回覆。
+   - **受保護檔合併核准題**：**只有使用者明確確認核准合併（選 A／同意）時**，從原提問的 `核准請求碼：`（或 `devflow pending` 的 `pending_approval.request_id`）取出原本向使用者確認的請求碼，執行 `terminal: devflow approve <board> <pr> --request <12碼核准請求碼>` 記錄核准，再執行 `devflow answer`（**嚴禁改查 `devflow check pr` 或 `gh pr view` 的最新 head 代填**，以免把原提交的同意套用到後推的新 commit；若 PR 已換新 head，`approve` 會直接拒絕，請重新向使用者確認）；若使用者拒絕或選 B 退回，**絕不執行 `devflow approve`**，直接以 `devflow answer` 交回拒絕回覆。
    - **計畫風險定錨題**：**只有使用者明確選擇核准目前計畫（選 B）時**，先從 `question` 的 `計畫雜湊：` 取得 12 碼雜湊，執行 `terminal: devflow approve-plan <board> <epic> --plan-hash <12碼雜湊>` 記錄明確同意，再執行 `devflow answer`；若使用者選擇調整縮減（選 A）或拒絕，**絕不執行 `devflow approve-plan`**，直接以 `devflow answer` 交回調整指示（調整消除風險前維持暫停出貨）。
    - **要使用者自己動手的題目**（設 secret、OAuth、在主機執行指令）：只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
@@ -135,7 +135,7 @@ metadata:
 | `devflow preflight SLUG [TASK] [--dir DIR]` | developer 送審前一站式確定性自檢：範圍（`Allowed-Scope`/`Out-of-Scope`）、變更檔數、保護檔 hash、PR 格式與快速測試 |
 | `devflow check pr SLUG PR` | PR 判斷：保護／gate 檔變更、EPIC 目標與 diff 範圍對齊（`out_of_scope_diff`）、review 往復熔斷與 Decisions 檢查 |
 | `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment、受保護檔人類 exact-head 核准（必要時 exit 6）與 EPIC 計畫風險定錨（必要時 exit 7）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
-| `devflow approve SLUG PR --head FULL_SHA [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准後，以完整 40 碼 SHA 記錄受保護檔 PR 的 exact-head 核准 |
+| `devflow approve SLUG PR --request REQ_ID [--head FULL_SHA] [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准後，以原提問的 `核准請求碼` 綁定原始確認提交並記錄 exact-head 核准（head 已變動即拒絕） |
 | `devflow approve-plan SLUG EPIC --plan-hash HASH [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准計畫風險（選 B）後，記錄該計畫雜湊的明確同意並解除 `[SHIP]` 暫停 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
