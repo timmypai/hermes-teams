@@ -775,6 +775,83 @@ class StandardDeliveryAndStability(unittest.TestCase):
         # Must not raise
         self.df.unsubscribe_idempotent("b", "t_1", "local", "chat1", "thr1")
 
+    def test_deploy_sh_pre_cutover_seed_filters_by_app_service_not_sidecar_or_db(self) -> None:
+        work = Path(tempfile.mkdtemp(prefix="devflow-deploy-seed-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        (work / ".devflow").mkdir()
+        (work / "deploy").mkdir()
+        shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+        (work / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=probe\nDEVFLOW_SERVICE=web\nDEVFLOW_PORT=18991\nDEVFLOW_APP_PORT=8080\nDEVFLOW_HEALTH_PATH=/health\n",
+            encoding="utf-8",
+        )
+        (work / "deploy" / "compose.yml").write_text("services:\n  web:\n    image: ${DEVFLOW_IMAGE}\n", encoding="utf-8")
+        for name, body in (
+            ("deploy-build.sh", "#!/usr/bin/env bash\nexit 0\n"),
+            ("capture.sh", "#!/usr/bin/env bash\nexit 0\n"),
+            ("verify.sh", "#!/usr/bin/env bash\nexit 1\n"),
+        ):
+            p = work / ".devflow" / name
+            p.write_text(body, encoding="utf-8")
+            p.chmod(0o755)
+        bin_dir = work / "bin"
+        bin_dir.mkdir()
+        calls_file = work / "calls.jsonl"
+        (bin_dir / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_dir / "curl").chmod(0o755)
+        (bin_dir / "docker").write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+calls = Path(os.environ["MOCK_CALLS"])
+with calls.open("a") as fh:
+    fh.write(json.dumps({"args": args, "sha": os.environ.get("DEVFLOW_SOURCE_SHA", "")}) + "\\n")
+if args[:2] == ["image", "inspect"]:
+    sys.exit(0 if Path(os.environ["MOCK_TAGGED"]).exists() else 1)
+if args[:1] == ["ps"]:
+    filters = [args[i + 1] for i, a in enumerate(args) if a == "--filter" and i + 1 < len(args)]
+    if "label=com.docker.compose.service=web" in filters:
+        print("cid-web-111111111111")
+    else:
+        print("cid-db-999999999999")
+        print("cid-web-111111111111")
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    cid = args[-1]
+    fmt = args[args.index("--format") + 1] if "--format" in args else ""
+    if cid == "cid-web-111111111111":
+        print("sha256:web-old-img" if fmt == "{{.Image}}" else "old-web-sha-1111111111111111111111111111")
+    else:
+        print("sha256:db-img" if fmt == "{{.Image}}" else "old-db-sha-99999999999999999999999999999")
+    sys.exit(0)
+if args[:1] == ["tag"]:
+    Path(os.environ["MOCK_TAGGED"]).write_text(args[1])
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        (bin_dir / "docker").chmod(0o755)
+        home = work / "home"
+        home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_SHA": "new-sha-22222222222222222222222222222222",
+            "MOCK_CALLS": str(calls_file),
+            "MOCK_TAGGED": str(work / "tagged"),
+        }
+        proc = subprocess.run(["bash", ".devflow/deploy.sh"], cwd=work, env=env, text=True, capture_output=True)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        records = [json.loads(line) for line in calls_file.read_text().splitlines()]
+        tag_calls = [r["args"] for r in records if r["args"][:1] == ["tag"]]
+        self.assertEqual(tag_calls, [["tag", "sha256:web-old-img", "devflow/probe:live"]])
+        rollback_ups = [r for r in records if r["args"][:1] == ["compose"] and "--no-build" in r["args"]]
+        self.assertTrue(rollback_ups, records)
+        self.assertEqual(rollback_ups[0]["sha"], "old-web-sha-1111111111111111111111111111")
+
 
 if __name__ == "__main__":
     unittest.main()

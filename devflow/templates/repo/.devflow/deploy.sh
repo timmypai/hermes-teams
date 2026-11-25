@@ -178,7 +178,9 @@ echo "::endgroup::"
 # 首次切換至公版 deploy.sh（尚未有 release 快照也尚未有 :live tag）：
 # 若同名 compose 專案已有執行中容器，先將其現行映像標為 :live 並記下 source SHA，失敗時可回滾。
 if [[ ! -f $LIVE/image ]] && ! docker image inspect "${REPO_IMAGE}:live" >/dev/null 2>&1; then
-  existing_cid=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" | head -n 1 || true)
+  existing_cid=$(docker ps -q \
+    --filter "label=com.docker.compose.project=$PROJECT" \
+    --filter "label=com.docker.compose.service=${DEVFLOW_SERVICE:-app}" | head -n 1 || true)
   if [[ -n "$existing_cid" ]]; then
     existing_img=$(docker inspect --format '{{.Image}}' "$existing_cid" 2>/dev/null || true)
     existing_sha=$(docker inspect --format '{{index .Config.Labels "io.devflow.source"}}' "$existing_cid" 2>/dev/null || true)
