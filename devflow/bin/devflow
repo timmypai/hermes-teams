@@ -1723,8 +1723,9 @@ BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
 
 def tick_key(board: str) -> str:
     """What a tick depends on: the board's files, pending PR judgments (written by workers while
-    kanban.db is idle), and the kit's own rules. A board idle since the last tick is skipped, but
-    not after a judgment write or a kit update."""
+    kanban.db is idle), runtime policy (`config.json`, `plan_risk_mode`, `auto_flow_adj`), and the
+    kit's own rules. A board idle since the last tick is skipped, but not after a judgment write,
+    policy change, or kit update."""
     import hashlib
     board_mtime = 0.0
     for p in (BOARDS / board).glob("kanban.db*"):
@@ -1733,8 +1734,16 @@ def tick_key(board: str) -> str:
     j_mtime = 0.0
     with suppress(FileNotFoundError):
         j_mtime = JUDGMENTS.stat().st_mtime
-    kit = hashlib.sha1(Path(__file__).resolve().read_bytes() + (ROOT / "roles.json").read_bytes()).hexdigest()[:12]
-    return f"{board_mtime}:{j_mtime}:{kit}"
+    h = hashlib.sha1()
+    h.update(Path(__file__).resolve().read_bytes())
+    h.update((ROOT / "roles.json").read_bytes())
+    cfg_path = ROOT / "config.json"
+    if cfg_path.is_file():
+        with suppress(OSError):
+            h.update(cfg_path.read_bytes())
+    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+    h.update(f"\x00risk_mode={risk_mode}\x00auto_flow_adj={int(AUTO_FLOW_ADJ)}".encode())
+    return f"{board_mtime}:{j_mtime}:{h.hexdigest()[:12]}"
 
 
 def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
@@ -1751,6 +1760,8 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
         elif card_type(c["title"]) == "SHIP":
             row.append(c.get("status") in SHIP_PENDING)
         rows.append(row)
+    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+    rows.append(["__policy__", risk_mode])
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 
 

@@ -352,6 +352,81 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(cm_rearmed.exception.code, 6)
         self.assertEqual(f.merges, [])
 
+    def test_enabling_plan_risk_mode_invalidates_cached_plan_and_tick_key_and_gates_ship(self) -> None:
+        self.df.AUTO_PLAN_ADVISOR = False
+        self.df.PLAN_RISK_MODE = "off"
+        self.df.HERMES_PY = "/nonexistent-hermes-py"
+        self.df.deploy_readiness = lambda slug: []
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+
+        db = self.root / "data" / "kanban" / "boards" / "b" / "kanban.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        epic_body = "## 目標\ng\n## 驗收\n- AC-1 [cli] ok\n  - S1 s\n    - Given g\n    - When w\n    - Then t\n"
+        with closing(sqlite3.connect(db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                    workspace_kind TEXT, workspace_path TEXT, completion_contract TEXT,
+                    created_by TEXT, result TEXT, goal_mode INTEGER NOT NULL DEFAULT 0,
+                    block_kind TEXT
+                );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER
+                );
+            """)
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+                ("t_ep1", "[EPIC] e", epic_body, "todo", "orchestrator", "dir", str(self.root / "repo"),
+                 None, "default", None, 0, None),
+                ("t_sh1", "[SHIP] s", "覆蓋：AC-1\nEPIC: t_ep1\n", "todo", "devops", "dir", str(self.root / "repo"),
+                 None, "orchestrator", None, 0, None),
+            ])
+            c.execute("INSERT INTO task_links VALUES ('t_sh1', 't_ep1')")
+
+        def fake_kanban(board, cmd, *args):
+            if cmd == "list":
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    return json.dumps([dict(r) for r in c.execute("SELECT id, title, assignee, status FROM tasks")])
+            if cmd == "show":
+                tid = args[0]
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    t = dict(c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    parents = [r[0] for r in c.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
+                    children = [r[0] for r in c.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (tid,))]
+                return json.dumps({"task": t, "parents": parents, "children": children, "comments": []})
+            if cmd == "comment":
+                return ""
+            raise AssertionError((cmd, args))
+
+        self.df.kanban = fake_kanban
+        calls: list[list[str]] = []
+        self.df.decide = lambda content, qs: calls.append([q["name"] for q in qs]) or {
+            q["name"]: {"probability": 0.9 if q["name"] == "scope_creep" else 0.05} for q in qs
+        }
+
+        # 1. Tick while plan_risk_mode="off": caches plan without calling LLM.
+        st: dict = {}
+        key_off = self.df.tick_key("b")
+        self.df.tick_board("b", st)
+        self.assertEqual(calls, [])
+        self.assertIn("t_ep1", st.get("plans") or {})
+
+        # 2. Switch policy off -> needs_input on the EXACT SAME unchanged plan.
+        self.df.PLAN_RISK_MODE = "needs_input"
+        key_on = self.df.tick_key("b")
+        self.assertNotEqual(key_off, key_on)
+        self.df.tick_board("b", st)
+        self.assertEqual(len(calls), 1)
+        with closing(sqlite3.connect(db)) as c:
+            states = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
+        self.assertEqual(states["t_ep1"], "blocked:needs_input")
+        self.assertEqual(states["t_sh1"], "blocked:dependency")
+
 
 class DocAndContractConsistency(unittest.TestCase):
     """Ensure souls/, skills/, README.md, and bin/devflow never drift back to contradictory legacy rules."""
