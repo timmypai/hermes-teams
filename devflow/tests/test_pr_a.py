@@ -413,6 +413,51 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(cm_rearmed.exception.code, 7)
         self.assertEqual(f.merges, [])
 
+        # 5a. Stale approval cannot authorize a live plan that changed BEFORE the next tick ran:
+        #     Approve current rhash2, then mutate t_dev2 body directly in SQLite (simulating an edit before tick).
+        #     Both `cmd_ship_merge` (against live plan) and `cmd_approve_plan` (with stale hash) MUST fail closed!
+        rhash2 = self.df.load_plan_risk_state()["b/t_ep1"]["rhash"]
+        with redirect_stdout(io.StringIO()):
+            self.df.cmd_approve_plan(SimpleNamespace(board="b", epic="t_ep1", plan_hash=rhash2, note="ok2", by="timmy"))
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'todo', block_kind = NULL WHERE id = 't_ep1'")
+            c.execute("UPDATE tasks SET body = body || '\n新增另一個未要求模組\n' WHERE id = 't_dev2'")
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm_stale_live:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertEqual(cm_stale_live.exception.code, 7)
+        self.assertEqual(f.merges, [])
+        with self.assertRaises(SystemExit) as cm_stale_approve:
+            self.df.cmd_approve_plan(SimpleNamespace(board="b", epic="t_ep1", plan_hash=rhash2, note="stale", by="timmy"))
+        self.assertEqual(cm_stale_approve.exception.code, 1)
+
+        # 5b. Adding `- 核准計畫風險：t_ep1 <live_hash>` to EPIC `## 使用者決定` MUST NOT mutate the plan hash
+        #     and MUST authorize `cmd_ship_merge` cleanly!
+        live_cards = self.df.plan_cards("b", "t_ep1")
+        live_hash = self.df.plan_risk_fingerprint("t_ep1", live_cards, self.df.load_plan_risk_state()["b/t_ep1"]["gating"])
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET body = body || ? WHERE id = 't_ep1'",
+                      (f"\n## 使用者決定\n- 核准計畫風險：t_ep1 {live_hash}\n",))
+        live_cards_after = self.df.plan_cards("b", "t_ep1")
+        self.assertEqual(
+            self.df.plan_risk_fingerprint("t_ep1", live_cards_after, self.df.load_plan_risk_state()["b/t_ep1"]["gating"]),
+            live_hash,
+        )
+        buf_dir_ok = io.StringIO()
+        with redirect_stdout(buf_dir_ok):
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertTrue(json.loads(buf_dir_ok.getvalue())["merged"])
+
+        # 5c. Stale `plan_risk_holds` bookkeeping MUST NEVER release a [SHIP] blocked on an UNRELATED dependency!
+        resumed.clear()
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = 't_sh1'")
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 9999)",
+                ("t_sh1", json.dumps({"kind": "dependency", "reason": "等待另一個不相關的父卡 t_other"}, ensure_ascii=False)),
+            )
+        self.df.release_plan_risk_holds("b", "t_ep1", self.df.plan_cards("b", "t_ep1"), {"plan_risk_holds": {"t_ep1": ["t_sh1"]}})
+        self.assertEqual(resumed, [])
+
     def test_enabling_plan_risk_mode_invalidates_cached_plan_and_tick_key_and_gates_ship(self) -> None:
         self.df.AUTO_PLAN_ADVISOR = False
         self.df.PLAN_RISK_MODE = "off"
