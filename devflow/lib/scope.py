@@ -75,15 +75,44 @@ def touched_paths(files: list[dict]) -> list[str]:
     return sorted(set(paths))
 
 
+_BROAD_WILDCARD_RE = re.compile(r"^(?:\*+(?:/\*+)*|\*\*+(?:/\*+(?:\.\*)?)?)$")
+
+
+def is_overly_broad_scope(pattern: str) -> bool:
+    """True when an `Allowed-Scope` pattern matches the entire repo (e.g. `*`, `**`, `**/*`, `.`)."""
+    p = (pattern or "").strip().strip("`").lstrip("./").rstrip("/")
+    if p in ("", ".", "*", "**", "**/*", "**/*.*"):
+        return True
+    return bool(_BROAD_WILDCARD_RE.fullmatch(p))
+
+
+def allowed_scope_problems(allowed_scope: list[str] | None, *, required: bool = True) -> list[str]:
+    """Validate declared `Allowed-Scope:` entries on a work card."""
+    items = [p.strip() for p in (allowed_scope or []) if p and p.strip()]
+    if not items:
+        if required:
+            return ["缺少 `Allowed-Scope:` 宣告（請列出本卡預期改動的目錄或檔案 glob，避免範圍外擴）"]
+        return []
+    broad = [p for p in items if is_overly_broad_scope(p)]
+    if broad:
+        return [
+            f"`Allowed-Scope:` 過寬（{', '.join(broad)}），不得使用全專案萬用模式；請縮小到實際要改動的目錄或檔案"
+        ]
+    return []
+
+
 def check_files_against_scope(
     filenames: list[str],
     *,
     allowed_scope: list[str] | None = None,
     out_of_scope: list[str] | None = None,
+    test_paths: list[str] | None = None,
     max_diff_files: int | None = None,
     file_count: int | None = None,
 ) -> list[str]:
-    """Deterministic diff scope checks: Out-of-Scope forbidden, Allowed-Scope bounded, file count capped."""
+    """Deterministic diff scope checks: Out-of-Scope forbidden, Allowed-Scope bounded, file count capped.
+    Declared `test_paths` (`DEVFLOW_TEST_PATHS`) are exempted alongside `allowed_scope` but NEVER
+    override `out_of_scope`."""
     findings: list[str] = []
     files = sorted(set(filenames))
     if out_of_scope:
@@ -94,10 +123,13 @@ def check_files_against_scope(
                 + (f" 等共 {len(violated)} 檔" if len(violated) > 10 else "")
             )
     if allowed_scope:
-        # Allow standard test/lesson/scenario paths alongside declared Allowed-Scope unless explicitly forbidden
+        extra_tests = [p.strip() for p in (test_paths or []) if p and p.strip()]
+        # Allow declared DEVFLOW_TEST_PATHS and standard lesson/scenario paths alongside Allowed-Scope
+        # (Out-of-Scope above still strictly forbids matching paths).
         outside = [
             f for f in files
             if not any(match_glob(f, pat) for pat in allowed_scope)
+            and not any(match_glob(f, pat) for pat in extra_tests)
             and not f.startswith((".devflow/lessons/", ".devflow/scenarios.json"))
         ]
         if outside:

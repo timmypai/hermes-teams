@@ -69,7 +69,7 @@ dispatcher 下一個 tick（約 1 分鐘）由 `devflow tick` 依序執行，結
 4. 建卡：
    ```
    kanban_create(title="[DEV] <白話標題：做什麼事>", assignee="developer", workspace_kind="worktree", goal_mode=true,
-                 parents=[...], body="## 目標\n<1-2 句白話：達成什麼使用者看得到的結果>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\nAllowed-Scope: <預期改動目錄或模組 glob，選填>\nOut-of-Scope: <禁止碰的區域 glob，選填>\nVerify: <針對性快測指令，選填>\nEPIC: t_xxxx",
+                 parents=[...], body="## 目標\n<1-2 句白話：達成什麼使用者看得到的結果>\n## 本卡完成\n完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。\n## 驗收\n覆蓋：AC-1, AC-3\nAllowed-Scope: <預期改動目錄或模組 glob，必填，不得填 * 或 **>\nOut-of-Scope: <禁止碰的區域 glob，選填>\nVerify: <針對性快測指令，選填>\nEPIC: t_xxxx",
                  skills=[選用，例如 "tdd"])
    ```
    建卡前可用 `devflow check card --title "..." --assignee ... --workspace ...` 先做確定性格式與 body 乾淨度檢查（fail fast，不等 tick）。

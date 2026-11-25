@@ -521,7 +521,7 @@ def cmd_contract(a) -> None:
     if drift:
         print("differs from current template (merge by hand, keep project changes; template: "
               f"{TEMPLATE}): " + ", ".join(drift))
-    if not (dest / "Dockerfile").exists() and "DEVFLOW_DEPLOY=false" not in (dest / ".devflow/config.env").read_text():
+    if not (dest / "Dockerfile").exists() and policy_lib.repo_deploys(policy_lib.load_repo_config(dest)):
         print("note: no Dockerfile yet — write one, or set DEVFLOW_DEPLOY=false")
 
 
@@ -696,7 +696,7 @@ def deploy_readiness(slug: str) -> list[dict]:
 
     cfg_text = branch_file(repo, branch, ".devflow/config.env")
     cfg = env_values(cfg_text or "")
-    deploys = cfg.get("DEVFLOW_DEPLOY", "true") != "false"
+    deploys = policy_lib.repo_deploys(cfg)
     tree = gh_json(["api", f"repos/{repo}/git/trees/{branch}?recursive=1"], check=False) or {}
     paths = {t["path"] for t in tree.get("tree", [])}
     need = [".devflow/config.env", ".devflow/test.sh", ".devflow/verify.sh", ".github/workflows/ci.yml"]
@@ -1004,7 +1004,13 @@ def repo_scenarios_for_rev(board: str, repo: str | None, epic: str, rev: str | N
     return {}, f"無法從本機 git 解析 commit {rev[:12]} 的 .devflow/scenarios.json"
 
 
-def repo_scenarios(board: str, epic: str, *, cards: dict[str, dict] | None = None) -> dict[str, list[dict]]:
+def repo_scenarios(
+    board: str,
+    epic: str,
+    *,
+    cards: dict[str, dict] | None = None,
+    extra_dirs: list[Path] | None = None,
+) -> dict[str, list[dict]]:
     """Load Given/When/Then scenarios from `<repo>/.devflow/scenarios.json` (or an active card worktree on
     the board during planning) so the EPIC Kanban card can stay a concise list of AC outcomes."""
     st = load_state()
@@ -1013,11 +1019,18 @@ def repo_scenarios(board: str, epic: str, *, cards: dict[str, dict] | None = Non
         with suppress(SystemExit, Exception):
             cards = plan_cards(board, epic)
     worktrees = _candidate_worktrees(board, cards)
-    merged: dict[str, list[dict]] = {}
-    seen_sids: set[str] = set()
-    for d in ([*worktrees, main_dir] if main_dir else worktrees):
+    search_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for d in [*(extra_dirs or []), *worktrees, *([main_dir] if main_dir else [])]:
         if not d:
             continue
+        rp = Path(d).resolve()
+        if rp not in seen_dirs:
+            seen_dirs.add(rp)
+            search_dirs.append(rp)
+    merged: dict[str, list[dict]] = {}
+    seen_sids: set[str] = set()
+    for d in search_dirs:
         path = d / ".devflow" / "scenarios.json"
         if not path.is_file():
             continue
@@ -1033,12 +1046,19 @@ def repo_scenarios(board: str, epic: str, *, cards: dict[str, dict] | None = Non
     return merged
 
 
-def epic_acceptance_spec(board: str, epic: str, body: str, *, cards: dict[str, dict] | None = None) -> list[dict]:
+def epic_acceptance_spec(
+    board: str,
+    epic: str,
+    body: str,
+    *,
+    cards: dict[str, dict] | None = None,
+    extra_dirs: list[Path] | None = None,
+) -> list[dict]:
     """`acceptance_spec(epic, body)` hydrated with `<repo>/.devflow/scenarios.json` for any non-manual AC
     that keeps its Given/When/Then steps in the repo instead of inlining them on the human-facing EPIC card."""
     spec = acceptance_spec(epic, body)
     if any(a["type"] != "manual" and not a["scenarios"] for a in spec):
-        from_repo = repo_scenarios(board, epic, cards=cards)
+        from_repo = repo_scenarios(board, epic, cards=cards, extra_dirs=extra_dirs)
         for a in spec:
             if a["type"] != "manual" and not a["scenarios"] and a["ac"] in from_repo:
                 a["scenarios"] = list(from_repo[a["ac"]])
@@ -1161,8 +1181,7 @@ def goal_modes(board: str, ids: list[str]) -> set[str]:
 
 
 def repo_deploys(board: str) -> bool:
-    cfg = Path(entry(board)["path"]) / ".devflow" / "config.env"
-    return not (cfg.exists() and re.search(r"^DEVFLOW_DEPLOY=false\s*$", cfg.read_text(), re.M))
+    return policy_lib.repo_deploys(policy_lib.load_repo_config(entry(board).get("path")))
 
 
 # The goal judge (Hermes tools/kanban_tools.py `_goal_gate`) runs when a goal-mode worker calls
@@ -1231,6 +1250,7 @@ MAX_DIFF_FILES = int(POLICY["max_diff_files"])
 AUTO_PLAN_ADVISOR = bool(POLICY.get("auto_plan_advisor", False))
 PLAN_RISK_MODE = policy_lib.effective_plan_risk_mode(POLICY)
 AUTO_FLOW_ADJ = bool(POLICY.get("auto_flow_adj", False))
+REQUIRE_ALLOWED_SCOPE = bool(POLICY.get("require_allowed_scope", True))
 
 
 def adj_targets(title: str, body: str | None) -> set[str]:
@@ -1388,6 +1408,10 @@ def approved_ship_patches(epic_body: str | None) -> set[tuple[str, str]]:
 
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     e = entry(board)
+    repo_cfg = policy_lib.load_repo_config(e.get("path"))
+    req_scope = policy_lib.repo_require_allowed_scope(
+        repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
+    )
     found: list[str] = []
     feeds = set()  # cards on a parent path into the EPIC
     stack = list(cards[epic]["parents"])
@@ -1460,6 +1484,9 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
             if (why := done_problem(c["title"], c["body"])):
                 found.append(f"{tid}: [{kind}] {why}")
+            card_contract = scope_lib.parse_card_contract(c["body"])
+            for scope_prob in scope_lib.allowed_scope_problems(card_contract["allowed_scope"], required=req_scope):
+                found.append(f"{tid}: [{kind}] {scope_prob}")
             covered = list(dict.fromkeys(
                 ac for m in COVER_LINE.finditer(c["body"] or "") for ac in re.findall(r"\bAC-\d+\b", m.group(0))
                 if ac in ac_types))
@@ -1728,28 +1755,43 @@ BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
 
 
 def tick_key(board: str) -> str:
-    """What a tick depends on: the board's files, pending PR judgments (written by workers while
-    kanban.db is idle), runtime policy (`config.json`, `plan_risk_mode`, `auto_flow_adj`), and the
-    kit's own rules. A board idle since the last tick is skipped, but not after a judgment write,
-    policy change, or kit update."""
+    """What a tick depends on: the board's files, pending PR judgments/approvals/plan-risk state
+    (written while kanban.db is idle), runtime policy, and the kit's own code/lib/templates."""
     import hashlib
     board_mtime = 0.0
     for p in (BOARDS / board).glob("kanban.db*"):
         with suppress(FileNotFoundError):  # SQLite removes -wal/-shm between glob and stat
             board_mtime = max(board_mtime, p.stat().st_mtime)
     j_mtime = 0.0
-    for p in (JUDGMENTS, PLAN_RISK_STATE):
+    for p in (JUDGMENTS, PLAN_RISK_STATE, HUMAN_APPROVALS):
         with suppress(FileNotFoundError):
             j_mtime = max(j_mtime, p.stat().st_mtime)
     h = hashlib.sha1()
     h.update(Path(__file__).resolve().read_bytes())
+    seen_libs: set[Path] = set()
+    for lib_dir in (_KIT_DIR / "lib", ROOT / "lib"):
+        if not lib_dir.is_dir():
+            continue
+        for lp in sorted(lib_dir.glob("*.py")):
+            rp = lp.resolve()
+            if rp in seen_libs:
+                continue
+            seen_libs.add(rp)
+            with suppress(OSError):
+                h.update(b"\x00lib:" + lp.name.encode() + b"\x00")
+                h.update(lp.read_bytes())
     h.update((ROOT / "roles.json").read_bytes())
     cfg_path = ROOT / "config.json"
     if cfg_path.is_file():
         with suppress(OSError):
             h.update(cfg_path.read_bytes())
+    if tpl_digest := standard_lib.templates_digest(TEMPLATE):
+        h.update(f"\x00templates={tpl_digest}".encode())
     risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
-    h.update(f"\x00risk_mode={risk_mode}\x00auto_flow_adj={int(AUTO_FLOW_ADJ)}".encode())
+    h.update(
+        f"\x00risk_mode={risk_mode}\x00auto_flow_adj={int(AUTO_FLOW_ADJ)}"
+        f"\x00req_scope={int(REQUIRE_ALLOWED_SCOPE)}\x00max_rev={MAX_REVIEW_ROUNDS}\x00max_cards={MAX_EPIC_CARDS}".encode()
+    )
     return f"{board_mtime}:{j_mtime}:{h.hexdigest()[:12]}"
 
 
@@ -1768,7 +1810,7 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
             row.append(c.get("status") in SHIP_PENDING)
         rows.append(row)
     risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
-    rows.append(["__policy__", risk_mode])
+    rows.append(["__policy__", risk_mode, int(REQUIRE_ALLOWED_SCOPE), MAX_REVIEW_ROUNDS, MAX_EPIC_CARDS])
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -3711,7 +3753,18 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
             if not tip:
                 common.append(f"讀不到 {branch} 的最新 commit")
             elif r is None:
-                common.append(f"找不到 {branch} 最新 commit {tip[:12]} 的 deploy.yml run（push 或 workflow_dispatch）")
+                local_cfg = policy_lib.load_repo_config(entry(board).get("path"))
+                live_cfg_text = None
+                with suppress(SystemExit, Exception):
+                    live_cfg_text = branch_file(repo, tip, ".devflow/config.env")
+                eff_cfg = env_values(live_cfg_text) if live_cfg_text is not None else local_cfg
+                if policy_lib.repo_deploy_manual_only(eff_cfg):
+                    common.append(
+                        f"找不到 {branch} 最新 commit {tip[:12]} 的 deploy.yml run（本 repo 設為 DEVFLOW_DEPLOY_MANUAL_ONLY=true，"
+                        f"merge 不自動部署；需經授權手動觸發 `gh workflow run deploy.yml -R {repo} --ref {branch}` 後再驗收）"
+                    )
+                else:
+                    common.append(f"找不到 {branch} 最新 commit {tip[:12]} 的 deploy.yml run（push 或 workflow_dispatch）")
             elif r.get("status") != "completed":
                 common.append(f"{branch} 最新 commit {tip[:12]} 的部署 run {r['id']} 還在 {r.get('status')}，完成後再驗收")
             elif r.get("conclusion") != "success":
@@ -4094,6 +4147,7 @@ def judgment_fingerprint(
     cfg = repo_cfg or {}
     base_fp = pr["fingerprint"]
     extra_protected = sorted(policy_lib.repo_protected_paths(cfg))
+    test_paths = sorted(policy_lib.repo_test_paths(cfg))
     max_files = policy_lib.repo_max_diff_files(cfg, POLICY)
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
     manual_only = policy_lib.repo_deploy_manual_only(cfg)
@@ -4101,6 +4155,7 @@ def judgment_fingerprint(
     if (
         goal_context is None
         and not extra_protected
+        and not test_paths
         and max_files == default_max
         and not manual_only
         and not allow_custom
@@ -4117,6 +4172,8 @@ def judgment_fingerprint(
         "standard_templates": templates_digest,
         "standard_schema": 1 if templates_digest else 0,
     }
+    if test_paths:
+        governing["test_paths"] = test_paths
     return hashlib.sha1(json.dumps(governing, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -4130,9 +4187,18 @@ def resolve_pr_judgment_inputs(board: str, repo: str, number: int, pr: dict) -> 
 
 
 def review_loop_status(board: str, repo: str, number: int, tid: str | None = None) -> dict:
-    """Check whether review rejections on this PR/card hit the configured loop breaker."""
+    """Check whether review rejections on this PR/card hit the configured loop breaker (strictly
+    counting rejections after any completed [ADJ] or human needs_input/capability intervention)."""
+    from datetime import datetime, timezone
+    since_iso: str | None = None
+    if tid:
+        _, wm_ts = kanban_adapter.card_review_reset_watermark(BOARDS, board, tid)
+        if wm_ts > 0.0:
+            since_iso = datetime.fromtimestamp(wm_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        gh_rej, approved_latest = breakers.count_review_rejections(pr_reviews(repo, number), gh_login("reviewer"))
+        gh_rej, approved_latest = breakers.count_review_rejections(
+            pr_reviews(repo, number), gh_login("reviewer"), since_iso=since_iso
+        )
     except (SystemExit, Exception):  # noqa: BLE001 - fail open on lookup error here; review_problem enforces approval
         gh_rej, approved_latest = 0, False
     kb_rej = kanban_adapter.card_changes_requested_count(BOARDS, board, tid) if tid else 0
@@ -4141,6 +4207,7 @@ def review_loop_status(board: str, repo: str, number: int, tid: str | None = Non
         kanban_rejections=kb_rej,
         approved_latest=approved_latest,
         max_rounds=MAX_REVIEW_ROUNDS,
+        reset_at=since_iso,
     )
 
 
@@ -4200,6 +4267,7 @@ def judge(pr: dict, files: list[dict], *, goal_context: dict | None = None, repo
             scope_lib.touched_paths(files),
             allowed_scope=goal_context.get("allowed_scope"),
             out_of_scope=goal_context.get("out_of_scope"),
+            test_paths=policy_lib.repo_test_paths(repo_cfg or {}),
             max_diff_files=policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY),
             file_count=len(files),
         ))
@@ -4836,8 +4904,16 @@ def cmd_ship_merge(a) -> None:
     if p.returncode != 0:
         die(f"未合併：gh pr merge 失敗：{(p.stderr or p.stdout).strip()[-400:]}")
     done = pr_meta(repo, a.pr)
-    print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
-                      "merge_method": merge_method, "fingerprint": rec["fingerprint"], "advisor": rec.get("advisor"),
+    merged_sha = (done.get("mergeCommit") or {}).get("oid")
+    post_cfg = repo_cfg
+    if merged_sha:
+        with suppress(SystemExit, Exception):
+            if live_txt := branch_file(repo, merged_sha, ".devflow/config.env"):
+                post_cfg = env_values(live_txt)
+    print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": merged_sha,
+                      "merge_method": merge_method, "deploys": policy_lib.repo_deploys(post_cfg),
+                      "deploy_manual_only": policy_lib.repo_deploy_manual_only(post_cfg),
+                      "fingerprint": rec["fingerprint"], "advisor": rec.get("advisor"),
                       **({"human_approval": approval_source} if approval_source else {}),
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
@@ -4847,21 +4923,47 @@ def cmd_preflight(a) -> None:
     e = entry(a.slug)
     repo_dir = Path(a.dir).resolve()
     base_ref = a.base or f"origin/{e['default_branch']}"
-    card_body, epic_id, valid_scenarios = None, None, None
+    card_body, card_title, epic_id, valid_scenarios = None, None, None, None
+    extra_findings: list[str] = []
+    review_loop: dict | None = None
     if a.task and (BOARDS / e["slug"] / "kanban.db").exists():
-        rows = board_rows(e["slug"], "SELECT id, body FROM tasks WHERE id = ?", (a.task,))
+        cols = {r["name"] for r in board_rows(e["slug"], "PRAGMA table_info(tasks)")}
+        sel = "id, body" + (", title" if "title" in cols else "")
+        rows = board_rows(e["slug"], f"SELECT {sel} FROM tasks WHERE id = ?", (a.task,))
         if rows:
             card_body = rows[0].get("body") or ""
+            card_title = rows[0].get("title") or ""
             if m := EPIC_REF.search(card_body):
                 epic_id = m.group(1)
                 epics = board_rows(e["slug"], "SELECT body FROM tasks WHERE id = ?", (epic_id,))
                 if epics:
-                    spec = epic_acceptance_spec(e["slug"], epic_id, epics[0].get("body") or "")
+                    spec = epic_acceptance_spec(
+                        e["slug"], epic_id, epics[0].get("body") or "", extra_dirs=[repo_dir]
+                    )
                     valid_scenarios = {s["id"] for ac in spec for s in ac["scenarios"]}
+                    local_sc_path = repo_dir / ".devflow" / "scenarios.json"
+                    if local_sc_path.is_file():
+                        try:
+                            raw_sc = json.loads(local_sc_path.read_text(encoding="utf-8"))
+                            if not isinstance(raw_sc, dict):
+                                raise ValueError("root must be a JSON object")
+                            local_by_ac = _parse_repo_scenarios(raw_sc, epic_id)
+                        except (OSError, ValueError) as err:
+                            extra_findings.append(f"本機 worktree 的 .devflow/scenarios.json 無法解析：{err}")
+                        else:
+                            non_manual_acs = {ac["ac"] for ac in spec if ac["type"] != "manual"}
+                            for ac_id, scs in local_by_ac.items():
+                                if ac_id in non_manual_acs:
+                                    valid_scenarios.update(s["id"] for s in scs)
+        cr_count = kanban_adapter.card_changes_requested_count(BOARDS, e["slug"], a.task)
+        review_loop = breakers.review_round_breaker(
+            github_rejections=0, kanban_rejections=cr_count, approved_latest=False, max_rounds=MAX_REVIEW_ROUNDS
+        )
     pr_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
+    require_scope_for_card = (not card_title) or (card_type(card_title) in ("DEV", "OPS"))
     rep = preflight_lib.run_preflight(
         repo_dir,
-        policy=POLICY,
+        policy={**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE},
         base_ref=base_ref,
         card_body=card_body,
         epic_id=epic_id,
@@ -4871,6 +4973,9 @@ def cmd_preflight(a) -> None:
         run_tests=not a.no_test,
         allow_dirty=a.allow_dirty,
         template_dir=TEMPLATE if TEMPLATE.is_dir() else None,
+        review_loop=review_loop,
+        extra_findings=extra_findings or None,
+        require_scope_for_card=require_scope_for_card,
     )
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     if not rep["ok"]:
@@ -4882,6 +4987,12 @@ def cmd_check_card(a) -> None:
     body = Path(a.body_file).read_text(encoding="utf-8") if a.body_file else (a.body if a.body is not None else sys.stdin.read())
     kind = card_type(a.title)
     findings: list[str] = []
+    contract = scope_lib.parse_card_contract(body)
+    board_arg = getattr(a, "board", None)
+    repo_cfg = policy_lib.load_repo_config(entry(board_arg).get("path")) if board_arg else {}
+    req_scope = policy_lib.repo_require_allowed_scope(
+        repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
+    )
     if kind not in CARDS:
         findings.append(f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]")
     else:
@@ -4893,9 +5004,9 @@ def cmd_check_card(a) -> None:
         if kind in ("DEV", "OPS"):
             if why := done_problem(a.title, body):
                 findings.append(why)
+            findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
         if why := body_problem(kind, a.title, body):
             findings.append(why)
-    contract = scope_lib.parse_card_contract(body)
     print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
                      ensure_ascii=False, indent=2))
     if findings:
@@ -4963,6 +5074,7 @@ def main() -> None:
     p = check.add_parser("card", help="fail-fast schema & body hygiene check before creating or editing a Kanban card")
     p.add_argument("--title", required=True); p.add_argument("--body"); p.add_argument("--body-file")
     p.add_argument("--assignee"); p.add_argument("--workspace")
+    p.add_argument("--board", help="optional repo slug to apply repo-specific .devflow/config.env policy")
     p.set_defaults(fn=cmd_check_card)
     p = sub.add_parser("preflight", help="developer pre-flight deterministic checks before pushing PR or requesting review")
     p.add_argument("slug"); p.add_argument("task", nargs="?")

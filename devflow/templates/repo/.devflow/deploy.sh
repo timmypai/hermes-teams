@@ -15,9 +15,10 @@ set -a; . .devflow/config.env; set +a
 _deploy_flag="${DEVFLOW_DEPLOY:-true}"
 _deploy_flag="${_deploy_flag#"${_deploy_flag%%[![:space:]]*}"}"
 _deploy_flag="${_deploy_flag%"${_deploy_flag##*[![:space:]]}"}"
-if [[ "${_deploy_flag,,}" == "false" ]]; then
-  echo "DEVFLOW_DEPLOY=false; skip deploy"; exit 0
-fi
+case "${_deploy_flag,,}" in
+  false|0|no|off)
+    echo "DEVFLOW_DEPLOY=${_deploy_flag}; skip deploy"; exit 0 ;;
+esac
 
 : "${DEVFLOW_APP:?}" "${DEVFLOW_PORT:?}"
 SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"

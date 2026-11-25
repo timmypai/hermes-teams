@@ -21,7 +21,8 @@
     "auto_plan_advisor": false,
     "plan_risk_mode": "off",
     "auto_flow_adj": false,
-    "require_human_approval_for_protected": true
+    "require_human_approval_for_protected": true,
+    "require_allowed_scope": true
   },
   "worker_config": {
     "agent.max_turns": "150",

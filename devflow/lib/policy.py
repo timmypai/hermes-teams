@@ -36,6 +36,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "plan_risk_mode": "off",
     "auto_flow_adj": False,
     "require_human_approval_for_protected": True,
+    "require_allowed_scope": True,
 }
 
 
@@ -89,6 +90,7 @@ def load_policy(root: Path, roles: dict[str, Any]) -> dict[str, Any]:
         ("DEVFLOW_AUTO_PLAN_ADVISOR", "auto_plan_advisor"),
         ("DEVFLOW_AUTO_FLOW_ADJ", "auto_flow_adj"),
         ("DEVFLOW_REQUIRE_HUMAN_APPROVAL_FOR_PROTECTED", "require_human_approval_for_protected"),
+        ("DEVFLOW_REQUIRE_ALLOWED_SCOPE", "require_allowed_scope"),
     ):
         raw = os.environ.get(env_key, "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
@@ -145,6 +147,20 @@ def repo_protected_paths(repo_cfg: dict[str, str]) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
+def repo_test_paths(repo_cfg: dict[str, str]) -> list[str]:
+    """Optional comma-separated declared test path globs from `.devflow/config.env` (`DEVFLOW_TEST_PATHS`)."""
+    raw = (repo_cfg.get("DEVFLOW_TEST_PATHS") or "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def repo_deploys(repo_cfg: dict[str, str]) -> bool:
+    """Single source of truth for whether a repo deploys via `deploy.yml` (default True)."""
+    raw = (repo_cfg.get("DEVFLOW_DEPLOY") or "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def repo_max_diff_files(repo_cfg: dict[str, str], policy: dict[str, Any]) -> int:
     raw = (repo_cfg.get("DEVFLOW_MAX_DIFF_FILES") or "").strip()
     if raw.isdigit() and int(raw) > 0:
@@ -157,11 +173,21 @@ def repo_review_test_cmd(repo_cfg: dict[str, str]) -> str:
 
 
 def repo_deploy_manual_only(repo_cfg: dict[str, str]) -> bool:
-    return (repo_cfg.get("DEVFLOW_DEPLOY_MANUAL_ONLY") or "").strip().lower() in ("1", "true", "yes")
+    return (repo_cfg.get("DEVFLOW_DEPLOY_MANUAL_ONLY") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def repo_allow_custom_delivery(repo_cfg: dict[str, str]) -> bool:
-    return (repo_cfg.get("DEVFLOW_ALLOW_CUSTOM_DELIVERY") or "").strip().lower() in ("1", "true", "yes")
+    return (repo_cfg.get("DEVFLOW_ALLOW_CUSTOM_DELIVERY") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def repo_require_allowed_scope(repo_cfg: dict[str, str], policy: dict[str, Any]) -> bool:
+    """Whether open [DEV]/[OPS] cards must declare a bounded `Allowed-Scope:`."""
+    raw = (repo_cfg.get("DEVFLOW_REQUIRE_ALLOWED_SCOPE") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(policy.get("require_allowed_scope", True))
 
 
 def repo_require_human_approval(repo_cfg: dict[str, str], policy: dict[str, Any]) -> bool:

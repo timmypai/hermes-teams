@@ -707,7 +707,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
             c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
                 ("t_ep1", "[EPIC] e", epic_body, "todo", "orchestrator", "dir", str(self.root / "repo"),
                  None, "default", None, 0, None),
-                ("t_dev1", "[DEV] d1", "覆蓋：AC-1\nEPIC: t_ep1\nPlan v1 risky\n", "todo", "developer", "worktree",
+                ("t_dev1", "[DEV] d1", "覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nPlan v1 risky\n", "todo", "developer", "worktree",
                  str(self.root / "repo"), None, "orchestrator", None, 1, None),
                 ("t_sh1", "[SHIP] s", "覆蓋：AC-1\nEPIC: t_ep1\n", "todo", "devops", "dir", str(self.root / "repo"),
                  None, "orchestrator", None, 0, None),
@@ -753,7 +753,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
 
         # Material work-card edit while H1 question is still unanswered -> Tick 2 MUST supersede question to H2.
         with closing(sqlite3.connect(db)) as c, c:
-            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nEPIC: t_ep1\nPlan v2 still risky\n",))
+            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nPlan v2 still risky\n",))
         self.df.tick_board("b", st)
         rec2 = self.df.load_plan_risk_state()["b/t_ep1"]
         h2 = rec2["rhash"]
@@ -785,7 +785,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
                 "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_ep1', 'blocked', ?, 3000)",
                 (json.dumps({"kind": "needs_input", "reason": "問題：一般產品問題，與計畫風險無關"}, ensure_ascii=False),),
             )
-            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nEPIC: t_ep1\nPlan v3 risky\n",))
+            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nPlan v3 risky\n",))
         ev_unrel = self.df.block_event("b", "t_ep1")
         self.df.tick_board("b", st)
         self.assertEqual(self.df.block_event("b", "t_ep1"), ev_unrel)
@@ -826,7 +826,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
                     c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
                         ("t_ep1", "[EPIC] e", epic_body, "todo", "orchestrator", "dir", str(self.root / "repo"),
                          None, "default", None, 0, None),
-                        ("t_dev1", "[DEV] d1", "覆蓋：AC-1\nEPIC: t_ep1\nRisky extra subsystem\n", "todo", "developer",
+                        ("t_dev1", "[DEV] d1", "覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nRisky extra subsystem\n", "todo", "developer",
                          "worktree", str(self.root / "repo"), None, "orchestrator", None, 1, None),
                         ("t_sh1", "[SHIP] s1", "覆蓋：AC-1\nEPIC: t_ep1\n", "todo", "devops", "dir",
                          str(self.root / "repo"), None, "orchestrator", None, 0, None),
@@ -889,7 +889,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
                 # Orchestrator adjusts plan to another still-risky plan (ready case should re-escalate fresh H2 question).
                 h1 = self.df.load_plan_risk_state()["b/t_ep1"]["rhash"]
                 with closing(sqlite3.connect(db)) as c, c:
-                    c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nEPIC: t_ep1\nStill risky v2\n",))
+                    c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nStill risky v2\n",))
                 self.df.tick_board("b", st)
                 self.assertEqual(len(calls), 2)
                 h2 = self.df.load_plan_risk_state()["b/t_ep1"]["rhash"]
@@ -908,7 +908,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
                 # Orchestrator adjusts plan to be safe -> recheck clears pending prohibition and releases ONLY t_sh1!
                 risk_flag["risky"] = False
                 with closing(sqlite3.connect(db)) as c, c:
-                    c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nEPIC: t_ep1\nReduced safe plan\n",))
+                    c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", ("覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\nReduced safe plan\n",))
                 self.df.tick_board("b", st)
                 self.assertEqual(len(calls), 3)
                 self.assertNotIn("b/t_ep1", self.df.load_plan_risk_state())
