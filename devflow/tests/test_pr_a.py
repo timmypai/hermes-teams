@@ -296,12 +296,12 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(st.get("advised", {}).get("t_ep1", []), [])
         self.assertTrue(any("暫停待出貨 [SHIP]" in c for c in comments), comments)
 
-        # 2. Even an already-running [SHIP] worker calling `ship merge` is blocked while t_ep1 awaits user decision!
+        # 2. Even an already-running [SHIP] worker calling `ship merge` is blocked (exit 7) while t_ep1 awaits user decision!
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
         buf_blk = io.StringIO()
         with redirect_stdout(buf_blk), self.assertRaises(SystemExit) as cm:
             self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
-        self.assertEqual(cm.exception.code, 6)
+        self.assertEqual(cm.exception.code, 7)
         blk_out = json.loads(buf_blk.getvalue())
         self.assertFalse(blk_out["merged"])
         self.assertTrue(blk_out["plan_risk_blocked"])
@@ -349,7 +349,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm_rearmed:
             self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
-        self.assertEqual(cm_rearmed.exception.code, 6)
+        self.assertEqual(cm_rearmed.exception.code, 7)
         self.assertEqual(f.merges, [])
 
     def test_enabling_plan_risk_mode_invalidates_cached_plan_and_tick_key_and_gates_ship(self) -> None:
@@ -435,6 +435,7 @@ class DocAndContractConsistency(unittest.TestCase):
         default_soul = (KIT / "souls" / "default.md").read_text(encoding="utf-8")
         self.assertNotIn("devflow resume <slug> <task> --note", default_soul)
         self.assertIn("devflow answer", default_soul)
+        self.assertIn("絕不執行 `devflow approve`", default_soul)
         self.assertNotIn("寫進卡片「提示」", default_soul)
 
         reviewer_soul = (KIT / "souls" / "reviewer.md").read_text(encoding="utf-8")
@@ -446,6 +447,10 @@ class DocAndContractConsistency(unittest.TestCase):
 
         intake_skill = (KIT / "skills" / "devflow-intake" / "SKILL.md").read_text(encoding="utf-8")
         self.assertNotIn("寫進卡片「提示」", intake_skill)
+        self.assertIn("絕不執行 `devflow approve`", intake_skill)
+
+        devops_skill = (KIT / "skills" / "devflow-devops" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("plan_risk_blocked=true", devops_skill)
 
         cli_src = (KIT / "bin" / "devflow").read_text(encoding="utf-8")
         self.assertNotIn("metadata.board_ops", cli_src)

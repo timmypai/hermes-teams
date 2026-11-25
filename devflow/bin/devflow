@@ -4372,8 +4372,8 @@ def cmd_approve(a) -> None:
 def cmd_ship_merge(a) -> None:
     """Exit 0 merged (or already merged); 3 waiting for the [ADV] verdict; 4 advisor says revise;
     5 the shared deploy channel is not ready (output: capability question); 6 PR touches protected
-    files and lacks exact-head human approval; 1 anything else (no judgment, PR changed meanwhile,
-    invalid merge method, merge refused)."""
+    files and lacks exact-head human approval; 7 governing EPIC is awaiting a user plan-risk
+    decision; 1 anything else (no judgment, PR changed meanwhile, invalid merge method, merge refused)."""
     e = entry(a.board)
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
@@ -4420,7 +4420,7 @@ def cmd_ship_merge(a) -> None:
             "epic": eid,
             "reason": ereason or f"{eid} 正等待使用者決定（needs_input），未定錨前禁止合併出貨",
         }, ensure_ascii=False, indent=2))
-        sys.exit(6)
+        sys.exit(7)
     if rec.get("needs_human_approval") and policy_lib.repo_require_human_approval(now_cfg, POLICY):
         approved, approval_source = trust_lib.is_human_approved(
             HUMAN_APPROVALS,
