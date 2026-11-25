@@ -1,6 +1,8 @@
 """Pinned external skill repository synchronization (fail-closed SHA verification)."""
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -11,6 +13,50 @@ FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 def _git(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+
+
+def _git_bytes(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=cwd, capture_output=True)
+
+
+def _git_blob_sha1(data: bytes) -> str:
+    return hashlib.sha1(f"blob {len(data)}\0".encode("ascii") + data).hexdigest()
+
+
+def _verify_tree_contents(vendor_dir: Path, commit_sha: str) -> None:
+    """Cryptographically verify every tracked file/symlink on disk against `commit_sha`'s Git tree,
+    independent of Git index flags (`--assume-unchanged`, `--skip-worktree`, or stat cache)."""
+    ls_p = _git_bytes(["git", "-C", str(vendor_dir), "ls-tree", "-r", "-z", commit_sha])
+    if ls_p.returncode != 0:
+        err = (ls_p.stderr or ls_p.stdout).decode("utf-8", errors="replace").strip()[:200]
+        raise RuntimeError(f"git ls-tree failed for {commit_sha[:12]}: {err}")
+    for entry in ls_p.stdout.split(b"\x00"):
+        if not entry:
+            continue
+        meta_b, sep, rel_b = entry.partition(b"\t")
+        if not sep:
+            continue
+        parts = meta_b.decode("ascii", errors="replace").split()
+        if len(parts) < 3:
+            continue
+        mode, obj_type, expected_oid = parts[0], parts[1], parts[2].lower()
+        if obj_type != "blob":
+            continue
+        rel = os.fsdecode(rel_b)
+        path = vendor_dir / rel
+        if mode == "120000":
+            if not path.is_symlink():
+                raise RuntimeError(f"pinned content mismatch for {rel}: expected symlink")
+            raw = os.fsencode(os.readlink(path))
+        else:
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(f"pinned content mismatch for {rel}: missing regular file")
+            raw = path.read_bytes()
+        actual_oid = _git_blob_sha1(raw)
+        if actual_oid != expected_oid:
+            raise RuntimeError(
+                f"pinned content mismatch for {rel}: expected blob {expected_oid[:12]}, got {actual_oid[:12]}"
+            )
 
 
 def validate_pinned_sha(sha: str | None) -> str:
@@ -73,14 +119,14 @@ def sync_pinned_git_repo(
         if _git(["git", "-C", str(vendor_dir), "cat-file", "-e", f"{want}^{{commit}}"]).returncode != 0:
             raise RuntimeError(f"pinned commit {want} not found in {repo_url}")
 
-    cur_head = _git(["git", "-C", str(vendor_dir), "rev-parse", "HEAD"])
-    cur_dirty = _git(["git", "-C", str(vendor_dir), "status", "--porcelain", "--ignored=matching", "--untracked-files=all"])
-    if cur_head.returncode != 0 or cur_head.stdout.strip().lower() != want or cur_dirty.stdout.strip():
-        co_p = _git(["git", "-C", str(vendor_dir), "checkout", "-q", "--detach", "--force", want])
-        if co_p.returncode != 0:
-            raise RuntimeError(f"git checkout {want[:12]} failed: {(co_p.stderr or co_p.stdout).strip()[:300]}")
-    # Always purge untracked, ignored, and nested git directories (-ffdx) so injected files
-    # hidden via .gitignore / .git/info/exclude or nested repos can never survive sync.
+    # Always reset the index unconditionally (clears --assume-unchanged / --skip-worktree flags),
+    # force-checkout the exact pinned tree, and purge all untracked/ignored/nested directories (-ffdx).
+    empty_p = _git(["git", "-C", str(vendor_dir), "read-tree", "--empty"])
+    if empty_p.returncode != 0:
+        raise RuntimeError(f"git read-tree --empty failed: {(empty_p.stderr or empty_p.stdout).strip()[:300]}")
+    co_p = _git(["git", "-C", str(vendor_dir), "checkout", "-q", "--detach", "--force", want])
+    if co_p.returncode != 0:
+        raise RuntimeError(f"git checkout {want[:12]} failed: {(co_p.stderr or co_p.stdout).strip()[:300]}")
     cl_p = _git(["git", "-C", str(vendor_dir), "clean", "-q", "-ffdx"])
     if cl_p.returncode != 0:
         raise RuntimeError(f"git clean failed: {(cl_p.stderr or cl_p.stdout).strip()[:300]}")
@@ -89,6 +135,7 @@ def sync_pinned_git_repo(
     actual = actual_p.stdout.strip().lower() if actual_p.returncode == 0 else ""
     if actual != want:
         raise RuntimeError(f"pinned checkout verification failed: expected {want}, got {actual or 'none'}")
+    _verify_tree_contents(vendor_dir, want)
     dirty_after = _git(
         ["git", "-C", str(vendor_dir), "status", "--porcelain", "--ignored=matching", "--untracked-files=all"]
     ).stdout.strip()

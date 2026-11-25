@@ -115,6 +115,18 @@ class PinnedMattpocockSkills(unittest.TestCase):
         self.assertFalse(nested_repo.exists())
         self.assertEqual(sorted(vendor_lib.discover_mattpocock_skills(vendor_dir)), ["tdd"])
 
+        # 2c. Tracked SKILL.md tampered under --assume-unchanged AND --skip-worktree (where git status
+        #     reports completely clean) MUST be restored and verified against commit c1's exact tree.
+        tdd_rel = "skills/engineering/tdd/SKILL.md"
+        tdd_path = vendor_dir / tdd_rel
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(index_flag=flag):
+                _git(vendor_dir, "update-index", flag, tdd_rel)
+                tdd_path.write_text(f"# injected under {flag}\n", encoding="utf-8")
+                self.assertEqual(_git(vendor_dir, "status", "--porcelain", "--ignored=matching"), "")
+                vendor_lib.sync_pinned_git_repo(vendor_dir, str(bare), c1)
+                self.assertEqual(tdd_path.read_text(encoding="utf-8"), "# tdd v1\n")
+
         # 3. Advance pin from c1 -> c2 fetches and checks out exact c2
         actual3 = vendor_lib.sync_pinned_git_repo(vendor_dir, str(bare), c2)
         self.assertEqual(actual3, c2)
