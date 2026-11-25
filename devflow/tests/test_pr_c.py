@@ -175,23 +175,37 @@ class ReadOnlyStatsTelemetry(unittest.TestCase):
             c.executescript("""
                 CREATE TABLE tasks (
                     id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
-                    created_by TEXT, result TEXT, created_at INTEGER, completed_at INTEGER
+                    created_by TEXT, result TEXT, created_at INTEGER, started_at INTEGER, completed_at INTEGER
                 );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
                 CREATE TABLE task_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER
                 );
             """)
-            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?)", [
-                ("t_ep1", "[EPIC] Feature A", "", "done", "orchestrator", "default", None, 100, 500),
-                ("t_ep2", "[EPIC] Feature B", "", "todo", "orchestrator", "default", None, 600, None),
-                ("t_dev1", "[DEV] Clean first pass", "", "done", "developer", "orchestrator", None, 110, 200),
-                ("t_dev2", "[DEV] Needed rework", "", "done", "developer", "orchestrator", None, 210, 350),
-                ("t_dev3", "[DEV] Tripped open card", "", "ready", "developer", "devops", None, 610, None),
-                ("t_sh1", "[SHIP] Ship A", "", "done", "devops", "orchestrator", None, 360, 490),
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                ("t_ep1", "[EPIC] Feature A", "", "done", "orchestrator", "default", None, 100, 105, 500),
+                ("t_ep2", "[EPIC] Feature B", "", "todo", "orchestrator", "default", None, 600, None, None),
+                ("t_dev1", "[DEV] Clean first pass", "", "done", "developer", "orchestrator", None, 110, 120, 200),
+                # Planned OPS card created by devops BEFORE t_sh1 started (400): MUST NOT count as post-hoc patch!
+                ("t_ops0", "[OPS] Planned infra", "", "done", "devops", "devops", None, 150, 160, 190),
+                ("t_dev2", "[DEV] Needed rework", "", "done", "developer", "orchestrator", None, 210, 220, 350),
+                # Actual post-hoc patch: ancestor of t_sh1 created at 450 > t_sh1.started_at (400)
+                ("t_dev3", "[DEV] Tripped post-hoc patch", "", "ready", "developer", "devops", None, 450, None, None),
+                # Unlinked DEV card created after t_sh1 started: NOT an ancestor of any SHIP -> NOT a patch!
+                ("t_dev4", "[DEV] Unlinked later work", "", "todo", "developer", "devops", None, 610, None, None),
+                ("t_sh1", "[SHIP] Ship A", "", "done", "devops", "orchestrator", None, 360, 400, 490),
                 ("t_adj1", "[ADJ] Fix A", "", "done", "orchestrator", "devflow-tick",
-                 json.dumps({"summary": "fixed", "metadata": {"root_cause": "missing_scope"}}), 250, 290),
+                 json.dumps({"summary": "fixed", "metadata": {"root_cause": "missing_scope"}}), 250, 255, 290),
                 ("t_adj2", "[ADJ] Fix B", "", "done", "orchestrator", "devflow-tick",
-                 json.dumps({"root_cause": "missing_scope"}), 650, 680),
+                 json.dumps({"root_cause": "missing_scope"}), 650, 655, 680),
+            ])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [
+                ("t_dev1", "t_sh1"),
+                ("t_ops0", "t_sh1"),
+                ("t_dev2", "t_sh1"),
+                ("t_dev3", "t_sh1"),
+                ("t_sh1", "t_ep1"),
+                ("t_dev4", "t_ep2"),
             ])
             c.executemany("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)", [
                 ("t_dev2", "changes_requested", "{}", 240),
@@ -225,14 +239,16 @@ class ReadOnlyStatsTelemetry(unittest.TestCase):
         b = rep["boards"][0]
         self.assertTrue(b["db_available"])
         self.assertEqual(b["epics"], {"total": 2, "done": 1, "open": 1, "archived": 0})
-        self.assertEqual(b["cards"]["avg_work_cards_per_epic"], 2.0)  # 4 work cards / 2 epics
-        self.assertEqual(b["review"]["pr_cards_completed"], 2)
-        self.assertEqual(b["review"]["first_pass_count"], 1)
-        self.assertEqual(b["review"]["first_pass_rate"], 0.5)
+        self.assertEqual(b["cards"]["avg_work_cards_per_epic"], 3.0)  # 6 work cards / 2 epics
+        self.assertEqual(b["review"]["pr_cards_completed"], 3)
+        self.assertEqual(b["review"]["first_pass_count"], 2)
+        self.assertEqual(b["review"]["first_pass_rate"], 0.6667)
         self.assertEqual(b["review"]["total_changes_requested"], 3)
         self.assertEqual(b["review"]["currently_tripped_cards"], 1)
         self.assertEqual(b["adjustments"]["total"], 2)
         self.assertEqual(b["adjustments"]["top_root_causes"], [{"root_cause": "missing_scope", "count": 2}])
+        # Strictly counts ONLY t_dev3 (ancestor of t_sh1 created after t_sh1.started_at=400);
+        # excludes t_ops0 (created before ship started) and t_dev4 (not an ancestor of any SHIP).
         self.assertEqual(b["shipping"]["post_hoc_patch_total"], 1)
         self.assertEqual(b["gates"], {
             "pr_judgments_total": 2,
@@ -250,7 +266,7 @@ class ReadOnlyStatsTelemetry(unittest.TestCase):
             self.df.cmd_stats(SimpleNamespace(slug=None, json=False))
         txt = buf_txt.getvalue()
         self.assertIn("alpha", txt)
-        self.assertIn("first_pass=50%", txt)
+        self.assertIn("first_pass=67%", txt)
         self.assertIn("missing_scope(2)", txt)
         self.assertIn("beta (owner/beta) [no db]", txt)
         self.assertIn("TOTAL (2 boards)", txt)

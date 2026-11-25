@@ -97,7 +97,10 @@ def collect_board_stats(
                 if "tasks" in tables:
                     db_available = True
                     t_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
-                    want_cols = [c for c in ("id", "title", "status", "created_by", "result", "created_at") if c in t_cols]
+                    want_cols = [
+                        c for c in ("id", "title", "status", "created_by", "result", "created_at", "started_at")
+                        if c in t_cols
+                    ]
                     rows = [dict(r) for r in conn.execute(f"SELECT {', '.join(want_cols)} FROM tasks")]
 
                     cr_by_task: dict[str, int] = {}
@@ -107,12 +110,22 @@ def collect_board_stats(
                         ):
                             cr_by_task[str(er["task_id"])] = int(er["cnt"])
 
+                    parents_by_child: dict[str, list[str]] = {}
+                    if "task_links" in tables:
+                        for lk in conn.execute("SELECT parent_id, child_id FROM task_links"):
+                            parents_by_child.setdefault(str(lk["child_id"]), []).append(str(lk["parent_id"]))
+
+                    active_tasks: dict[str, dict[str, Any]] = {}
+                    ship_ids: list[str] = []
+
                     for r in rows:
                         tid = str(r.get("id") or "")
                         status = str(r.get("status") or "").lower()
                         kind = _card_kind(r.get("title"))
                         total_cards += 1
                         by_kind[kind] = by_kind.get(kind, 0) + 1
+                        if status != "archived":
+                            active_tasks[tid] = r
 
                         if kind == "EPIC":
                             epics["total"] += 1
@@ -137,8 +150,6 @@ def collect_board_stats(
                                 pr_cards_completed += 1
                                 if cr == 0:
                                     first_pass_count += 1
-                            if str(r.get("created_by") or "").lower() == "devops" and status != "archived":
-                                post_hoc_patch_total += 1
                         elif kind == "ADJ" and status != "archived":
                             adj_total += 1
                             if status == "done":
@@ -149,10 +160,32 @@ def collect_board_stats(
                                 root_causes[rc] += 1
                         elif kind == "SHIP" and status != "archived":
                             ship_total += 1
+                            ship_ids.append(tid)
                             if status == "done":
                                 ship_done += 1
                             else:
                                 ship_open += 1
+
+                    # Align strictly with `ship_post_hoc_parents`: non-archived [DEV]/[OPS] ancestors
+                    # of a non-archived [SHIP] created strictly after that [SHIP]'s `started_at`.
+                    post_hoc_ids: set[str] = set()
+                    for sid in ship_ids:
+                        started = kanban_adapter._parse_ts(active_tasks[sid].get("started_at"))
+                        if started is None:
+                            continue
+                        seen: set[str] = set()
+                        stack = list(parents_by_child.get(sid, []))
+                        while stack:
+                            anc = stack.pop()
+                            if anc in seen or anc not in active_tasks:
+                                continue
+                            seen.add(anc)
+                            stack.extend(parents_by_child.get(anc, []))
+                            if _card_kind(active_tasks[anc].get("title")) in PR_KINDS:
+                                created = kanban_adapter._parse_ts(active_tasks[anc].get("created_at"))
+                                if created is not None and created > started:
+                                    post_hoc_ids.add(anc)
+                    post_hoc_patch_total = len(post_hoc_ids)
         except sqlite3.Error as err:
             error = f"sqlite_error: {type(err).__name__}"
 
