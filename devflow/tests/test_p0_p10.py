@@ -852,6 +852,89 @@ sys.exit(0)
         self.assertTrue(rollback_ups, records)
         self.assertEqual(rollback_ups[0]["sha"], "old-web-sha-1111111111111111111111111111")
 
+    def test_judgment_uses_exact_head_config_for_manual_only_switches_and_invalidates_stale_and_template_caches(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. Main has manual_only=false; PR turns DEVFLOW_DEPLOY_MANUAL_ONLY=true and switches deploy.yml to workflow_dispatch
+        (self.repo / ".devflow").mkdir(exist_ok=True)
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        wf_manual = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "true"}
+        )
+        f.files = [
+            {"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_DEPLOY_MANUAL_ONLY=true"},
+            {"filename": ".github/workflows/deploy.yml", "status": "modified", "patch": "-push:"},
+        ]
+        head_files = {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n",
+            ".github/workflows/deploy.yml": wf_manual,
+        }
+        self.df.branch_file = lambda repo, ref, path: head_files.get(path)
+        pr_on = {**f.pr, "number": 21, "headRefOid": "1" * 40, "url": f"https://github.com/{REPO}/pull/21", "fingerprint": "fp-on"}
+        rec_on = self.df.judgment("b", REPO, 21, pr_on)
+        self.assertTrue(rec_on["standard_delivery"]["ok"], rec_on)
+
+        # 2. Main has manual_only=true; PR turns DEVFLOW_DEPLOY_MANUAL_ONLY=false and restores canonical push+workflow_dispatch
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        wf_auto = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "false"}
+        )
+        head_files_off = {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=false\n",
+            ".github/workflows/deploy.yml": wf_auto,
+        }
+        self.df.branch_file = lambda repo, ref, path: head_files_off.get(path)
+        pr_off = {**f.pr, "number": 22, "headRefOid": "2" * 40, "url": f"https://github.com/{REPO}/pull/22", "fingerprint": "fp-off"}
+        rec_off = self.df.judgment("b", REPO, 22, pr_off)
+        self.assertTrue(rec_off["standard_delivery"]["ok"], rec_off)
+
+        # 3. PR cannot self-exempt via DEVFLOW_ALLOW_CUSTOM_DELIVERY=true in head config.env
+        f.files = [
+            {"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_ALLOW_CUSTOM_DELIVERY=true"},
+            {"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+exec custom.py"},
+        ]
+        self.df.branch_file = lambda repo, ref, path: {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_ALLOW_CUSTOM_DELIVERY=true\n",
+            ".devflow/deploy.sh": "#!/usr/bin/env bash\nexec custom.py\n",
+        }.get(path)
+        pr_bypass = {**f.pr, "number": 23, "headRefOid": "3" * 40, "url": f"https://github.com/{REPO}/pull/23", "fingerprint": "fp-byp"}
+        rec_bypass = self.df.judgment("b", REPO, 23, pr_bypass)
+        self.assertFalse(rec_bypass["standard_delivery"]["ok"], rec_bypass)
+        self.assertIn(".devflow/deploy.sh", rec_bypass["standard_delivery"]["drifted"])
+
+        # 4. Pre-upgrade cached clean judgment (keyed by legacy base_fp without standard_templates) MUST be invalidated
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        pr_mig = {**f.pr, "number": 24, "headRefOid": "4" * 40, "url": f"https://github.com/{REPO}/pull/24", "fingerprint": "legacyfp24"}
+        self.df.update_judgment(f"{REPO}#24", board="b", repo=REPO, pr=24, url=pr_mig["url"],
+                                head_sha=pr_mig["headRefOid"], fingerprint="legacyfp24", findings=[])
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+exec custom.py"}]
+        self.df.branch_file = lambda repo, ref, path: "#!/usr/bin/env bash\nexec custom.py\n"
+        rec_mig = self.df.judgment("b", REPO, 24, pr_mig)
+        self.assertNotEqual(rec_mig["fingerprint"], "legacyfp24")
+        self.assertFalse(rec_mig["standard_delivery"]["ok"], rec_mig)
+        self.assertIn(".devflow/deploy.sh", rec_mig["standard_delivery"]["drifted"])
+
+        # 5. Updating a canonical template invalidates cached clean judgment and flags drift on next check
+        canonical_before = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical_before
+        pr_tpl = {**f.pr, "number": 25, "headRefOid": "5" * 40, "url": f"https://github.com/{REPO}/pull/25", "fingerprint": "fp-tpl25"}
+        rec_before = self.df.judgment("b", REPO, 25, pr_tpl)
+        self.assertTrue(rec_before["standard_delivery"]["ok"], rec_before)
+        # Upgrade kit template under self.df.TEMPLATE
+        tpl_deploy = self.df.TEMPLATE / ".devflow" / "deploy.sh"
+        tpl_deploy.write_text(tpl_deploy.read_text(encoding="utf-8") + "# template-v2\n", encoding="utf-8")
+        rec_after = self.df.judgment("b", REPO, 25, pr_tpl)
+        self.assertNotEqual(rec_after["fingerprint"], rec_before["fingerprint"])
+        self.assertFalse(rec_after["standard_delivery"]["ok"], rec_after)
+        self.assertIn(".devflow/deploy.sh", rec_after["standard_delivery"]["drifted"])
+
 
 if __name__ == "__main__":
     unittest.main()

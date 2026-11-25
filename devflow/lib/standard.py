@@ -8,6 +8,7 @@ Project-specific differences belong strictly in `.devflow/config.env`, `Dockerfi
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,28 @@ _PUSH_TRIGGER_RE = re.compile(
 
 def _norm_text(text: str) -> str:
     return text.replace("\r\n", "\n").rstrip("\n") + "\n"
+
+
+def templates_digest(template_dir: Path) -> str:
+    """Stable short digest over all canonical delivery templates present in `template_dir`.
+
+    Returns empty string when `template_dir` does not exist so callers without a
+    populated kit template directory retain backwards-compatible fingerprints.
+    """
+    if not template_dir.is_dir():
+        return ""
+    h = hashlib.sha256()
+    found = 0
+    for rel in ALL_STANDARD_DELIVERY_FILES:
+        src = template_dir / rel
+        if not src.is_file():
+            continue
+        found += 1
+        h.update(rel.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(_norm_text(src.read_text(encoding="utf-8", errors="replace")).encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16] if found else ""
 
 
 def required_standard_files(repo_cfg: dict[str, str] | None = None) -> tuple[str, ...]:

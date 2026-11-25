@@ -3637,8 +3637,15 @@ def pr_goal_context(board: str, repo: str, number: int, pr: dict) -> dict | None
     return ctx
 
 
-def judgment_fingerprint(pr: dict, *, goal_context: dict | None = None, repo_cfg: dict[str, str] | None = None) -> str:
-    """Bind PR judgment cache & [ADV] decisions to PR head/title/body PLUS governing card/EPIC scope & repo policy."""
+def judgment_fingerprint(
+    pr: dict,
+    *,
+    goal_context: dict | None = None,
+    repo_cfg: dict[str, str] | None = None,
+    templates_digest: str = "",
+) -> str:
+    """Bind PR judgment cache & [ADV] decisions to PR head/title/body PLUS governing card/EPIC scope,
+    repo policy, and canonical standard-delivery template digest."""
     import hashlib
     cfg = repo_cfg or {}
     base_fp = pr["fingerprint"]
@@ -3647,7 +3654,14 @@ def judgment_fingerprint(pr: dict, *, goal_context: dict | None = None, repo_cfg
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
     manual_only = policy_lib.repo_deploy_manual_only(cfg)
     allow_custom = policy_lib.repo_allow_custom_delivery(cfg)
-    if goal_context is None and not extra_protected and max_files == default_max and not manual_only and not allow_custom:
+    if (
+        goal_context is None
+        and not extra_protected
+        and max_files == default_max
+        and not manual_only
+        and not allow_custom
+        and not templates_digest
+    ):
         return base_fp
     governing = {
         "pr_fingerprint": base_fp,
@@ -3656,6 +3670,8 @@ def judgment_fingerprint(pr: dict, *, goal_context: dict | None = None, repo_cfg
         "max_diff_files": max_files,
         "deploy_manual_only": manual_only,
         "allow_custom_delivery": allow_custom,
+        "standard_templates": templates_digest,
+        "standard_schema": 1 if templates_digest else 0,
     }
     return hashlib.sha1(json.dumps(governing, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
@@ -3664,7 +3680,8 @@ def resolve_pr_judgment_inputs(board: str, repo: str, number: int, pr: dict) -> 
     """Return `(goal_context, repo_cfg, effective_fingerprint)` for PR judgment caching & stale-check validation."""
     goal_ctx = pr_goal_context(board, repo, number, pr)
     repo_cfg = policy_lib.load_repo_config(entry(board).get("path"))
-    eff_fp = judgment_fingerprint(pr, goal_context=goal_ctx, repo_cfg=repo_cfg)
+    tpl_digest = standard_lib.templates_digest(TEMPLATE)
+    eff_fp = judgment_fingerprint(pr, goal_context=goal_ctx, repo_cfg=repo_cfg, templates_digest=tpl_digest)
     return goal_ctx, repo_cfg, eff_fp
 
 
@@ -3807,36 +3824,66 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
     files = pr_files(repo, number)
     result = judge(pr, files, goal_context=goal_ctx, repo_cfg=repo_cfg) if (goal_ctx or repo_cfg) else judge(pr, files)
     # Deterministic standard delivery check when PR touches canonical delivery files and kit templates exist.
-    req_std = set(standard_lib.required_standard_files(repo_cfg))
-    touched_std = [p for p in scope_lib.touched_paths(files) if p in req_std]
-    if touched_std and TEMPLATE.is_dir() and not policy_lib.repo_allow_custom_delivery(repo_cfg):
-        fetched: dict[str, str | None] = {}
+    touched_all = scope_lib.touched_paths(files)
+    if TEMPLATE.is_dir() and not policy_lib.repo_allow_custom_delivery(repo_cfg):
+        eff_std_cfg = dict(repo_cfg)
         fetch_errors: list[tuple[str, str]] = []
-        for rel in touched_std:
-            removed = (
-                any(f.get("filename") == rel and f.get("status") == "removed" for f in files)
+        # Resolve declarative deployment settings (`DEVFLOW_DEPLOY`, `DEVFLOW_DEPLOY_MANUAL_ONLY`)
+        # from exact PR head `.devflow/config.env` when modified in the PR, while keeping
+        # authorization-sensitive `DEVFLOW_ALLOW_CUSTOM_DELIVERY` strictly from trusted main `repo_cfg`.
+        if ".devflow/config.env" in touched_all:
+            cfg_removed = (
+                any(f.get("filename") == ".devflow/config.env" and f.get("status") == "removed" for f in files)
                 or (
-                    any(f.get("previous_filename") == rel and f.get("filename") != rel for f in files)
-                    and not any(f.get("filename") == rel and f.get("status") != "removed" for f in files)
+                    any(f.get("previous_filename") == ".devflow/config.env" and f.get("filename") != ".devflow/config.env" for f in files)
+                    and not any(f.get("filename") == ".devflow/config.env" and f.get("status") != "removed" for f in files)
                 )
             )
-            if removed:
-                fetched[rel] = None
-                continue
-            try:
-                content = branch_file(repo, pr["headRefOid"], rel)
-            except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error, never cache clean
-                fetch_errors.append((rel, str(err)[:160]))
-                continue
-            if content is None:
-                fetch_errors.append((rel, "content_unavailable"))
-                continue
-            fetched[rel] = content
+            if not cfg_removed:
+                try:
+                    head_cfg_text = branch_file(repo, pr["headRefOid"], ".devflow/config.env")
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error
+                    fetch_errors.append((".devflow/config.env", str(err)[:160]))
+                    head_cfg_text = None
+                else:
+                    if head_cfg_text is None:
+                        fetch_errors.append((".devflow/config.env", "content_unavailable"))
+                if head_cfg_text is not None:
+                    head_cfg = policy_lib.env_values(head_cfg_text)
+                    for key_name in ("DEVFLOW_DEPLOY", "DEVFLOW_DEPLOY_MANUAL_ONLY"):
+                        if key_name in head_cfg:
+                            eff_std_cfg[key_name] = head_cfg[key_name]
+                        else:
+                            eff_std_cfg.pop(key_name, None)
+        req_std = set(standard_lib.required_standard_files(eff_std_cfg))
+        touched_std = [p for p in touched_all if p in req_std]
+        fetched: dict[str, str | None] = {}
+        if touched_std and not fetch_errors:
+            for rel in touched_std:
+                removed = (
+                    any(f.get("filename") == rel and f.get("status") == "removed" for f in files)
+                    or (
+                        any(f.get("previous_filename") == rel and f.get("filename") != rel for f in files)
+                        and not any(f.get("filename") == rel and f.get("status") != "removed" for f in files)
+                    )
+                )
+                if removed:
+                    fetched[rel] = None
+                    continue
+                try:
+                    content = branch_file(repo, pr["headRefOid"], rel)
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error, never cache clean
+                    fetch_errors.append((rel, str(err)[:160]))
+                    continue
+                if content is None:
+                    fetch_errors.append((rel, "content_unavailable"))
+                    continue
+                fetched[rel] = content
         if fetch_errors:
             failed_paths = [p for p, _ in fetch_errors]
             sd = {
                 "ok": False,
-                "checked": touched_std,
+                "checked": touched_std or failed_paths,
                 "missing": [],
                 "drifted": [],
                 "custom_allowed": False,
@@ -3862,12 +3909,13 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
                 "posted": None,
                 "cached": False,
             }
-        sd = standard_lib.check_standard_delivery_contents(
-            fetched, TEMPLATE, repo_cfg=repo_cfg, only_paths=touched_std
-        )
-        result["standard_delivery"] = sd
-        if not sd["ok"]:
-            result["findings"] = list(result.get("findings") or []) + sd["findings"]
+        if touched_std:
+            sd = standard_lib.check_standard_delivery_contents(
+                fetched, TEMPLATE, repo_cfg=eff_std_cfg, only_paths=touched_std
+            )
+            result["standard_delivery"] = sd
+            if not sd["ok"]:
+                result["findings"] = list(result.get("findings") or []) + sd["findings"]
     # Written only if no one stored another fingerprint during the Decisions call (a body, scope, or
     # policy edit judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
     return update_judgment(key, fp=rec.get("fingerprint", ""), board=board, repo=repo, pr=number, url=pr["url"],
