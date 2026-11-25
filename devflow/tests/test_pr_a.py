@@ -551,6 +551,106 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(states["t_ep1"], "blocked:needs_input")
         self.assertEqual(states["t_sh1"], "blocked:dependency")
 
+    def test_ordinary_epic_needs_input_with_plan_risk_off_never_creates_permanent_plan_risk_lock(self) -> None:
+        self.df.AUTO_PLAN_ADVISOR = False
+        self.df.PLAN_RISK_MODE = "off"
+        self.df.HERMES_PY = "/nonexistent-hermes-py"
+        self.df.deploy_readiness = lambda slug: []
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+
+        f = Fake(self.df)
+        for name in ("pr_meta", "run", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
+
+        db = self.root / "data" / "kanban" / "boards" / "b" / "kanban.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                    workspace_kind TEXT, workspace_path TEXT, completion_contract TEXT,
+                    created_by TEXT, result TEXT, goal_mode INTEGER NOT NULL DEFAULT 0,
+                    block_kind TEXT
+                );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER
+                );
+            """)
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+                ("t_ep1", "[EPIC] e", "## 目標\ng\n## 驗收\n- AC-1 [cli] ok\n", "blocked", "orchestrator", "dir",
+                 str(self.root / "repo"), None, "default", None, 0, "needs_input"),
+                ("t_dev1", "[DEV] d", "EPIC: t_ep1\n", "done", "developer", "worktree", str(self.root / "repo"),
+                 f"https://github.com/{REPO}/pull/7", "orchestrator", None, 1, None),
+                ("t_ship", "[SHIP] s", "EPIC: t_ep1\n", "running", "devops", "dir", str(self.root / "repo"),
+                 None, "orchestrator", None, 0, None),
+            ])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [("t_dev1", "t_ship"), ("t_ship", "t_ep1")])
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 1000)",
+                ("t_ep1", json.dumps({"kind": "needs_input", "reason": "一般產品確認問題"}, ensure_ascii=False)),
+            )
+
+        # 1. Running [SHIP] calls ship merge while EPIC is in ordinary needs_input wait -> exits 7,
+        #    and MUST NOT fabricate a hashless record in state/plan-risk.json.
+        os.environ["HERMES_KANBAN_TASK"] = "t_ship"
+        self.addCleanup(os.environ.pop, "HERMES_KANBAN_TASK", None)
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+        self.assertEqual(cm.exception.code, 7)
+        blk = json.loads(buf.getvalue())
+        self.assertEqual(self.df.load_plan_risk_state(), {})
+        self.assertEqual(f.merges, [])
+
+        # Simulate SHIP self-blocking with hold_reason
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = 't_ship'")
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 1500)",
+                ("t_ship", json.dumps({"kind": "dependency", "reason": blk["hold_reason"]}, ensure_ascii=False)),
+            )
+
+        # 2. User answers the ordinary EPIC question -> tick releases t_ship and ship merge succeeds!
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = 't_ep1'")
+        resumed: list[str] = []
+        self.df.resume = lambda board, tid, note=None: resumed.append(tid) or f"resumed {tid}"
+
+        def fake_kanban(board, cmd, *args):
+            if cmd == "list":
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    return json.dumps([dict(r) for r in c.execute("SELECT id, title, assignee, status FROM tasks")])
+            if cmd == "show":
+                tid = args[0]
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    t = dict(c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    parents = [r[0] for r in c.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
+                    children = [r[0] for r in c.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (tid,))]
+                return json.dumps({"task": t, "parents": parents, "children": children, "comments": []})
+            if cmd == "comment":
+                return ""
+            raise AssertionError((cmd, args))
+
+        self.df.kanban = fake_kanban
+        self.df.tick_board("b", {})
+        self.assertEqual(resumed, ["t_ship"])
+
+        buf_ok = io.StringIO()
+        with redirect_stdout(buf_ok):
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertTrue(json.loads(buf_ok.getvalue())["merged"])
+        self.assertEqual(len(f.merges), 1)
+
 
 class DocAndContractConsistency(unittest.TestCase):
     """Ensure souls/, skills/, README.md, and bin/devflow never drift back to contradictory legacy rules."""

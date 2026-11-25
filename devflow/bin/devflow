@@ -2001,12 +2001,16 @@ def register_plan_risk_pending(board: str, epic: str, rhash: str, gating: list[s
 
 
 def register_ship_plan_risk_hold(board: str, epic: str, ship_id: str) -> None:
+    """Attach `ship_id` to an EXISTING plan-risk record only; never fabricate a hashless record
+    for an ordinary EPIC needs_input/capability wait."""
     if not ship_id:
         return
     key = plan_risk_key(board, epic)
     with locked("plan-risk"):
         data = load_plan_risk_state()
-        cur = data.get(key) if isinstance(data.get(key), dict) else {"board": board, "epic": epic, "status": "pending"}
+        cur = data.get(key)
+        if not isinstance(cur, dict) or not cur.get("rhash") or not cur.get("gating"):
+            return
         held = list(cur.get("held_ships") or [])
         if ship_id not in held:
             held.append(ship_id)
@@ -2407,10 +2411,22 @@ def tick_board(board: str, st: dict) -> bool:
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
             print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
-    # Reconcile plan-risk [SHIP] holds for EPICs outside waiting_epics (e.g., ready/running/done after user action).
+    # Reconcile plan-risk [SHIP] holds for EPICs outside waiting_epics (e.g., ready/running/done after user action),
+    # including [SHIP] cards that self-blocked on an ordinary EPIC wait when plan_risk_mode="off".
     all_risk_epics = set((st.get("plan_risk_holds") or {}).keys()) | {
         r["epic"] for r in load_plan_risk_state().values() if isinstance(r, dict) and r.get("board") == board and r.get("epic")
     }
+    for t in tasks:
+        if card_type(t.get("title") or "") == "SHIP" and t.get("status") == "blocked":
+            try:
+                ev = block_event(board, t["id"])
+                reason = block_reason(board, ev) if ev is not None else ""
+                if reason.startswith(PLAN_RISK_HOLD_PREFIX):
+                    rest = reason[len(PLAN_RISK_HOLD_PREFIX):].split(None, 1)[0]
+                    if TASK_ID_RE.fullmatch(rest):
+                        all_risk_epics.add(rest)
+            except sqlite3.Error:
+                pass
     for eid in sorted(all_risk_epics):
         if eid in waiting_epics:
             continue
@@ -2423,7 +2439,7 @@ def tick_board(board: str, st: dict) -> bool:
                     retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
                 else:
                     retry = release_plan_risk_holds(board, eid, cards, st) or retry
-            else:
+            elif not waiting(cards.get(eid, {})):
                 retry = release_plan_risk_holds(board, eid, cards, st) or retry
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC hold reconciliation
             retry = True
