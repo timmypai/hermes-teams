@@ -3824,7 +3824,7 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
     goal_ctx, repo_cfg, eff_fp = resolve_pr_judgment_inputs(board, repo, number, pr)
     key = f"{repo}#{number}"
     rec = load_judgments().get(key) or {}
-    if rec.get("fingerprint") == eff_fp:
+    if rec.get("fingerprint") == eff_fp and not rec.get("transient_error"):
         return rec
     files = pr_files(repo, number)
     result = judge(pr, files, goal_context=goal_ctx, repo_cfg=repo_cfg) if (goal_ctx or repo_cfg) else judge(pr, files)
@@ -3907,7 +3907,7 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
             }
             result["standard_delivery"] = sd
             result["findings"] = list(result.get("findings") or []) + sd["findings"]
-            # Do not cache transient API/fetch failures as a judgment for this fingerprint.
+            # Do not cache transient API/fetch failures as a completed judgment for this fingerprint.
             return {
                 **result,
                 "board": board,
@@ -3920,6 +3920,7 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
                 "advisor": None,
                 "posted": None,
                 "cached": False,
+                "transient_error": True,
             }
         if touched_std:
             sd = standard_lib.check_standard_delivery_contents(
@@ -3986,7 +3987,19 @@ def ensure_pr_advisor(board: str, rec: dict, epic: str | None) -> dict:
 
 def publish(rec: dict, verdict: str | None) -> dict:
     """Post `devflow-judgment` on the judged head when its state changes: success with no findings
-    or an advisor `ok`, failure on `revise`/`missing`, pending while the advisor is open."""
+    or an advisor `ok`, failure on `revise`/`missing`, error on transient fetch failure, pending
+    while the advisor is open."""
+    if rec.get("transient_error"):
+        key = f"{rec['repo']}#{rec['pr']}"
+        j_role, _, _ = trust_lib.judgment_gh_role(ROLES)
+        run(["gh", "api", "-X", "POST", f"repos/{rec['repo']}/statuses/{rec['head_sha']}", "-f", "state=error",
+             "-f", f"context={JUDGMENT_CHECK}", "-f", "description=transient fetch failure; retry standard-delivery check"],
+            gh=j_role)
+        # Invalidate any stale cached `posted` marker on the same head so a later recovery re-posts cleanly.
+        current = load_judgments().get(key) or {}
+        if current.get("posted") and current["posted"][0] == rec["head_sha"]:
+            update_judgment(key, fp=current.get("fingerprint", ""), posted=None)
+        return {**rec, "posted": [rec["head_sha"], "error"]}
     state = "success" if verdict == "ok" else "failure" if verdict in ("revise", "missing") else "pending"
     if rec.get("posted") == [rec["head_sha"], state]:
         return rec
@@ -4016,6 +4029,8 @@ def gate(board: str, repo: str, number: int, pr: dict | None = None) -> tuple[di
     rec = judgment(board, repo, number, pr)
     if rec.get("fingerprint") != eff_fp:
         raise DecisionsError("PR 或其卡片範圍／政策在判斷期間被修改；重跑")
+    if rec.get("transient_error"):
+        return publish(rec, None), None
     verdict = advisor_verdict(board, rec) if rec["findings"] else "ok"
     return publish(rec, verdict), verdict
 
@@ -4066,7 +4081,9 @@ def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
             if n is None:
                 continue
             rec, verdict = gate(board, repo, n)
-            if verdict is None:
+            if rec.get("transient_error"):
+                retry = True
+            elif verdict is None:
                 ensure_pr_advisor(board, rec, epic_of(d))
         except DecisionsError as err:
             retry = True

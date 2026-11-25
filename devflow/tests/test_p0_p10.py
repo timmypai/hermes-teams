@@ -1120,6 +1120,98 @@ sys.exit(0)
                 self.assertIn("skip deploy", proc.stdout)
                 self.assertNotIn("DOCKER_CALLED", proc.stderr)
 
+    def test_transient_fetch_failure_end_to_end_across_gate_check_pr_merge_and_tick(self) -> None:
+        import io
+        import types
+        from contextlib import redirect_stdout
+
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. No prior judgment + API 503: gate, cmd_check_pr, cmd_ship_merge, tick_prs all fail closed cleanly
+        f.pr = {
+            **f.pr,
+            "number": 41,
+            "headRefOid": "a" * 40,
+            "url": f"https://github.com/{REPO}/pull/41",
+            "fingerprint": "fp-41-v1",
+            "state": "OPEN",
+        }
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(RuntimeError("API 503"))
+
+        rec, verdict = self.df.gate("b", REPO, 41)
+        self.assertIsNone(verdict)
+        self.assertTrue(rec.get("transient_error"))
+        self.assertEqual(rec["url"], f"https://github.com/{REPO}/pull/41")
+        self.assertEqual(f.statuses[-1], "error")
+        self.assertNotIn(f"{REPO}#41", self.df.load_judgments())
+
+        # cmd_check_pr must exit 3 with wait=retry (NOT KeyError: 'url')
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            self.df.cmd_check_pr(types.SimpleNamespace(board="b", pr=41))
+        self.assertEqual(cm.exception.code, 3)
+        out_check = json.loads(buf.getvalue())
+        self.assertEqual(out_check["wait"], "retry")
+        self.assertEqual(out_check["pr"], f"https://github.com/{REPO}/pull/41")
+        self.assertTrue(any("無法讀取 PR head" in x for x in out_check["findings"]))
+
+        # cmd_ship_merge with valid approval must still exit 3 wait=retry
+        f.reviews = [{"user": "rev", "state": "APPROVED", "commit_id": "a" * 40}]
+        buf_m = io.StringIO()
+        with redirect_stdout(buf_m), self.assertRaises(SystemExit) as cm_m:
+            self.df.cmd_ship_merge(types.SimpleNamespace(board="b", pr=41))
+        self.assertEqual(cm_m.exception.code, 3)
+        self.assertEqual(json.loads(buf_m.getvalue())["wait"], "retry")
+        self.assertEqual(f.merges, [])
+
+        # tick_prs must mark retry=True and NEVER open an [ADV] advisor card for a transient error
+        f.cards["t_rev41"] = {
+            "task": {"id": "t_rev41", "title": "[DEV] x", "body": "", "status": "review",
+                     "completion_contract": f"https://github.com/{REPO}/pull/41"},
+            "runs": [],
+        }
+        orig_kanban = self.df.kanban
+        self.df.kanban = lambda b, *a: json.dumps(f.cards["t_rev41"]) if a[:2] == ("show", "t_rev41") else orig_kanban(b, *a)
+        adv_calls: list = []
+        self.df.ensure_pr_advisor = lambda *a: adv_calls.append(a)
+        retry = self.df.tick_prs(
+            "b",
+            REPO,
+            [{"id": "t_rev41", "title": "[DEV] x", "assignee": "reviewer", "status": "review",
+              "completion_contract": f"https://github.com/{REPO}/pull/41"}],
+        )
+        self.assertTrue(retry)
+        self.assertEqual(adv_calls, [])
+
+        # 2. Stale prior success on same head, then body edit + API 503 must overwrite GitHub status to error
+        f.statuses.clear()
+        f.files = [{"filename": "app/a.py", "status": "modified", "patch": "+x=1"}]
+        rec_ok, v_ok = self.df.gate("b", REPO, 41)
+        self.assertEqual(v_ok, "ok")
+        self.assertEqual(f.statuses, ["success"])
+
+        # Same head_sha, edited body changes fingerprint, now touches deploy.sh and API 503s
+        f.pr = {**f.pr, "fingerprint": "fp-41-v2", "body": "edited body"}
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        rec_fail, v_fail = self.df.gate("b", REPO, 41)
+        self.assertIsNone(v_fail)
+        self.assertTrue(rec_fail.get("transient_error"))
+        self.assertEqual(f.statuses[-1], "error")
+
+        # 3. Once API recovers with canonical content, retry recomputes cleanly and caches new fingerprint
+        canonical = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical
+        rec_recov, v_recov = self.df.gate("b", REPO, 41)
+        self.assertFalse(rec_recov.get("transient_error", False))
+        self.assertTrue(rec_recov["standard_delivery"]["ok"])
+        self.assertEqual(self.df.load_judgments()[f"{REPO}#41"]["fingerprint"], rec_recov["fingerprint"])
+
 
 if __name__ == "__main__":
     unittest.main()
