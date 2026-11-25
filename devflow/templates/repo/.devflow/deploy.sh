@@ -12,7 +12,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . .devflow/config.env; set +a
 
-if [[ "${DEVFLOW_DEPLOY:-true}" == "false" ]]; then
+_deploy_flag="${DEVFLOW_DEPLOY:-true}"
+if [[ "${_deploy_flag,,}" == "false" ]]; then
   echo "DEVFLOW_DEPLOY=false; skip deploy"; exit 0
 fi
 

@@ -1090,6 +1090,35 @@ sys.exit(0)
                 self.assertNotEqual(rb_ups[0]["sha"], failed_sha)
                 self.assertEqual(post_log.read_text().strip(), f"rollback|{expected_sha}")
 
+    def test_devflow_deploy_false_case_variants_match_between_standard_validation_and_deploy_sh(self) -> None:
+        for val in ("false", "False", "FALSE"):
+            with self.subTest(val=val):
+                self.assertEqual(
+                    self.df.standard_lib.required_standard_files({"DEVFLOW_DEPLOY": val}),
+                    self.df.standard_lib.STANDARD_CORE_FILES,
+                )
+                work = Path(tempfile.mkdtemp(prefix="devflow-deploy-off-"))
+                self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+                (work / ".devflow").mkdir()
+                shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+                (work / ".devflow" / "config.env").write_text(
+                    f"DEVFLOW_APP=offprobe\nDEVFLOW_DEPLOY={val}\n", encoding="utf-8"
+                )
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "docker").write_text("#!/usr/bin/env bash\necho DOCKER_CALLED >&2; exit 99\n", encoding="utf-8")
+                (bin_dir / "docker").chmod(0o755)
+                proc = subprocess.run(
+                    ["bash", ".devflow/deploy.sh"],
+                    cwd=work,
+                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("skip deploy", proc.stdout)
+                self.assertNotIn("DOCKER_CALLED", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
