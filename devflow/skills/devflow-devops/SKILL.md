@@ -50,7 +50,7 @@ workflow_dispatch ──operate.yml (self-hosted, default branch tip only)：`de
 | `.devflow/check.sh`、`check.py`、`rules/*.toml`、`lessons/` | 必過的規則與教訓檢查（CI `check` job，在 `devflow-ci` 的 needs）：每條規則先用自己的錯誤範例自測，再掃描追蹤中的檔案；豁免必須引用存在的教訓 |
 | `.github/workflows/ci.yml`、`deploy.yml`、`repro.yml`、`operate.yml`、`quality.yml` | CI（`test`／`check`／`verify`／`verify-base` → `devflow-ci`；`workflow_dispatch` = 整合驗收）/ CD（smoke，都上傳證據 artifact）/ 除錯重現 / 正式服務 UI 操作 / ub-mode 指標（不擋） |
 
-在 worktree 套用：`devflow contract <slug> .`（只補缺的檔，不覆蓋；會填好 app 名稱與分配的埠；列出與目前範本不同的檔案，舊 repo 升級時對照範本手動合併，保留專案改動）。有服務的專案要有 `Dockerfile`（`DEVFLOW_SERVICE` 有值卻沒有 `Dockerfile`，CI 會失敗，不再略過）。沒有服務的 repo（CLI、函式庫）設 `DEVFLOW_SERVICE=`，情境寫在 `verify.sh`；不需要部署的 repo 設 `DEVFLOW_DEPLOY=false`。舊 repo 的 `journey` 要改寫成 `scenario`。repo 還沒有可腳本化的驗證方式時，用 `pstack:create-verification-skill` 的方法盤點，產物寫成 `.devflow/verify.sh`／`.devflow/ui/` 的情境。
+在 worktree 套用：`devflow contract <slug> .`（只補缺的檔，不覆蓋）；若要強制對齊或還原公版交付腳本（`.devflow/deploy.sh`、`capture.sh`、`redact.py`、`.github/workflows/deploy.yml`）執行 `devflow contract <slug> . --sync-standard`。所有 repo 一律遵循公版 `deploy.sh`（build → up → health → smoke → 失敗採證 → 精確 release 回滾），禁止用自寫腳本取代；若建置映像需自備 build contexts（例如離線 npm/wheels），只放在可執行的 `.devflow/deploy-build.sh`（公版 `deploy.sh` 會自動呼叫並保留完整輸出），需保留手動觸發部署設 `DEVFLOW_DEPLOY_MANUAL_ONLY=true`，需隨 release 保存的檔案（如 seccomp JSON）寫在 `DEVFLOW_RELEASE_FILES`。有服務的專案要有 `Dockerfile`；沒有服務設 `DEVFLOW_SERVICE=`；不部署設 `DEVFLOW_DEPLOY=false`。
 
 ## 3. 接入 repo（`[OPS]` 卡，或 Hermes 直接要求）
 1. `devflow repo add OWNER/REPO`（若尚未）：建 board、clone、設定 squash/自動刪分支、讓 builder 與 reviewer 都有 push 權限、分配埠、自動申請 self-hosted runner。

@@ -31,6 +31,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     "advisor_retry_seconds": 30,
     "advisor_max_retries": 6,
     "default_merge_method": "squash",
+    "auto_plan_advisor": False,
+    "auto_flow_adj": False,
 }
 
 
@@ -80,6 +82,15 @@ def load_policy(root: Path, roles: dict[str, Any]) -> dict[str, Any]:
             cfg[pol_key] = int(raw)
     if (mm := os.environ.get("DEVFLOW_DEFAULT_MERGE_METHOD", "").strip().lower()) in VALID_MERGE_METHODS:
         cfg["default_merge_method"] = mm
+    for env_key, pol_key in (
+        ("DEVFLOW_AUTO_PLAN_ADVISOR", "auto_plan_advisor"),
+        ("DEVFLOW_AUTO_FLOW_ADJ", "auto_flow_adj"),
+    ):
+        raw = os.environ.get(env_key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            cfg[pol_key] = True
+        elif raw in ("0", "false", "no", "off"):
+            cfg[pol_key] = False
     return cfg
 
 
@@ -135,3 +146,11 @@ def repo_max_diff_files(repo_cfg: dict[str, str], policy: dict[str, Any]) -> int
 
 def repo_review_test_cmd(repo_cfg: dict[str, str]) -> str:
     return (repo_cfg.get("DEVFLOW_REVIEW_TEST_CMD") or "").strip()
+
+
+def repo_deploy_manual_only(repo_cfg: dict[str, str]) -> bool:
+    return (repo_cfg.get("DEVFLOW_DEPLOY_MANUAL_ONLY") or "").strip().lower() in ("1", "true", "yes")
+
+
+def repo_allow_custom_delivery(repo_cfg: dict[str, str]) -> bool:
+    return (repo_cfg.get("DEVFLOW_ALLOW_CUSTOM_DELIVERY") or "").strip().lower() in ("1", "true", "yes")

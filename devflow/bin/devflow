@@ -26,7 +26,7 @@ _KIT_DIR = Path(__file__).resolve().parents[1]
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
 
-from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, scope as scope_lib, trust as trust_lib  # noqa: E402
+from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, scope as scope_lib, standard as standard_lib, trust as trust_lib  # noqa: E402
 
 ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
 DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
@@ -349,9 +349,15 @@ def cmd_repo_doctor(a) -> None:
         ready = all(i["ok"] for i in deploy)
         repo_cfg = policy_lib.load_repo_config(e.get("path"))
         merge_method, _ = policy_lib.repo_merge_method(repo_cfg, POLICY)
-        bad |= state != "ok" or not ready
+        repo_dir = Path(e["path"]) if e.get("path") else None
+        if TEMPLATE.is_dir() and repo_dir and (repo_dir / ".devflow" / "config.env").is_file():
+            std_delivery = standard_lib.check_standard_delivery_dir(repo_dir, TEMPLATE, repo_cfg=repo_cfg)
+        else:
+            std_delivery = {"ok": True, "checked": [], "missing": [], "drifted": [], "custom_allowed": False, "findings": []}
+        bad |= state != "ok" or not ready or not std_delivery["ok"]
         print(json.dumps({"slug": slug, "state": state, "project": project and project["id"],
                           "actions": actions, "problems": problems, "deploy_ready": ready, "deploy": deploy,
+                          "standard_delivery": std_delivery,
                           "merge_method": merge_method, "judgment_token_role": j_role,
                           "judgment_token_isolated": j_isolated},
                          ensure_ascii=False))
@@ -376,7 +382,12 @@ def _rules_error(p: subprocess.CompletedProcess) -> str:
 
 def branch_file(repo: str, branch: str, path: str) -> str | None:
     p = run(["gh", "api", f"repos/{repo}/contents/{path}?ref={branch}", "--jq", ".content"], gh="builder", check=False)
-    return base64.b64decode(p.stdout).decode(errors="replace") if p.returncode == 0 else None
+    if p.returncode == 0:
+        return base64.b64decode(p.stdout).decode(errors="replace")
+    err = ((p.stderr or "") + "\n" + (p.stdout or "")).lower()
+    if "404" in err or "not found" in err or not err.strip():
+        return None
+    raise RuntimeError(f"gh api contents {path} failed (exit {p.returncode}): {(p.stderr or p.stdout or '').strip()[:160]}")
 
 
 def protect_repo(slug: str) -> dict:
@@ -471,12 +482,21 @@ def cmd_contract(a) -> None:
     sources = [(TEMPLATE, p) for p in sorted(TEMPLATE.rglob("*"))]
     if a.ui:
         sources += [(TEMPLATE_UI, p) for p in sorted(TEMPLATE_UI.rglob("*"))]
+    repo_cfg = policy_lib.load_repo_config(dest)
+    synced: list[str] = []
+    if getattr(a, "sync_standard", False):
+        res = standard_lib.sync_standard_files(dest, TEMPLATE, repo_cfg=repo_cfg)
+        synced = res["updated"]
     for base, src in sources:
         if src.is_dir():
             continue
         rel = src.relative_to(base)
+        rel_str = rel.as_posix()
         out = dest / rel
-        text = src.read_text().replace("__APP__", e["slug"]).replace("__PORT__", str(e["port"]))
+        if rel_str in standard_lib.ALL_STANDARD_DELIVERY_FILES:
+            text = standard_lib.render_standard_file(base, rel_str, repo_cfg=repo_cfg) or src.read_text()
+        else:
+            text = src.read_text().replace("__APP__", e["slug"]).replace("__PORT__", str(e["port"]))
         if out.exists():
             if out.read_text(errors="replace") != text:
                 drift.append(str(rel))
@@ -496,6 +516,8 @@ def cmd_contract(a) -> None:
             fh.write(("\n" if lines else "") + "\n".join(missing) + "\n")
         added.append(".gitignore entries")
     print("added: " + (", ".join(added) if added else "nothing (all present)"))
+    if synced:
+        print("synced standard delivery: " + ", ".join(synced))
     if drift:
         print("differs from current template (merge by hand, keep project changes; template: "
               f"{TEMPLATE}): " + ", ".join(drift))
@@ -1206,6 +1228,8 @@ SHIP_PATCH_LIMIT = int(POLICY["ship_patch_limit"])
 MAX_REVIEW_ROUNDS = int(POLICY["max_review_rounds"])
 MAX_EPIC_CARDS = int(POLICY["max_epic_cards"])
 MAX_DIFF_FILES = int(POLICY["max_diff_files"])
+AUTO_PLAN_ADVISOR = bool(POLICY.get("auto_plan_advisor", False))
+AUTO_FLOW_ADJ = bool(POLICY.get("auto_flow_adj", False))
 
 
 def adj_targets(title: str, body: str | None) -> set[str]:
@@ -1374,10 +1398,14 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     spec = epic_acceptance_spec(board, epic, cards[epic]["body"], cards=cards)
     acs = [a["ac"] for a in spec]
     ac_types = {a["ac"]: a["type"] for a in spec}
+    work_kinds = [card_type(c["title"]) for t, c in cards.items() if t != epic and c.get("status") != "archived"
+                  and card_type(c["title"]) in ("RES", "ARCH", "DEV", "OPS", "SHIP")]
+    ship_only = bool(work_kinds) and all(k == "SHIP" for k in work_kinds)
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
     for a in spec:
-        found += [f"{epic}: {p}" for p in spec_problems(a)]
+        probs = [p for p in spec_problems(a) if not (ship_only and "沒有任何情境" in p)]
+        found += [f"{epic}: {p}" for p in probs]
     found += plan_manual_rules(epic, spec)
     body_by_tid = {}
     for msg in plan_body_rules(cards):
@@ -2042,7 +2070,7 @@ def tick_board(board: str, st: dict) -> bool:
                 )
             )
             if plans.get(tid) != fp or repair_ended:
-                rep = check_plan(board, tid, advise=True, cards=cards, advised=frozenset(advised.get(tid, [])))
+                rep = check_plan(board, tid, advise=AUTO_PLAN_ADVISOR, cards=cards, advised=frozenset(advised.get(tid, [])))
                 advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
                 retry = adj_retry or retry
@@ -2237,19 +2265,34 @@ def subscribe(board: str, tid: str, chat: dict, profile: str = "default") -> Non
     kanban(board, *args)
 
 
+def unsubscribe_idempotent(board: str, tid: str, platform: str, chat_id: str, thread_id: str = "") -> None:
+    """Unsubscribe a chat from `tid`, treating `(no such subscription)` as idempotent success."""
+    args = ["notify-unsubscribe", tid, "--platform", platform, "--chat-id", chat_id]
+    if thread_id:
+        args += ["--thread-id", thread_id]
+    if getattr(kanban, "__module__", "") == __name__:
+        p = run([HERMES, "kanban", "--board", board, *args], check=False)
+        if p.returncode == 0 or "no such subscription" in (p.stderr + p.stdout).lower():
+            return
+        raise RuntimeError((p.stderr or p.stdout).strip()[-400:] or f"exit {p.returncode}")
+    try:
+        kanban(board, *args)
+    except (SystemExit, Exception) as err:
+        if "no such subscription" in str(err).lower():
+            return
+        raise
+
+
 def move_to_inbox(board: str, tid: str, subs: dict[str, list], box: dict, readable) -> None:
-    """With an inbox set, a card notifies only there among the chats a person reads: Hermes subscribes
-    the chat a card was made in, and a gateway wake-up there races the person typing in it (the Desktop
-    prompt is refused SESSION_NOT_OWNED when the wake is admitted between its two ownership checks,
-    tui_gateway prompt_turn.py `_admit_prompt_turn`, Hermes; 2026-11-17..19: 9 times). Mitigation, not
-    a fix. Bot Chats of other profiles (`ask_assignees`) are not people's chats here and stay."""
+    """With an inbox set, a card notifies only there among the chats a person reads. Bot Chats of
+    other profiles (`ask_assignees`) are not people's chats here and stay."""
     mine = subs.get(tid, [])
     at = (box["platform"], box["chat_id"])
     if not any((s["platform"], s["chat_id"]) == at for s in mine):
         subscribe(board, tid, box)
     for s in mine:
         if (s["platform"], s["chat_id"]) != at and readable(s) and (s["notifier_profile"] or "default") == "default":
-            kanban(board, "notify-unsubscribe", tid, "--platform", s["platform"], "--chat-id", s["chat_id"])
+            unsubscribe_idempotent(board, tid, s["platform"], s["chat_id"], s.get("thread_id") or "")
     subs[tid] = board_rows(board, "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,))
 
 
@@ -2296,7 +2339,7 @@ def route_questions(board: str, st: dict) -> bool:
         return (s["platform"], s["chat_id"]) in people
 
     retry = stalled_triage(board, tasks, children, st)
-    handled = flow_blocks(board, tasks, children, st)
+    handled = flow_blocks(board, tasks, children, st) if AUTO_FLOW_ADJ else {}
     for tid, t in tasks.items():
         if t["status"] not in OPEN:
             continue
@@ -2394,13 +2437,18 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
         # Answered, gone, or reassigned to another bot: the old bot must not be woken again. Archiving
         # removes a card's subscriptions itself, and unsubscribing a missing one fails the whole tick.
         if not now or (now["platform"], now["chat_id"]) != (r["platform"], r["chat_id"]):
-            if any((s["platform"], s["chat_id"]) == (r["platform"], r["chat_id"]) for s in subs.get(tid, [])):
+            matched_subs = [s for s in subs.get(tid, []) if (s["platform"], s["chat_id"]) == (r["platform"], r["chat_id"])]
+            failed_unsub = False
+            for s in matched_subs:
                 try:
-                    kanban(board, "notify-unsubscribe", tid, "--platform", r["platform"], "--chat-id", r["chat_id"])
+                    unsubscribe_idempotent(board, tid, r["platform"], r["chat_id"], s.get("thread_id") or "")
                 except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
                     retry = True
+                    failed_unsub = True
                     print(f"devflow: notify-unsubscribe failed for {board}/{tid}: {err}", file=sys.stderr)
-                    continue
+                    break
+            if failed_unsub:
+                continue
             del routed[key]
     for tid, t in tasks.items():
         chat = dest[tid]
@@ -2657,9 +2705,18 @@ def pending(profile: str | None = None) -> list[dict]:
     can be a follow-up, a pause or an answer to an older question; only `answer` applies one."""
     flow = (json.loads(TICK.read_text()) if TICK.exists() else {}).get("flow", {})
     out = []
-    for db in sorted(BOARDS.glob("*/kanban.db")):
-        board = db.parent.name
-        for t in board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks"):
+    registered = load_state()
+    if registered:
+        board_dbs = [(slug, BOARDS / slug / "kanban.db") for slug in sorted(registered) if (BOARDS / slug / "kanban.db").is_file()]
+    else:
+        board_dbs = [(db.parent.name, db) for db in sorted(BOARDS.glob("*/kanban.db"))]
+    for board, _db in board_dbs:
+        try:
+            task_rows = board_rows(board, "SELECT id, title, body, status, block_kind, assignee FROM tasks")
+        except sqlite3.Error as err:
+            print(f"devflow: pending skipping invalid board DB {board}: {err}", file=sys.stderr)
+            continue
+        for t in task_rows:
             if not waiting(t):
                 continue
             # The event the card waits on: a repeated block arrives as `block_loop_detected` (triage),
@@ -3585,20 +3642,41 @@ def pr_goal_context(board: str, repo: str, number: int, pr: dict) -> dict | None
     return ctx
 
 
-def judgment_fingerprint(pr: dict, *, goal_context: dict | None = None, repo_cfg: dict[str, str] | None = None) -> str:
-    """Bind PR judgment cache & [ADV] decisions to PR head/title/body PLUS governing card/EPIC scope & repo policy."""
+def judgment_fingerprint(
+    pr: dict,
+    *,
+    goal_context: dict | None = None,
+    repo_cfg: dict[str, str] | None = None,
+    templates_digest: str = "",
+) -> str:
+    """Bind PR judgment cache & [ADV] decisions to PR head/title/body PLUS governing card/EPIC scope,
+    repo policy, and canonical standard-delivery template digest."""
     import hashlib
+    cfg = repo_cfg or {}
     base_fp = pr["fingerprint"]
-    extra_protected = sorted(policy_lib.repo_protected_paths(repo_cfg or {}))
-    max_files = policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY)
+    extra_protected = sorted(policy_lib.repo_protected_paths(cfg))
+    max_files = policy_lib.repo_max_diff_files(cfg, POLICY)
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
-    if goal_context is None and not extra_protected and max_files == default_max:
+    manual_only = policy_lib.repo_deploy_manual_only(cfg)
+    allow_custom = policy_lib.repo_allow_custom_delivery(cfg)
+    if (
+        goal_context is None
+        and not extra_protected
+        and max_files == default_max
+        and not manual_only
+        and not allow_custom
+        and not templates_digest
+    ):
         return base_fp
     governing = {
         "pr_fingerprint": base_fp,
         "goal_context": goal_context,
         "protected_paths": extra_protected,
         "max_diff_files": max_files,
+        "deploy_manual_only": manual_only,
+        "allow_custom_delivery": allow_custom,
+        "standard_templates": templates_digest,
+        "standard_schema": 1 if templates_digest else 0,
     }
     return hashlib.sha1(json.dumps(governing, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
@@ -3607,7 +3685,8 @@ def resolve_pr_judgment_inputs(board: str, repo: str, number: int, pr: dict) -> 
     """Return `(goal_context, repo_cfg, effective_fingerprint)` for PR judgment caching & stale-check validation."""
     goal_ctx = pr_goal_context(board, repo, number, pr)
     repo_cfg = policy_lib.load_repo_config(entry(board).get("path"))
-    eff_fp = judgment_fingerprint(pr, goal_context=goal_ctx, repo_cfg=repo_cfg)
+    tpl_digest = standard_lib.templates_digest(TEMPLATE)
+    eff_fp = judgment_fingerprint(pr, goal_context=goal_ctx, repo_cfg=repo_cfg, templates_digest=tpl_digest)
     return goal_ctx, repo_cfg, eff_fp
 
 
@@ -3745,10 +3824,111 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
     goal_ctx, repo_cfg, eff_fp = resolve_pr_judgment_inputs(board, repo, number, pr)
     key = f"{repo}#{number}"
     rec = load_judgments().get(key) or {}
-    if rec.get("fingerprint") == eff_fp:
+    if rec.get("fingerprint") == eff_fp and not rec.get("transient_error"):
         return rec
     files = pr_files(repo, number)
     result = judge(pr, files, goal_context=goal_ctx, repo_cfg=repo_cfg) if (goal_ctx or repo_cfg) else judge(pr, files)
+    # Deterministic standard delivery check when PR touches canonical delivery files and kit templates exist.
+    touched_all = scope_lib.touched_paths(files)
+    if TEMPLATE.is_dir() and not policy_lib.repo_allow_custom_delivery(repo_cfg):
+        eff_std_cfg = dict(repo_cfg)
+        fetch_errors: list[tuple[str, str]] = []
+        # Resolve declarative deployment settings (`DEVFLOW_DEPLOY`, `DEVFLOW_DEPLOY_MANUAL_ONLY`)
+        # from exact PR head `.devflow/config.env` when modified in the PR, while keeping
+        # authorization-sensitive `DEVFLOW_ALLOW_CUSTOM_DELIVERY` strictly from trusted main `repo_cfg`.
+        if ".devflow/config.env" in touched_all:
+            cfg_removed = (
+                any(f.get("filename") == ".devflow/config.env" and f.get("status") == "removed" for f in files)
+                or (
+                    any(f.get("previous_filename") == ".devflow/config.env" and f.get("filename") != ".devflow/config.env" for f in files)
+                    and not any(f.get("filename") == ".devflow/config.env" and f.get("status") != "removed" for f in files)
+                )
+            )
+            if not cfg_removed:
+                try:
+                    head_cfg_text = branch_file(repo, pr["headRefOid"], ".devflow/config.env")
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error
+                    fetch_errors.append((".devflow/config.env", str(err)[:160]))
+                    head_cfg_text = None
+                else:
+                    if head_cfg_text is None:
+                        fetch_errors.append((".devflow/config.env", "content_unavailable"))
+                if head_cfg_text is not None:
+                    head_cfg = policy_lib.env_values(head_cfg_text)
+                    for key_name in ("DEVFLOW_DEPLOY", "DEVFLOW_DEPLOY_MANUAL_ONLY"):
+                        if key_name in head_cfg:
+                            eff_std_cfg[key_name] = head_cfg[key_name]
+                        else:
+                            eff_std_cfg.pop(key_name, None)
+        touched_std = standard_lib.dependent_standard_paths(
+            touched_all, base_cfg=repo_cfg, head_cfg=eff_std_cfg
+        )
+        fetched: dict[str, str | None] = {}
+        if touched_std and not fetch_errors:
+            touched_all_set = set(touched_all)
+            for rel in touched_std:
+                removed = (
+                    any(f.get("filename") == rel and f.get("status") == "removed" for f in files)
+                    or (
+                        any(f.get("previous_filename") == rel and f.get("filename") != rel for f in files)
+                        and not any(f.get("filename") == rel and f.get("status") != "removed" for f in files)
+                    )
+                )
+                if removed:
+                    fetched[rel] = None
+                    continue
+                try:
+                    content = branch_file(repo, pr["headRefOid"], rel)
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error, never cache clean
+                    fetch_errors.append((rel, str(err)[:160]))
+                    continue
+                if content is None:
+                    if rel in touched_all_set:
+                        # File is listed in PR diff as present on head; None means API unavailable.
+                        fetch_errors.append((rel, "content_unavailable"))
+                        continue
+                    # Untouched dependent file (pulled in by config.env change) returning None means missing on head.
+                    fetched[rel] = None
+                    continue
+                fetched[rel] = content
+        if fetch_errors:
+            failed_paths = [p for p, _ in fetch_errors]
+            sd = {
+                "ok": False,
+                "checked": touched_std or failed_paths,
+                "missing": [],
+                "drifted": [],
+                "custom_allowed": False,
+                "fetch_failed": True,
+                "failed_paths": failed_paths,
+                "findings": [
+                    f"無法讀取 PR head 的 devflow 公版交付檔（{', '.join(failed_paths)}），已 fail closed；請稍後重試"
+                ],
+            }
+            result["standard_delivery"] = sd
+            result["findings"] = list(result.get("findings") or []) + sd["findings"]
+            # Do not cache transient API/fetch failures as a completed judgment for this fingerprint.
+            return {
+                **result,
+                "board": board,
+                "repo": repo,
+                "pr": number,
+                "url": pr["url"],
+                "head_sha": pr["headRefOid"],
+                "fingerprint": eff_fp,
+                "judged_at": int(time.time()),
+                "advisor": None,
+                "posted": None,
+                "cached": False,
+                "transient_error": True,
+            }
+        if touched_std:
+            sd = standard_lib.check_standard_delivery_contents(
+                fetched, TEMPLATE, repo_cfg=eff_std_cfg, only_paths=touched_std
+            )
+            result["standard_delivery"] = sd
+            if not sd["ok"]:
+                result["findings"] = list(result.get("findings") or []) + sd["findings"]
     # Written only if no one stored another fingerprint during the Decisions call (a body, scope, or
     # policy edit judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
     return update_judgment(key, fp=rec.get("fingerprint", ""), board=board, repo=repo, pr=number, url=pr["url"],
@@ -3807,7 +3987,19 @@ def ensure_pr_advisor(board: str, rec: dict, epic: str | None) -> dict:
 
 def publish(rec: dict, verdict: str | None) -> dict:
     """Post `devflow-judgment` on the judged head when its state changes: success with no findings
-    or an advisor `ok`, failure on `revise`/`missing`, pending while the advisor is open."""
+    or an advisor `ok`, failure on `revise`/`missing`, error on transient fetch failure, pending
+    while the advisor is open."""
+    if rec.get("transient_error"):
+        key = f"{rec['repo']}#{rec['pr']}"
+        j_role, _, _ = trust_lib.judgment_gh_role(ROLES)
+        run(["gh", "api", "-X", "POST", f"repos/{rec['repo']}/statuses/{rec['head_sha']}", "-f", "state=error",
+             "-f", f"context={JUDGMENT_CHECK}", "-f", "description=transient fetch failure; retry standard-delivery check"],
+            gh=j_role)
+        # Invalidate any stale cached `posted` marker on the same head so a later recovery re-posts cleanly.
+        current = load_judgments().get(key) or {}
+        if current.get("posted") and current["posted"][0] == rec["head_sha"]:
+            update_judgment(key, fp=current.get("fingerprint", ""), posted=None)
+        return {**rec, "posted": [rec["head_sha"], "error"]}
     state = "success" if verdict == "ok" else "failure" if verdict in ("revise", "missing") else "pending"
     if rec.get("posted") == [rec["head_sha"], state]:
         return rec
@@ -3837,6 +4029,8 @@ def gate(board: str, repo: str, number: int, pr: dict | None = None) -> tuple[di
     rec = judgment(board, repo, number, pr)
     if rec.get("fingerprint") != eff_fp:
         raise DecisionsError("PR 或其卡片範圍／政策在判斷期間被修改；重跑")
+    if rec.get("transient_error"):
+        return publish(rec, None), None
     verdict = advisor_verdict(board, rec) if rec["findings"] else "ok"
     return publish(rec, verdict), verdict
 
@@ -3887,7 +4081,9 @@ def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
             if n is None:
                 continue
             rec, verdict = gate(board, repo, n)
-            if verdict is None:
+            if rec.get("transient_error"):
+                retry = True
+            elif verdict is None:
                 ensure_pr_advisor(board, rec, epic_of(d))
         except DecisionsError as err:
             retry = True
@@ -4023,6 +4219,7 @@ def cmd_preflight(a) -> None:
         pr_body=pr_body,
         run_tests=not a.no_test,
         allow_dirty=a.allow_dirty,
+        template_dir=TEMPLATE if TEMPLATE.is_dir() else None,
     )
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     if not rep["ok"]:
@@ -4080,9 +4277,10 @@ def main() -> None:
     p.add_argument("slug"); p.set_defaults(fn=cmd_repo_bind)
     p = repo.add_parser("doctor", help="read-only: project <-> board <-> repo bindings and deploy readiness")
     p.add_argument("slug", nargs="?"); p.set_defaults(fn=cmd_repo_doctor)
-    p = sub.add_parser("contract", help="copy missing devflow contract files into DIR")
+    p = sub.add_parser("contract", help="copy missing devflow contract files into DIR (or --sync-standard to enforce canonical delivery)")
     p.add_argument("slug"); p.add_argument("dir", nargs="?", default=".")
     p.add_argument("--ui", action="store_true", help="also add the Playwright UI scenario scaffold (.devflow/ui)")
+    p.add_argument("--sync-standard", action="store_true", help="overwrite canonical delivery files (.devflow/deploy.sh, capture.sh, redact.py, deploy.yml, etc.) with kit standard")
     p.set_defaults(fn=cmd_contract)
     p = sub.add_parser("operate", help="Hermes operates the deployed service UI: run reviewed op "
                        ".devflow/ui/ops/<op>.spec.ts on the VM runner (operate.yml), print result + screenshots")

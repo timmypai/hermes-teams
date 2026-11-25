@@ -69,6 +69,8 @@ metadata:
 - 可逆的事自己決定並記在 summary，不停下來問。
 - **Review 往復熔斷**：review 退件用 `kanban_request_changes`；同一張卡退件達上限（預設 2 輪，`roles.json` `policy.max_review_rounds`）時觸發熔斷，停止盲目互踢，由 orchestrator／architect 重檢根因或以 `needs_input` 請使用者定錨。同因再失敗必須換做法（`pstack:principle-attack-the-premise`），不要原樣重試。
 - **卡片與預算上限**：單一 EPIC 工作卡數上限與 worker 回合／時間預算由 `roles.json` `policy`／`worker_config` 宣告控制，超限自動要求收斂。
+- **公版交付強制對齊**：所有 repo 一律使用 devflow 公版部署與採證腳本（`.devflow/deploy.sh`、`capture.sh`、`redact.py`、`.github/workflows/deploy.yml`），禁止自寫黑箱部署包裝器；專案差異只放 `.devflow/config.env`、`Dockerfile`、`deploy/compose.yml` 與選用的 `.devflow/deploy-build.sh`（只負責 build `$DEVFLOW_IMAGE`）。偏離公版時 `repo doctor`、`preflight` 與 `check pr` 會直接確定性擋下，用 `devflow contract <slug> . --sync-standard` 還原。
+- **反官僚與行動導向交接**：禁止在留言貼多段免責宣言，禁止提「要不要請另一個 Bot 檢查？」這類元問題。`kanban_block` 嚴格寫 3 段：① 確切失敗步驟與錯誤原因 ② 已查證事實 ③ 唯一具體下一步（需人動手只給一條明確動作）。
 - 只有三種情況才 `kanban_block`：缺憑證/權限（`capability`）、產品方向或付費/破壞性資料操作需要使用者決定（`needs_input`）、在等其他卡（`dependency`，需先 `kanban_link` 該卡為 parent）。block 時 reason **必須是給人直接判讀的純白話**（禁止寫 commit SHA、CI run ID、artifact 編號或內部參數代號）。`needs_input` 與 `capability` 的 reason 第一行固定為 `問題：<一句白話問題>？選項：A / B（建議 A）`，150 字內（聊天通知只顯示前 160 字）；`capability` 的問題寫成誰做什麼具體動作（例「要由 Hermes 用主機 ssh 註冊 devflow 共用 runner 嗎？」），不要只寫缺什麼。第二行以後只寫簡潔白話，使用者只看這段就能決定：`背景：` 目前完成到哪、只缺哪一件事（1–2 句白話）；`A：` / `B：` 各選項的白話結果與影響；`建議：` 一句話理由。Hermes 會把它送到聊天問使用者，回覆後以留言帶回並重跑本卡。
 - 要使用者**自己動手**的 `capability`（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：問題第一行寫成 `問題：請你 <動作>，做完回覆「完成」？選項：A 已完成 / B 暫緩（建議 A）`，不要寫成「要不要／同意嗎」：使用者回「同意」只表示願意做，交回卡片後重查仍缺、再 block 同一題會觸發重複阻擋並被轉進 triage。由 Bot 做、只需使用者核准的事（例如「要由 Hermes 註冊 runner 嗎？」）才用「同意 / 先不要」。
 - 卡片範圍外的發現：寫進 summary/metadata `followups`，由 orchestrator 決定是否建卡。

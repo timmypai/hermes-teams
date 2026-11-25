@@ -17,7 +17,9 @@
     "max_diff_files": 30,
     "advisor_retry_seconds": 30,
     "advisor_max_retries": 6,
-    "default_merge_method": "squash"
+    "default_merge_method": "squash",
+    "auto_plan_advisor": false,
+    "auto_flow_adj": false
   },
   "worker_config": {
     "agent.max_turns": "150",

@@ -621,5 +621,597 @@ class ReviewFindingsRegression(unittest.TestCase):
         self.assertTrue(any("同時對應多張未封存開發卡" in f for f in rec_amb["scope_findings"]), rec_amb)
 
 
+class StandardDeliveryAndStability(unittest.TestCase):
+    """Tests for standard delivery enforcement, pending isolation, idempotent unsubscribe, and meta-loop defaults."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="devflow-std-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        shutil.copy(KIT / "roles.json", self.root / "roles.json")
+        shutil.copytree(KIT / "templates", self.root / "templates")
+        (self.root / "state").mkdir()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.root / "state" / "repos.json").write_text(json.dumps({
+            "b": {"slug": "b", "repo": REPO, "path": str(self.repo), "port": 18101, "default_branch": "main"}
+        }))
+        os.environ["DEVFLOW_HERMES_DATA"] = str(self.root / "data")
+        self.addCleanup(os.environ.pop, "DEVFLOW_HERMES_DATA", None)
+        self.df = load_devflow(self.root)
+
+    def test_sync_standard_enforces_canonical_delivery_and_preflight_blocks_custom_drift(self) -> None:
+        (self.repo / ".devflow").mkdir()
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_PORT=18101\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n",
+            encoding="utf-8",
+        )
+        res = self.df.standard_lib.sync_standard_files(
+            self.repo, self.df.TEMPLATE, repo_cfg=self.df.policy_lib.load_repo_config(self.repo)
+        )
+        self.assertIn(".devflow/deploy.sh", res["updated"])
+        self.assertIn(".github/workflows/deploy.yml", res["updated"])
+        # Manual-only mode must strip push trigger while keeping canonical workflow
+        wf_text = (self.repo / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.assertNotIn("branches:", wf_text)
+        self.assertIn("workflow_dispatch:", wf_text)
+        # Clean repo passes standard delivery check
+        chk = self.df.standard_lib.check_standard_delivery_dir(
+            self.repo, self.df.TEMPLATE, repo_cfg=self.df.policy_lib.load_repo_config(self.repo)
+        )
+        self.assertTrue(chk["ok"], chk)
+
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "standard contract"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+        # Replacing .devflow/deploy.sh with a custom opaque wrapper must fail preflight deterministically
+        (self.repo / ".devflow" / "deploy.sh").write_text("#!/usr/bin/env bash\nexec python3 custom.py\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".devflow/deploy.sh"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "feat: custom deployer"], cwd=self.repo, check=True)
+        rep = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False, template_dir=self.df.TEMPLATE
+        )
+        self.assertFalse(rep["ok"])
+        self.assertEqual(rep["checks"]["standard_delivery"], "fail")
+        self.assertTrue(any("偏離 devflow 公版交付檔" in f and ".devflow/deploy.sh" in f for f in rep["findings"]), rep)
+
+    def test_pending_skips_unregistered_or_corrupt_board_dbs_without_crashing(self) -> None:
+        boards = self.root / "data" / "kanban" / "boards"
+        # Orphan unregistered board with minimal invalid schema (like stray `boards/b` in production)
+        orphan = boards / "orphan" / "kanban.db"
+        orphan.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(orphan)) as c, c:
+            c.execute("CREATE TABLE tasks (id TEXT, status TEXT, goal_mode INTEGER)")
+        # Registered board `b` with corrupted/missing columns must ALSO be skipped gracefully
+        bad_reg = boards / "b" / "kanban.db"
+        bad_reg.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(bad_reg)) as c, c:
+            c.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+        self.assertEqual(self.df.pending(), [])
+
+    def test_default_policy_disables_async_meta_loops_and_allows_ship_only_epic(self) -> None:
+        self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
+        self.assertFalse(self.df.AUTO_FLOW_ADJ)
+        # Ship-only EPIC without synthetic Given/When/Then scenarios passes plan_rules when ACs are defined & covered
+        cards = {
+            "t_ep01": {"id": "t_ep01", "title": "[EPIC] 出貨部署", "status": "todo", "assignee": "orchestrator",
+                       "workspace_kind": "dir", "parents": ["t_sh01"], "children": [], "goal_mode": False,
+                       "body": "## 目標\n合併並部署 PR #16\n## 驗收\n- AC-1 [cli] 合併進 main\n- AC-2 [api] 部署健康\n"},
+            "t_sh01": {"id": "t_sh01", "title": "[SHIP] 出貨 PR #16", "status": "ready", "assignee": "devops",
+                       "workspace_kind": "dir", "parents": [], "children": ["t_ep01"], "goal_mode": False,
+                       "body": "## 目標\n合併並部署\n## 驗收\n覆蓋：AC-1, AC-2\nEPIC: t_ep01\n"},
+        }
+        findings = self.df.plan_rules("b", "t_ep01", cards)
+        self.assertEqual(findings, [], findings)
+        # Ship-only EPIC still enforces meaningful acceptance coverage (uncovered AC fails plan_rules)
+        uncovered = {
+            **cards,
+            "t_sh01": {**cards["t_sh01"], "body": "## 目標\n合併並部署\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep01\n"},
+        }
+        self.assertTrue(any("AC-2" in f for f in self.df.plan_rules("b", "t_ep01", uncovered)))
+
+    def test_judgment_standard_delivery_fails_closed_on_deletion_and_transient_fetch_error_without_caching(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. Deleting the only touched canonical file must fail closed (never silently pass)
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "removed", "patch": ""}]
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(AssertionError("should not fetch removed file"))
+        pr_del = {**f.pr, "number": 11, "headRefOid": "d" * 40, "url": f"https://github.com/{REPO}/pull/11", "fingerprint": "fp-del"}
+        rec_del = self.df.judgment("b", REPO, 11, pr_del)
+        self.assertFalse(rec_del["standard_delivery"]["ok"], rec_del)
+        self.assertIn(".devflow/deploy.sh", rec_del["standard_delivery"]["missing"])
+        self.assertTrue(any("缺少 devflow 公版交付檔" in x for x in rec_del["findings"]), rec_del)
+
+        # 2. Transient fetch exception on a modified canonical file must fail closed AND not cache
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        pr_err = {**f.pr, "number": 12, "headRefOid": "e" * 40, "url": f"https://github.com/{REPO}/pull/12", "fingerprint": "fp-err"}
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(RuntimeError("API 503"))
+        rec_err = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertFalse(rec_err["standard_delivery"]["ok"], rec_err)
+        self.assertTrue(rec_err["standard_delivery"].get("fetch_failed"), rec_err)
+        self.assertFalse(rec_err.get("cached", True))
+        self.assertTrue(any("無法讀取 PR head" in x for x in rec_err["findings"]), rec_err)
+        self.assertNotIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 3. Returning None for a modified (non-removed) canonical file also fails closed without caching
+        self.df.branch_file = lambda repo, ref, path: None
+        rec_none = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertFalse(rec_none["standard_delivery"]["ok"], rec_none)
+        self.assertTrue(rec_none["standard_delivery"].get("fetch_failed"), rec_none)
+        self.assertNotIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 4. Retry succeeds once GitHub returns canonical template content and caches clean result
+        canonical = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical
+        rec_ok = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertTrue(rec_ok["standard_delivery"]["ok"], rec_ok)
+        self.assertEqual(rec_ok["standard_delivery"]["findings"], [])
+        self.assertFalse(any("公版交付檔" in x for x in rec_ok["findings"]), rec_ok)
+        self.assertIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 5. PR-level risk escalation remains active even when AUTO_PLAN_ADVISOR is False
+        self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"probability": 0.9 if q["name"] == "unlabeled_fix" else 0.05} for q in qs
+        }
+        f.files = [{"filename": "app/migrate.py", "status": "modified", "patch": "+DROP TABLE x"}]
+        pr_risk = {**f.pr, "number": 13, "headRefOid": "f" * 40, "url": f"https://github.com/{REPO}/pull/13", "fingerprint": "fp-risk"}
+        rec_risk = self.df.judgment("b", REPO, 13, pr_risk)
+        self.assertTrue(rec_risk["findings"], rec_risk)
+        self.assertGreaterEqual(rec_risk["risks"].get("unlabeled_fix", 0), 0.9)
+
+    def test_unsubscribe_idempotent_treats_no_such_subscription_as_success(self) -> None:
+        self.df.kanban = lambda *a: (_ for _ in ()).throw(SystemExit("no such subscription"))
+        # Must not raise
+        self.df.unsubscribe_idempotent("b", "t_1", "local", "chat1", "thr1")
+
+    def test_deploy_sh_pre_cutover_seed_filters_by_app_service_not_sidecar_or_db(self) -> None:
+        work = Path(tempfile.mkdtemp(prefix="devflow-deploy-seed-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        (work / ".devflow").mkdir()
+        (work / "deploy").mkdir()
+        shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+        (work / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=probe\nDEVFLOW_SERVICE=web\nDEVFLOW_PORT=18991\nDEVFLOW_APP_PORT=8080\nDEVFLOW_HEALTH_PATH=/health\n",
+            encoding="utf-8",
+        )
+        (work / "deploy" / "compose.yml").write_text("services:\n  web:\n    image: ${DEVFLOW_IMAGE}\n", encoding="utf-8")
+        for name, body in (
+            ("deploy-build.sh", "#!/usr/bin/env bash\nexit 0\n"),
+            ("capture.sh", "#!/usr/bin/env bash\nexit 0\n"),
+            ("verify.sh", "#!/usr/bin/env bash\nexit 1\n"),
+        ):
+            p = work / ".devflow" / name
+            p.write_text(body, encoding="utf-8")
+            p.chmod(0o755)
+        bin_dir = work / "bin"
+        bin_dir.mkdir()
+        calls_file = work / "calls.jsonl"
+        (bin_dir / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_dir / "curl").chmod(0o755)
+        (bin_dir / "docker").write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+calls = Path(os.environ["MOCK_CALLS"])
+with calls.open("a") as fh:
+    fh.write(json.dumps({"args": args, "sha": os.environ.get("DEVFLOW_SOURCE_SHA", "")}) + "\\n")
+if args[:2] == ["image", "inspect"]:
+    sys.exit(0 if Path(os.environ["MOCK_TAGGED"]).exists() else 1)
+if args[:1] == ["ps"]:
+    filters = [args[i + 1] for i, a in enumerate(args) if a == "--filter" and i + 1 < len(args)]
+    if "label=com.docker.compose.service=web" in filters:
+        print("cid-web-111111111111")
+    else:
+        print("cid-db-999999999999")
+        print("cid-web-111111111111")
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    cid = args[-1]
+    fmt = args[args.index("--format") + 1] if "--format" in args else ""
+    if cid == "cid-web-111111111111":
+        print("sha256:web-old-img" if fmt == "{{.Image}}" else "old-web-sha-1111111111111111111111111111")
+    else:
+        print("sha256:db-img" if fmt == "{{.Image}}" else "old-db-sha-99999999999999999999999999999")
+    sys.exit(0)
+if args[:1] == ["tag"]:
+    Path(os.environ["MOCK_TAGGED"]).write_text(args[1])
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        (bin_dir / "docker").chmod(0o755)
+        home = work / "home"
+        home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_SHA": "new-sha-22222222222222222222222222222222",
+            "MOCK_CALLS": str(calls_file),
+            "MOCK_TAGGED": str(work / "tagged"),
+        }
+        proc = subprocess.run(["bash", ".devflow/deploy.sh"], cwd=work, env=env, text=True, capture_output=True)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        records = [json.loads(line) for line in calls_file.read_text().splitlines()]
+        tag_calls = [r["args"] for r in records if r["args"][:1] == ["tag"]]
+        self.assertEqual(tag_calls, [["tag", "sha256:web-old-img", "devflow/probe:live"]])
+        rollback_ups = [r for r in records if r["args"][:1] == ["compose"] and "--no-build" in r["args"]]
+        self.assertTrue(rollback_ups, records)
+        self.assertEqual(rollback_ups[0]["sha"], "old-web-sha-1111111111111111111111111111")
+
+    def test_judgment_uses_exact_head_config_for_manual_only_switches_and_invalidates_stale_and_template_caches(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. Main has manual_only=false; PR turns DEVFLOW_DEPLOY_MANUAL_ONLY=true and switches deploy.yml to workflow_dispatch
+        (self.repo / ".devflow").mkdir(exist_ok=True)
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        wf_manual = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "true"}
+        )
+        f.files = [
+            {"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_DEPLOY_MANUAL_ONLY=true"},
+            {"filename": ".github/workflows/deploy.yml", "status": "modified", "patch": "-push:"},
+        ]
+        head_files = {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n",
+            ".github/workflows/deploy.yml": wf_manual,
+        }
+        self.df.branch_file = lambda repo, ref, path: head_files.get(path)
+        pr_on = {**f.pr, "number": 21, "headRefOid": "1" * 40, "url": f"https://github.com/{REPO}/pull/21", "fingerprint": "fp-on"}
+        rec_on = self.df.judgment("b", REPO, 21, pr_on)
+        self.assertTrue(rec_on["standard_delivery"]["ok"], rec_on)
+
+        # 2. Main has manual_only=true; PR turns DEVFLOW_DEPLOY_MANUAL_ONLY=false and restores canonical push+workflow_dispatch
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        wf_auto = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "false"}
+        )
+        head_files_off = {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=false\n",
+            ".github/workflows/deploy.yml": wf_auto,
+        }
+        self.df.branch_file = lambda repo, ref, path: head_files_off.get(path)
+        pr_off = {**f.pr, "number": 22, "headRefOid": "2" * 40, "url": f"https://github.com/{REPO}/pull/22", "fingerprint": "fp-off"}
+        rec_off = self.df.judgment("b", REPO, 22, pr_off)
+        self.assertTrue(rec_off["standard_delivery"]["ok"], rec_off)
+
+        # 3. PR cannot self-exempt via DEVFLOW_ALLOW_CUSTOM_DELIVERY=true in head config.env
+        f.files = [
+            {"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_ALLOW_CUSTOM_DELIVERY=true"},
+            {"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+exec custom.py"},
+        ]
+        self.df.branch_file = lambda repo, ref, path: {
+            ".devflow/config.env": "DEVFLOW_APP=b\nDEVFLOW_ALLOW_CUSTOM_DELIVERY=true\n",
+            ".devflow/deploy.sh": "#!/usr/bin/env bash\nexec custom.py\n",
+        }.get(path)
+        pr_bypass = {**f.pr, "number": 23, "headRefOid": "3" * 40, "url": f"https://github.com/{REPO}/pull/23", "fingerprint": "fp-byp"}
+        rec_bypass = self.df.judgment("b", REPO, 23, pr_bypass)
+        self.assertFalse(rec_bypass["standard_delivery"]["ok"], rec_bypass)
+        self.assertIn(".devflow/deploy.sh", rec_bypass["standard_delivery"]["drifted"])
+
+        # 4. Pre-upgrade cached clean judgment (keyed by legacy base_fp without standard_templates) MUST be invalidated
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        pr_mig = {**f.pr, "number": 24, "headRefOid": "4" * 40, "url": f"https://github.com/{REPO}/pull/24", "fingerprint": "legacyfp24"}
+        self.df.update_judgment(f"{REPO}#24", board="b", repo=REPO, pr=24, url=pr_mig["url"],
+                                head_sha=pr_mig["headRefOid"], fingerprint="legacyfp24", findings=[])
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+exec custom.py"}]
+        self.df.branch_file = lambda repo, ref, path: "#!/usr/bin/env bash\nexec custom.py\n"
+        rec_mig = self.df.judgment("b", REPO, 24, pr_mig)
+        self.assertNotEqual(rec_mig["fingerprint"], "legacyfp24")
+        self.assertFalse(rec_mig["standard_delivery"]["ok"], rec_mig)
+        self.assertIn(".devflow/deploy.sh", rec_mig["standard_delivery"]["drifted"])
+
+        # 5. Updating a canonical template invalidates cached clean judgment and flags drift on next check
+        canonical_before = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical_before
+        pr_tpl = {**f.pr, "number": 25, "headRefOid": "5" * 40, "url": f"https://github.com/{REPO}/pull/25", "fingerprint": "fp-tpl25"}
+        rec_before = self.df.judgment("b", REPO, 25, pr_tpl)
+        self.assertTrue(rec_before["standard_delivery"]["ok"], rec_before)
+        # Upgrade kit template under self.df.TEMPLATE
+        tpl_deploy = self.df.TEMPLATE / ".devflow" / "deploy.sh"
+        tpl_deploy.write_text(tpl_deploy.read_text(encoding="utf-8") + "# template-v2\n", encoding="utf-8")
+        rec_after = self.df.judgment("b", REPO, 25, pr_tpl)
+        self.assertNotEqual(rec_after["fingerprint"], rec_before["fingerprint"])
+        self.assertFalse(rec_after["standard_delivery"]["ok"], rec_after)
+        self.assertIn(".devflow/deploy.sh", rec_after["standard_delivery"]["drifted"])
+
+    def test_config_only_deploy_switches_validate_dependent_files_in_judgment_and_preflight(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        wf_auto = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "false"}
+        )
+        wf_manual = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "true"}
+        )
+        (self.repo / ".devflow").mkdir(exist_ok=True)
+        (self.repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+
+        # 1a. judgment: config-only switch manual_only false -> true with untouched push deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        f.files = [{"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_DEPLOY_MANUAL_ONLY=true"}]
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n"
+            if path == ".devflow/config.env"
+            else wf_auto
+        )
+        pr1 = {**f.pr, "number": 31, "headRefOid": "6" * 40, "url": f"https://github.com/{REPO}/pull/31", "fingerprint": "fp-c1"}
+        r1 = self.df.judgment("b", REPO, 31, pr1)
+        self.assertFalse(r1["standard_delivery"]["ok"], r1)
+        self.assertIn(".github/workflows/deploy.yml", r1["standard_delivery"]["drifted"])
+
+        # 1b. judgment: config-only switch manual_only true -> false with untouched manual-only deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=false\n"
+            if path == ".devflow/config.env"
+            else wf_manual
+        )
+        pr2 = {**f.pr, "number": 32, "headRefOid": "7" * 40, "url": f"https://github.com/{REPO}/pull/32", "fingerprint": "fp-c2"}
+        r2 = self.df.judgment("b", REPO, 32, pr2)
+        self.assertFalse(r2["standard_delivery"]["ok"], r2)
+        self.assertIn(".github/workflows/deploy.yml", r2["standard_delivery"]["drifted"])
+
+        # 1c. judgment: config-only enabling DEVFLOW_DEPLOY=true when deploy.sh/deploy.yml are missing on head MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n" if path == ".devflow/config.env" else None
+        )
+        pr3 = {**f.pr, "number": 33, "headRefOid": "8" * 40, "url": f"https://github.com/{REPO}/pull/33", "fingerprint": "fp-c3"}
+        r3 = self.df.judgment("b", REPO, 33, pr3)
+        self.assertFalse(r3["standard_delivery"]["ok"], r3)
+        self.assertEqual(set(r3["standard_delivery"]["missing"]), {".devflow/deploy.sh", ".github/workflows/deploy.yml"})
+
+        # 2. preflight: config-only switch manual_only=true with untouched push deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        (self.repo / ".github" / "workflows" / "deploy.yml").write_text(wf_auto, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base auto deploy"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", ".devflow/config.env"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "chore: manual only without workflow update"], cwd=self.repo, check=True)
+        pf = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False, template_dir=self.df.TEMPLATE
+        )
+        self.assertFalse(pf["ok"], pf)
+        self.assertEqual(pf["checks"]["standard_delivery"], "fail")
+        self.assertIn(".github/workflows/deploy.yml", pf["standard_delivery"]["drifted"])
+
+    def test_deploy_sh_rollback_from_pre_upgrade_snapshot_never_inherits_failed_candidate_sha(self) -> None:
+        for mode in ("pre_upgrade_with_label", "pre_upgrade_no_label", "new_format_with_source_sha"):
+            with self.subTest(mode=mode):
+                work = Path(tempfile.mkdtemp(prefix=f"devflow-rb-{mode}-"))
+                self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+                (work / ".devflow").mkdir()
+                (work / "deploy").mkdir()
+                shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+                (work / ".devflow" / "config.env").write_text(
+                    "DEVFLOW_APP=rbprobe\nDEVFLOW_SERVICE=app\nDEVFLOW_PORT=18992\nDEVFLOW_APP_PORT=8080\nDEVFLOW_HEALTH_PATH=/health\n",
+                    encoding="utf-8",
+                )
+                (work / "deploy" / "compose.yml").write_text("services:\n  app:\n    image: ${DEVFLOW_IMAGE}\n", encoding="utf-8")
+                post_log = work / "post.log"
+                for name, body in (
+                    ("deploy-build.sh", "#!/usr/bin/env bash\nexit 0\n"),
+                    ("capture.sh", "#!/usr/bin/env bash\nexit 0\n"),
+                    ("verify.sh", "#!/usr/bin/env bash\nexit 1\n"),
+                    ("deploy-post.sh", f'#!/usr/bin/env bash\nprintf "%s|%s\\n" "$DEVFLOW_DEPLOY_PHASE" "$DEVFLOW_SOURCE_SHA" >> "{post_log}"\n'),
+                ):
+                    p = work / ".devflow" / name
+                    p.write_text(body, encoding="utf-8")
+                    p.chmod(0o755)
+                home = work / "home"
+                live_dir = home / ".devflow-live" / "rbprobe.d" / "old-snap"
+                live_dir.mkdir(parents=True)
+                shutil.copy2(work / "deploy" / "compose.yml", live_dir / "compose.yml")
+                shutil.copy2(work / ".devflow" / "config.env", live_dir / "config.env")
+                (live_dir / ".env").write_text("", encoding="utf-8")
+                (live_dir / "image").write_text("sha256:" + ("1" * 64) + "\n", encoding="utf-8")
+                if mode == "new_format_with_source_sha":
+                    (live_dir / "source_sha").write_text("saved-old-sha-" + ("0" * 26) + "\n", encoding="utf-8")
+                (home / ".devflow-live" / "rbprobe").symlink_to(live_dir)
+
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                calls_file = work / "calls.jsonl"
+                (bin_dir / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                (bin_dir / "curl").chmod(0o755)
+                label_sha = "label-old-sha-" + ("9" * 26) if mode == "pre_upgrade_with_label" else ""
+                (bin_dir / "docker").write_text(
+                    f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path({str(calls_file)!r}).open("a") as fh:
+    fh.write(json.dumps({{"args": args, "sha": os.environ.get("DEVFLOW_SOURCE_SHA", "")}}) + "\\n")
+if args[:2] == ["image", "inspect"]:
+    if "--format" in args:
+        fmt = args[args.index("--format") + 1]
+        if "org.opencontainers.image.revision" in fmt:
+            print({label_sha!r} if {bool(label_sha)!r} else "<no value>")
+        else:
+            print("<no value>")
+    sys.exit(0)
+sys.exit(0)
+""",
+                    encoding="utf-8",
+                )
+                (bin_dir / "docker").chmod(0o755)
+                failed_sha = "failed-cand-sha-" + ("f" * 24)
+                env = {
+                    **os.environ,
+                    "HOME": str(home),
+                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "GITHUB_SHA": failed_sha,
+                }
+                proc = subprocess.run(["bash", ".devflow/deploy.sh"], cwd=work, env=env, text=True, capture_output=True)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                records = [json.loads(line) for line in calls_file.read_text().splitlines()]
+                rb_ups = [r for r in records if r["args"][:1] == ["compose"] and "--no-build" in r["args"]]
+                self.assertTrue(rb_ups, records)
+                expected_sha = (
+                    "saved-old-sha-" + ("0" * 26)
+                    if mode == "new_format_with_source_sha"
+                    else (label_sha if mode == "pre_upgrade_with_label" else "")
+                )
+                self.assertEqual(rb_ups[0]["sha"], expected_sha)
+                self.assertNotEqual(rb_ups[0]["sha"], failed_sha)
+                self.assertEqual(post_log.read_text().strip(), f"rollback|{expected_sha}")
+
+    def test_devflow_deploy_false_case_variants_match_between_standard_validation_and_deploy_sh(self) -> None:
+        for cfg_line in ("false", "False", "FALSE", '" false "', "' FALSE '"):
+            with self.subTest(cfg_line=cfg_line):
+                parsed = self.df.policy_lib.env_values(f"DEVFLOW_DEPLOY={cfg_line}\n")
+                self.assertEqual(
+                    self.df.standard_lib.required_standard_files(parsed),
+                    self.df.standard_lib.STANDARD_CORE_FILES,
+                )
+                work = Path(tempfile.mkdtemp(prefix="devflow-deploy-off-"))
+                self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+                (work / ".devflow").mkdir()
+                shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+                (work / ".devflow" / "config.env").write_text(
+                    f"DEVFLOW_APP=offprobe\nDEVFLOW_DEPLOY={cfg_line}\n", encoding="utf-8"
+                )
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "docker").write_text("#!/usr/bin/env bash\necho DOCKER_CALLED >&2; exit 99\n", encoding="utf-8")
+                (bin_dir / "docker").chmod(0o755)
+                proc = subprocess.run(
+                    ["bash", ".devflow/deploy.sh"],
+                    cwd=work,
+                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("skip deploy", proc.stdout)
+                self.assertNotIn("DOCKER_CALLED", proc.stderr)
+
+    def test_transient_fetch_failure_end_to_end_across_gate_check_pr_merge_and_tick(self) -> None:
+        import io
+        import types
+        from contextlib import redirect_stdout
+
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. No prior judgment + API 503: gate, cmd_check_pr, cmd_ship_merge, tick_prs all fail closed cleanly
+        f.pr = {
+            **f.pr,
+            "number": 41,
+            "headRefOid": "a" * 40,
+            "url": f"https://github.com/{REPO}/pull/41",
+            "fingerprint": "fp-41-v1",
+            "state": "OPEN",
+        }
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(RuntimeError("API 503"))
+
+        rec, verdict = self.df.gate("b", REPO, 41)
+        self.assertIsNone(verdict)
+        self.assertTrue(rec.get("transient_error"))
+        self.assertEqual(rec["url"], f"https://github.com/{REPO}/pull/41")
+        self.assertEqual(f.statuses[-1], "error")
+        self.assertNotIn(f"{REPO}#41", self.df.load_judgments())
+
+        # cmd_check_pr must exit 3 with wait=retry (NOT KeyError: 'url')
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit) as cm:
+            self.df.cmd_check_pr(types.SimpleNamespace(board="b", pr=41))
+        self.assertEqual(cm.exception.code, 3)
+        out_check = json.loads(buf.getvalue())
+        self.assertEqual(out_check["wait"], "retry")
+        self.assertEqual(out_check["pr"], f"https://github.com/{REPO}/pull/41")
+        self.assertTrue(any("無法讀取 PR head" in x for x in out_check["findings"]))
+
+        # cmd_ship_merge with valid approval must still exit 3 wait=retry
+        f.reviews = [{"user": "rev", "state": "APPROVED", "commit_id": "a" * 40}]
+        buf_m = io.StringIO()
+        with redirect_stdout(buf_m), self.assertRaises(SystemExit) as cm_m:
+            self.df.cmd_ship_merge(types.SimpleNamespace(board="b", pr=41))
+        self.assertEqual(cm_m.exception.code, 3)
+        self.assertEqual(json.loads(buf_m.getvalue())["wait"], "retry")
+        self.assertEqual(f.merges, [])
+
+        # tick_prs must mark retry=True and NEVER open an [ADV] advisor card for a transient error
+        f.cards["t_rev41"] = {
+            "task": {"id": "t_rev41", "title": "[DEV] x", "body": "", "status": "review",
+                     "completion_contract": f"https://github.com/{REPO}/pull/41"},
+            "runs": [],
+        }
+        orig_kanban = self.df.kanban
+        self.df.kanban = lambda b, *a: json.dumps(f.cards["t_rev41"]) if a[:2] == ("show", "t_rev41") else orig_kanban(b, *a)
+        adv_calls: list = []
+        self.df.ensure_pr_advisor = lambda *a: adv_calls.append(a)
+        retry = self.df.tick_prs(
+            "b",
+            REPO,
+            [{"id": "t_rev41", "title": "[DEV] x", "assignee": "reviewer", "status": "review",
+              "completion_contract": f"https://github.com/{REPO}/pull/41"}],
+        )
+        self.assertTrue(retry)
+        self.assertEqual(adv_calls, [])
+
+        # 2. Stale prior success on same head, then body edit + API 503 must overwrite GitHub status to error
+        f.statuses.clear()
+        f.files = [{"filename": "app/a.py", "status": "modified", "patch": "+x=1"}]
+        rec_ok, v_ok = self.df.gate("b", REPO, 41)
+        self.assertEqual(v_ok, "ok")
+        self.assertEqual(f.statuses, ["success"])
+
+        # Same head_sha, edited body changes fingerprint, now touches deploy.sh and API 503s
+        f.pr = {**f.pr, "fingerprint": "fp-41-v2", "body": "edited body"}
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        rec_fail, v_fail = self.df.gate("b", REPO, 41)
+        self.assertIsNone(v_fail)
+        self.assertTrue(rec_fail.get("transient_error"))
+        self.assertEqual(f.statuses[-1], "error")
+
+        # 3. Once API recovers with canonical content, retry recomputes cleanly and caches new fingerprint
+        canonical = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical
+        rec_recov, v_recov = self.df.gate("b", REPO, 41)
+        self.assertFalse(rec_recov.get("transient_error", False))
+        self.assertTrue(rec_recov["standard_delivery"]["ok"])
+        self.assertEqual(self.df.load_judgments()[f"{REPO}#41"]["fingerprint"], rec_recov["fingerprint"])
+
+
 if __name__ == "__main__":
     unittest.main()
