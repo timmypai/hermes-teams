@@ -1091,10 +1091,11 @@ sys.exit(0)
                 self.assertEqual(post_log.read_text().strip(), f"rollback|{expected_sha}")
 
     def test_devflow_deploy_false_case_variants_match_between_standard_validation_and_deploy_sh(self) -> None:
-        for val in ("false", "False", "FALSE"):
-            with self.subTest(val=val):
+        for cfg_line in ("false", "False", "FALSE", '" false "', "' FALSE '"):
+            with self.subTest(cfg_line=cfg_line):
+                parsed = self.df.policy_lib.env_values(f"DEVFLOW_DEPLOY={cfg_line}\n")
                 self.assertEqual(
-                    self.df.standard_lib.required_standard_files({"DEVFLOW_DEPLOY": val}),
+                    self.df.standard_lib.required_standard_files(parsed),
                     self.df.standard_lib.STANDARD_CORE_FILES,
                 )
                 work = Path(tempfile.mkdtemp(prefix="devflow-deploy-off-"))
@@ -1102,7 +1103,7 @@ sys.exit(0)
                 (work / ".devflow").mkdir()
                 shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
                 (work / ".devflow" / "config.env").write_text(
-                    f"DEVFLOW_APP=offprobe\nDEVFLOW_DEPLOY={val}\n", encoding="utf-8"
+                    f"DEVFLOW_APP=offprobe\nDEVFLOW_DEPLOY={cfg_line}\n", encoding="utf-8"
                 )
                 bin_dir = work / "bin"
                 bin_dir.mkdir()
