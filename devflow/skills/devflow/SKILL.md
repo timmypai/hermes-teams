@@ -99,7 +99,10 @@ metadata:
    直接回覆編號或你的想法。
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
-3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。題目要使用者自己動手（設 secret、OAuth、在主機執行指令）時，只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
+3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後依題型處理再呼叫 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
+   - **受保護檔合併核准題**：**只有使用者明確確認核准合併（選 A／同意）時**，先核對本次受審 PR 的完整 40 碼 `head_sha`（取自卡片 `metadata.head_sha` 或 `devflow check pr <board> <pr>`，不可猜測或省略），先執行 `terminal: devflow approve <board> <pr> --head <完整40碼SHA>` 記錄核准，再執行 `devflow answer`；若使用者拒絕或選 B 退回，**絕不執行 `devflow approve`**，直接以 `devflow answer` 交回拒絕回覆。
+   - **計畫風險定錨題**：**只有使用者明確選擇核准目前計畫（選 B）時**，先從 `question` 的 `計畫雜湊：` 取得 12 碼雜湊，執行 `terminal: devflow approve-plan <board> <epic> --plan-hash <12碼雜湊>` 記錄明確同意，再執行 `devflow answer`；若使用者選擇調整縮減（選 A）或拒絕，**絕不執行 `devflow approve-plan`**，直接以 `devflow answer` 交回調整指示（調整消除風險前維持暫停出貨）。
+   - **要使用者自己動手的題目**（設 secret、OAuth、在主機執行指令）：只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
 5. 說「有沒有送到」只看 `devflow pending` 的 `chats[]`，它讀的是那個對話自己的紀錄：`woken` = 通知已進入那個對話，`replied` = 那個 bot 之後有回話。`woken` 為 false 時說「那邊還沒看到這則通知（Hermes 一次叫醒一個 bot，常晚約 1 分鐘）」，不要說「未送達」；超過 10 分鐘仍為 false 才說「那邊沒收到」，並請使用者在這裡直接回答。
 

@@ -676,6 +676,13 @@ class DocAndContractConsistency(unittest.TestCase):
         devops_skill = (KIT / "skills" / "devflow-devops" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("plan_risk_blocked=true", devops_skill)
 
+        shared_skill = (KIT / "skills" / "devflow" / "SKILL.md").read_text(encoding="utf-8")
+        chat_section = shared_skill.split("## 在自己的 Bot Chat 回答卡片問題")[1].split("## 身分與憑證")[0]
+        self.assertIn("devflow approve ", chat_section)
+        self.assertIn("絕不執行 `devflow approve`", chat_section)
+        self.assertIn("devflow approve-plan ", chat_section)
+        self.assertIn("絕不執行 `devflow approve-plan`", chat_section)
+
         cli_src = (KIT / "bin" / "devflow").read_text(encoding="utf-8")
         self.assertNotIn("metadata.board_ops", cli_src)
 
