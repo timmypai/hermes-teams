@@ -1920,6 +1920,55 @@ def mark_plan_needs_input(board: str, epic: str, reason: str) -> tuple[int | Non
     return kanban_adapter.mark_plan_needs_input(run, HERMES_PY, BOARDS, board, epic, reason)
 
 
+def hold_pending_ships_for_plan_risk(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
+    """Park every pending [SHIP] card in `blocked (dependency)` while `epic` waits on a user plan-risk
+    decision, so the dispatcher cannot run risky shipping before the user decides. Returns True on
+    any transient failure that needs retry."""
+    holds = st.setdefault("plan_risk_holds", {})
+    held_list = holds.setdefault(epic, [])
+    retry = False
+    hold_reason = f"等待 {epic} 的計畫風險使用者定錨（plan_risk_mode=needs_input）"
+    for ship_id in pending_ships(cards):
+        if cards[ship_id].get("status") not in ("todo", "ready", "scheduled"):
+            continue
+        ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, ship_id, hold_reason)
+        if failed:
+            retry = True
+        elif ok:
+            cards[ship_id]["status"] = "blocked"
+            cards[ship_id]["block_kind"] = "dependency"
+            if ship_id not in held_list:
+                held_list.append(ship_id)
+    return retry
+
+
+def release_plan_risk_holds(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
+    """Once `epic` is no longer waiting on the user, release [SHIP] cards parked for its plan risk."""
+    holds = st.get("plan_risk_holds") or {}
+    held = list(holds.get(epic) or [])
+    if not held:
+        return False
+    retry = False
+    remaining: list[str] = []
+    for ship_id in held:
+        c = cards.get(ship_id)
+        if not c or c.get("status") != "blocked" or c.get("block_kind") != "dependency":
+            continue
+        try:
+            resume(board, ship_id, f"devflow tick：{epic} 計畫風險已由使用者定錨，解除 [SHIP] 暫停。")
+            c["status"] = "ready"
+            c["block_kind"] = None
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+            retry = True
+            remaining.append(ship_id)
+            print(f"devflow: release plan-risk hold for {board}/{ship_id} failed: {err}", file=sys.stderr)
+    if remaining:
+        holds[epic] = remaining
+    else:
+        holds.pop(epic, None)
+    return retry
+
+
 def plan_cap_reason(epic: str, epic_card: dict, rules: list[str], adjs: list[str]) -> str:
     adj_list = ", ".join(sorted(adjs))
     rule_list = "；".join(rules)
@@ -2100,15 +2149,21 @@ def tick_board(board: str, st: dict) -> bool:
                         )
                         bev, esc_failed = mark_plan_needs_input(board, tid, reason)
                         if bev is not None:
+                            cards[tid]["status"] = "blocked"
+                            cards[tid]["block_kind"] = "needs_input"
                             esc_map[tid] = rhash
                             risk_escalated = True
                         elif esc_failed:
                             retry = True
+                if waiting(cards.get(tid, {})) and tid in (st.get("plan_risk_escalated") or {}):
+                    retry = hold_pending_ships_for_plan_risk(board, tid, cards, st) or retry
+                elif tid in (st.get("plan_risk_holds") or {}):
+                    retry = release_plan_risk_holds(board, tid, cards, st) or retry
                 suffix = []
                 if rep.get("advisor_card"):
                     suffix.append(f"已建 {rep['advisor_card']}")
                 if risk_escalated:
-                    suffix.append("高風險／範圍疑慮已轉 needs_input 通知使用者定錨")
+                    suffix.append("高風險／範圍疑慮已轉 needs_input 並暫停待出貨 [SHIP] 等待使用者定錨")
                 if adj_id == "user":
                     suffix.append("已達 [ADJ] 修正上限，已轉 needs_input 通知使用者決定")
                 elif adj_id:
@@ -2124,9 +2179,24 @@ def tick_board(board: str, st: dict) -> bool:
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 if not adj_retry and not retry:
                     plans[tid] = plan_fingerprint(tid, cards, repo)
+            elif waiting(cards.get(tid, {})) and tid in (st.get("plan_risk_escalated") or {}):
+                retry = hold_pending_ships_for_plan_risk(board, tid, cards, st) or retry
+            elif tid in (st.get("plan_risk_holds") or {}):
+                retry = release_plan_risk_holds(board, tid, cards, st) or retry
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
             print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
+    # Release any plan-risk [SHIP] holds whose EPIC transitioned out of waiting (even to ready/running/done).
+    for eid in list((st.get("plan_risk_holds") or {}).keys()):
+        if eid in waiting_epics:
+            continue
+        try:
+            cards = plan_cards(board, eid)
+            if not waiting(cards.get(eid, {})):
+                retry = release_plan_risk_holds(board, eid, cards, st) or retry
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC hold release
+            retry = True
+            print(f"devflow: release_plan_risk_holds failed for {board}/{eid}: {err}", file=sys.stderr)
     del applied[:-1000]
     del settled[:-1000]
     del wake_ops[:-1000]
@@ -4175,6 +4245,47 @@ def cmd_check_pr(a) -> None:
                       "judgment_token_isolated": j_isolated}, ensure_ascii=False, indent=2))
 
 
+def _epic_waiting_on_user(board: str, goal_ctx: dict | None, ship_task_id: str | None = None) -> tuple[str, str] | None:
+    """Return `(epic_id, reason)` when the governing EPIC of this PR (or current [SHIP] worker) is
+    actively waiting on a user decision (`blocked`/`triage` with `needs_input`/`capability`).
+    Enforced synchronously inside `cmd_ship_merge` so even an already-running [SHIP] worker cannot
+    merge before the user resolves a plan-risk or scope decision."""
+    db = BOARDS / board / "kanban.db"
+    if not db.exists():
+        return None
+    epic_ids: list[str] = []
+    if goal_ctx and goal_ctx.get("epic_id"):
+        epic_ids.append(goal_ctx["epic_id"])
+    try:
+        cols = {r["name"] for r in board_rows(board, "PRAGMA table_info(tasks)")}
+        if not {"id", "status", "block_kind"}.issubset(cols):
+            return None
+        if not epic_ids and ship_task_id:
+            s_rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (ship_task_id,))
+            if s_rows and (m := EPIC_REF.search(s_rows[0].get("body") or "")):
+                epic_ids.append(m.group(1))
+            if not epic_ids:
+                tables = {r["name"] for r in board_rows(board, "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "task_links" in tables:
+                    for lk in board_rows(board, "SELECT child_id FROM task_links WHERE parent_id = ?", (ship_task_id,)):
+                        c_rows = board_rows(board, "SELECT id, title FROM tasks WHERE id = ?", (lk["child_id"],))
+                        if c_rows and card_type(c_rows[0].get("title") or "") == "EPIC":
+                            epic_ids.append(c_rows[0]["id"])
+        for eid in dict.fromkeys(epic_ids):
+            rows = board_rows(board, "SELECT id, status, block_kind FROM tasks WHERE id = ?", (eid,))
+            if rows and waiting(rows[0]):
+                ev = None
+                try:
+                    ev = block_event(board, eid)
+                except sqlite3.Error:
+                    ev = None
+                reason = block_reason(board, ev) if ev else ""
+                return eid, reason
+    except sqlite3.Error:
+        return None
+    return None
+
+
 def _epic_body_for_pr(board: str, goal_ctx: dict | None) -> str | None:
     if not goal_ctx:
         return None
@@ -4269,6 +4380,15 @@ def cmd_ship_merge(a) -> None:
             gate(e["slug"], repo, a.pr, now)
         finally:
             die("未合併：PR 或其卡片範圍／政策在判斷後被修改，重跑 devflow ship merge")
+    if pending_epic := _epic_waiting_on_user(e["slug"], goal_ctx, os.environ.get("HERMES_KANBAN_TASK")):
+        eid, ereason = pending_epic
+        print(json.dumps({
+            "merged": False,
+            "plan_risk_blocked": True,
+            "epic": eid,
+            "reason": ereason or f"{eid} 正等待使用者決定（needs_input），未定錨前禁止合併出貨",
+        }, ensure_ascii=False, indent=2))
+        sys.exit(6)
     if rec.get("needs_human_approval") and policy_lib.repo_require_human_approval(now_cfg, POLICY):
         approved, approval_source = trust_lib.is_human_approved(
             HUMAN_APPROVALS,

@@ -209,47 +209,120 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(st.get("advised", {}).get("t_ep1", []), [])
         self.assertTrue(any("plan_risk_mode=off" in body for _, body in comments), comments)
 
-    def test_plan_risk_mode_needs_input_escalates_gating_risks_directly_without_adv(self) -> None:
+    def test_plan_risk_mode_needs_input_escalates_and_durably_gates_ship_and_merge_until_resolved(self) -> None:
         self.df.AUTO_PLAN_ADVISOR = False
         self.df.PLAN_RISK_MODE = "needs_input"
+        self.df.HERMES_PY = "/nonexistent-hermes-py"  # exercise real SQLite persistence path
         self.df.deploy_readiness = lambda slug: []
         self.df.tick_prs = lambda *a: False
         self.df.release_held = lambda *a: None
         self.df.release_rate_limited_advisors = lambda *a: False
         self.df.route_questions = lambda *a: False
+
+        f = Fake(self.df)
+        for name in ("pr_meta", "run", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
         self.df.decide = lambda content, qs: {
             q["name"]: {"probability": 0.9 if q["name"] == "scope_creep" else 0.05} for q in qs
         }
-        escalated: list[tuple[str, str]] = []
-        self.df.mark_plan_needs_input = lambda b, e, r: escalated.append((e, r)) or (99, False)
+
+        db = self.root / "data" / "kanban" / "boards" / "b" / "kanban.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
         epic_body = "## 目標\ng\n## 驗收\n- AC-1 [cli] ok\n  - S1 s\n    - Given g\n    - When w\n    - Then t\n"
-        cards = {
-            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "body": epic_body, "status": "todo",
-                      "assignee": "orchestrator", "workspace_kind": "dir", "parents": ["t_sh1"], "children": [], "goal_mode": False},
-            "t_sh1": {"id": "t_sh1", "title": "[SHIP] s", "body": "覆蓋：AC-1\nEPIC: t_ep1", "status": "todo",
-                      "assignee": "devops", "workspace_kind": "dir", "parents": [], "children": ["t_ep1"], "goal_mode": False},
-        }
-        self.df.plan_cards = lambda b, e: cards
+        dev_body = f"## 目標\nd\n## 本卡完成\n{self.df.DONE_TEXT}\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep1\n"
+        with closing(sqlite3.connect(db)) as c, c:
+            c.executescript("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                    workspace_kind TEXT, workspace_path TEXT, completion_contract TEXT,
+                    created_by TEXT, result TEXT, goal_mode INTEGER NOT NULL DEFAULT 0,
+                    block_kind TEXT
+                );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER
+                );
+            """)
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [
+                ("t_ep1", "[EPIC] e", epic_body, "todo", "orchestrator", "dir", str(self.root / "repo"),
+                 None, "default", None, 0, None),
+                ("t_dev1", "[DEV] d", dev_body, "done", "developer", "worktree", str(self.root / "repo"),
+                 f"https://github.com/{REPO}/pull/7", "orchestrator", None, 1, None),
+                ("t_sh1", "[SHIP] s", "覆蓋：AC-1\nEPIC: t_ep1\n", "todo", "devops", "dir", str(self.root / "repo"),
+                 None, "orchestrator", None, 0, None),
+            ])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [("t_dev1", "t_sh1"), ("t_sh1", "t_ep1")])
+
         comments: list[str] = []
+        resumed: list[tuple[str, str | None]] = []
 
         def fake_kanban(board, cmd, *args):
             if cmd == "list":
-                return json.dumps([{"id": "t_ep1", "title": "[EPIC] e", "assignee": "orchestrator", "status": "todo"}])
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    return json.dumps([dict(r) for r in c.execute("SELECT id, title, assignee, status FROM tasks")])
             if cmd == "show":
-                return json.dumps({"task": cards["t_ep1"], "parents": ["t_sh1"], "children": [], "comments": []})
+                tid = args[0]
+                with closing(sqlite3.connect(db)) as c:
+                    c.row_factory = sqlite3.Row
+                    t = dict(c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    parents = [r[0] for r in c.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (tid,))]
+                    children = [r[0] for r in c.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (tid,))]
+                return json.dumps({"task": t, "parents": parents, "children": children, "comments": []})
             if cmd == "comment":
                 comments.append(args[1])
                 return ""
             raise AssertionError((cmd, args))
 
+        def fake_resume(board, tid, note=None):
+            resumed.append((tid, note))
+            with closing(sqlite3.connect(db)) as c, c:
+                c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = ?", (tid,))
+            return f"resumed {tid}"
+
         self.df.kanban = fake_kanban
+        self.df.resume = fake_resume
+
+        # 1. Tick detects scope_creep -> blocks BOTH t_ep1 (needs_input) AND pending t_sh1 (dependency) in SQLite.
         st: dict = {}
         self.df.tick_board("b", st)
-        self.assertEqual(len(escalated), 1)
-        self.assertEqual(escalated[0][0], "t_ep1")
-        self.assertIn("scope_creep", escalated[0][1])
+        with closing(sqlite3.connect(db)) as c:
+            states = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
+        self.assertEqual(states["t_ep1"], "blocked:needs_input")
+        self.assertEqual(states["t_sh1"], "blocked:dependency")
+        self.assertEqual(st.get("plan_risk_holds", {}).get("t_ep1"), ["t_sh1"])
         self.assertEqual(st.get("advised", {}).get("t_ep1", []), [])
-        self.assertTrue(any("已轉 needs_input 通知使用者定錨" in c for c in comments), comments)
+        self.assertTrue(any("暫停待出貨 [SHIP]" in c for c in comments), comments)
+
+        # 2. Even an already-running [SHIP] worker calling `ship merge` is blocked while t_ep1 awaits user decision!
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
+        buf_blk = io.StringIO()
+        with redirect_stdout(buf_blk), self.assertRaises(SystemExit) as cm:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertEqual(cm.exception.code, 6)
+        blk_out = json.loads(buf_blk.getvalue())
+        self.assertFalse(blk_out["merged"])
+        self.assertTrue(blk_out["plan_risk_blocked"])
+        self.assertEqual(blk_out["epic"], "t_ep1")
+        self.assertEqual(f.merges, [])
+
+        # 3. User resolves the EPIC decision (t_ep1 leaves blocked/needs_input) -> tick releases t_sh1 & merge succeeds.
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = 't_ep1'")
+        self.df.tick_board("b", st)
+        self.assertEqual([t for t, _ in resumed], ["t_sh1"])
+        self.assertNotIn("t_ep1", st.get("plan_risk_holds") or {})
+        with closing(sqlite3.connect(db)) as c:
+            states_after = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
+        self.assertEqual(states_after["t_sh1"], "ready:")
+
+        buf_ok = io.StringIO()
+        with redirect_stdout(buf_ok):
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertTrue(json.loads(buf_ok.getvalue())["merged"])
+        self.assertEqual(len(f.merges), 1)
 
 
 class DocAndContractConsistency(unittest.TestCase):

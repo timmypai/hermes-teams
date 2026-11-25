@@ -211,3 +211,58 @@ def mark_triage_needs_input(
         return None, False
     out = p.stdout.strip()
     return (int(out), False) if out.isdigit() else (None, True)
+
+
+def hold_task_dependency(
+    run_fn: Callable, hermes_py: str, boards_dir: Path, board: str, task_id: str, reason: str,
+) -> tuple[bool, bool]:
+    """Durably park a pending [SHIP] card in `blocked (dependency)` while its EPIC awaits a user
+    plan-risk decision. Returns `(held_or_already_blocked, transient_failure)`."""
+    db = boards_dir / board / "kanban.db"
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from hermes_cli import kanban_db_connect as k, kanban_db as kb\n"
+        "c = k.connect(Path(sys.argv[1]))\n"
+        "try:\n"
+        "    with kb.write_txn(c):\n"
+        "        cur = c.execute(\n"
+        "            \"UPDATE tasks SET status = 'blocked', block_kind = 'dependency' \"\n"
+        "            \"WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')\",\n"
+        "            (sys.argv[2],),\n"
+        "        )\n"
+        "        if cur.rowcount == 1:\n"
+        "            kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'dependency', 'reason': sys.argv[3]})\n"
+        "        print(cur.rowcount)\n"
+        "finally:\n"
+        "    c.close()\n"
+    )
+    p = None
+    try:
+        p = run_fn([hermes_py, "-c", code, str(db), task_id, reason], check=False)
+    except FileNotFoundError:
+        p = None
+    if p is not None and p.returncode == 0 and p.stdout.strip().isdigit():
+        return p.stdout.strip() == "1", False
+    if db.exists():
+        try:
+            with closing(sqlite3.connect(db)) as c, c:
+                cur = c.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'dependency' "
+                    "WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')",
+                    (task_id,),
+                )
+                if cur.rowcount == 1:
+                    c.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+                        (task_id, json.dumps({"kind": "dependency", "reason": reason}, ensure_ascii=False), int(time.time())),
+                    )
+                return cur.rowcount == 1, False
+        except sqlite3.Error as err:
+            print(f"devflow: hold_task_dependency sqlite fallback for {board}/{task_id} failed: {err}", file=sys.stderr)
+            return False, True
+    if p is not None and p.returncode != 0:
+        print(f"devflow: hold_task_dependency for {board}/{task_id} failed: "
+              f"{(p.stderr or p.stdout).strip()[-300:]}", file=sys.stderr)
+        return False, True
+    return False, False
