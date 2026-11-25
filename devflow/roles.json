@@ -32,7 +32,12 @@
   "common_env": {
     "GIT_CONFIG_GLOBAL": "/opt/data/devflow/gitconfig",
     "GH_PROMPT_DISABLED": "1",
-    "GH_NO_UPDATE_NOTIFIER": "1"
+    "GH_NO_UPDATE_NOTIFIER": "1",
+    "DBUS_SESSION_BUS_ADDRESS": "disabled:"
+  },
+  "mattpocock_skills": {
+    "repo": "https://github.com/mattpocock/skills",
+    "sha": "d65391149dbb5fe76478e76fa8d5122b2aa5a70e"
   },
   "worker_env": {
     "TERMINAL_TIMEOUT": "1800"
