@@ -351,6 +351,7 @@ class RouteQuestions(unittest.TestCase):
     def _flow(self, p: float | None, create_ok: bool = True) -> tuple[list, list]:
         """Decisions answers `p` (None: unavailable); `hermes kanban create` is recorded and, like Hermes,
         puts the [ADJ] on the board; `hermes kanban comment` goes to self.comments."""
+        self.df.AUTO_FLOW_ADJ = True
         judged, created = [], []
         self.comments: list[tuple[str, str]] = []
 

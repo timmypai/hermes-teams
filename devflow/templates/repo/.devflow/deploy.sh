@@ -20,6 +20,8 @@ fi
 SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
 REPO_IMAGE="devflow/${DEVFLOW_APP}"
 export DEVFLOW_IMAGE="${REPO_IMAGE}:${SHA:0:12}"
+export DEVFLOW_SOURCE_SHA="$SHA"
+export DEVFLOW_RELEASE_DIR="$PWD"
 PROJECT="devflow-${DEVFLOW_APP}"
 COMPOSE=(docker compose -p "$PROJECT" -f deploy/compose.yml)
 LIVE="${DEVFLOW_LIVE_DIR:-$HOME/.devflow-live/$DEVFLOW_APP}"
@@ -100,7 +102,8 @@ rollback_release() {
   docker tag "$1" "${REPO_IMAGE}:live"
   cp "$LIVE/.env" deploy/.env
   (set -a; . "$LIVE/config.env"; set +a
-    DEVFLOW_IMAGE="${REPO_IMAGE}:live" docker compose -p "$PROJECT" -f "$LIVE/compose.yml" --project-directory deploy \
+    DEVFLOW_IMAGE="${REPO_IMAGE}:live" DEVFLOW_RELEASE_DIR="$LIVE" \
+      docker compose -p "$PROJECT" -f "$LIVE/compose.yml" --project-directory deploy \
       up -d --no-build --remove-orphans)
 }
 
@@ -112,12 +115,23 @@ healthy_release() {
 
 # 發布成功的 release：整組寫進新目錄，再用 rename 一步把 $LIVE 指過去；中斷時 $LIVE 仍指向完整的舊 release。
 save_release() {
-  local id dir
+  local id dir rel
+  local -a _rel_files=()
   id=$(docker image inspect "${DEVFLOW_IMAGE}" --format '{{.Id}}')
   dir="$LIVE.d/${SHA:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   mkdir -p "$LIVE.d"
   (umask 077; mkdir "$dir")
   cp deploy/compose.yml deploy/.env .devflow/config.env "$dir/"
+  if [[ -n "${DEVFLOW_RELEASE_FILES:-}" ]]; then
+    IFS=',' read -r -a _rel_files <<<"$DEVFLOW_RELEASE_FILES"
+    for rel in "${_rel_files[@]}"; do
+      rel="${rel#"${rel%%[![:space:]]*}"}"
+      rel="${rel%"${rel##*[![:space:]]}"}"
+      [[ -n "$rel" && -f "$rel" ]] || continue
+      mkdir -p "$dir/$(dirname "$rel")"
+      cp "$rel" "$dir/$rel"
+    done
+  fi
   echo "$id" >"$dir/image"
   ln -sfn "$dir" "$LIVE.new"
   mv -Tf "$LIVE.new" "$LIVE"
@@ -125,7 +139,13 @@ save_release() {
 }
 
 echo "::group::build ${DEVFLOW_IMAGE}"
-if ! "${COMPOSE[@]}" build --pull; then
+build_ok=true
+if [[ -x .devflow/deploy-build.sh ]]; then
+  bash .devflow/deploy-build.sh || build_ok=false
+else
+  "${COMPOSE[@]}" build --pull || build_ok=false
+fi
+if ! $build_ok; then
   echo "::endgroup::"
   # build 不動到執行中的容器，不需回滾；仍記下目前（舊版）狀態。
   echo "::error::devflow: ${DEVFLOW_APP} ${SHA:0:12} build failed; running version unchanged" >&2

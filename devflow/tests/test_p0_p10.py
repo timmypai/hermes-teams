@@ -621,5 +621,99 @@ class ReviewFindingsRegression(unittest.TestCase):
         self.assertTrue(any("同時對應多張未封存開發卡" in f for f in rec_amb["scope_findings"]), rec_amb)
 
 
+class StandardDeliveryAndStability(unittest.TestCase):
+    """Tests for standard delivery enforcement, pending isolation, idempotent unsubscribe, and meta-loop defaults."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="devflow-std-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        shutil.copy(KIT / "roles.json", self.root / "roles.json")
+        shutil.copytree(KIT / "templates", self.root / "templates")
+        (self.root / "state").mkdir()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
+        (self.root / "state" / "repos.json").write_text(json.dumps({
+            "b": {"slug": "b", "repo": REPO, "path": str(self.repo), "port": 18101, "default_branch": "main"}
+        }))
+        os.environ["DEVFLOW_HERMES_DATA"] = str(self.root / "data")
+        self.addCleanup(os.environ.pop, "DEVFLOW_HERMES_DATA", None)
+        self.df = load_devflow(self.root)
+
+    def test_sync_standard_enforces_canonical_delivery_and_preflight_blocks_custom_drift(self) -> None:
+        (self.repo / ".devflow").mkdir()
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_PORT=18101\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n",
+            encoding="utf-8",
+        )
+        res = self.df.standard_lib.sync_standard_files(
+            self.repo, self.df.TEMPLATE, repo_cfg=self.df.policy_lib.load_repo_config(self.repo)
+        )
+        self.assertIn(".devflow/deploy.sh", res["updated"])
+        self.assertIn(".github/workflows/deploy.yml", res["updated"])
+        # Manual-only mode must strip push trigger while keeping canonical workflow
+        wf_text = (self.repo / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+        self.assertNotIn("branches:", wf_text)
+        self.assertIn("workflow_dispatch:", wf_text)
+        # Clean repo passes standard delivery check
+        chk = self.df.standard_lib.check_standard_delivery_dir(
+            self.repo, self.df.TEMPLATE, repo_cfg=self.df.policy_lib.load_repo_config(self.repo)
+        )
+        self.assertTrue(chk["ok"], chk)
+
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "standard contract"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+        # Replacing .devflow/deploy.sh with a custom opaque wrapper must fail preflight deterministically
+        (self.repo / ".devflow" / "deploy.sh").write_text("#!/usr/bin/env bash\nexec python3 custom.py\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".devflow/deploy.sh"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "feat: custom deployer"], cwd=self.repo, check=True)
+        rep = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False, template_dir=self.df.TEMPLATE
+        )
+        self.assertFalse(rep["ok"])
+        self.assertEqual(rep["checks"]["standard_delivery"], "fail")
+        self.assertTrue(any("偏離 devflow 公版交付檔" in f and ".devflow/deploy.sh" in f for f in rep["findings"]), rep)
+
+    def test_pending_skips_unregistered_or_corrupt_board_dbs_without_crashing(self) -> None:
+        boards = self.root / "data" / "kanban" / "boards"
+        # Orphan unregistered board with minimal invalid schema (like stray `boards/b` in production)
+        orphan = boards / "orphan" / "kanban.db"
+        orphan.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(orphan)) as c, c:
+            c.execute("CREATE TABLE tasks (id TEXT, status TEXT, goal_mode INTEGER)")
+        # Registered board `b` with corrupted/missing columns must ALSO be skipped gracefully
+        bad_reg = boards / "b" / "kanban.db"
+        bad_reg.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(bad_reg)) as c, c:
+            c.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+        self.assertEqual(self.df.pending(), [])
+
+    def test_default_policy_disables_async_meta_loops_and_allows_ship_only_epic(self) -> None:
+        self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
+        self.assertFalse(self.df.AUTO_FLOW_ADJ)
+        # Ship-only EPIC without synthetic Given/When/Then scenarios passes plan_rules
+        cards = {
+            "t_ep01": {"id": "t_ep01", "title": "[EPIC] 出貨部署", "status": "todo", "assignee": "orchestrator",
+                       "workspace_kind": "dir", "parents": ["t_sh01"], "children": [], "goal_mode": False,
+                       "body": "## 目標\n合併並部署 PR #16\n## 驗收\n- AC-1 [cli] 合併進 main\n- AC-2 [api] 部署健康\n"},
+            "t_sh01": {"id": "t_sh01", "title": "[SHIP] 出貨 PR #16", "status": "ready", "assignee": "devops",
+                       "workspace_kind": "dir", "parents": [], "children": ["t_ep01"], "goal_mode": False,
+                       "body": "## 目標\n合併並部署\n## 驗收\n覆蓋：AC-1, AC-2\nEPIC: t_ep01\n"},
+        }
+        findings = self.df.plan_rules("b", "t_ep01", cards)
+        self.assertEqual(findings, [], findings)
+
+    def test_unsubscribe_idempotent_treats_no_such_subscription_as_success(self) -> None:
+        self.df.kanban = lambda *a: (_ for _ in ()).throw(SystemExit("no such subscription"))
+        # Must not raise
+        self.df.unsubscribe_idempotent("b", "t_1", "local", "chat1", "thr1")
+
+
 if __name__ == "__main__":
     unittest.main()

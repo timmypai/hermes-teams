@@ -9,6 +9,7 @@ from typing import Any
 
 from .policy import load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
 from .scope import check_files_against_scope, parse_card_contract, touched_paths
+from .standard import ALL_STANDARD_DELIVERY_FILES, check_standard_delivery_dir
 from .trust import is_protected_file, protected_file_changes, sha256_text
 
 FIX_TITLE_RE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)
@@ -108,6 +109,7 @@ def run_preflight(
     pr_body: str | None = None,
     run_tests: bool = True,
     allow_dirty: bool = False,
+    template_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Run all deterministic local preflight checks inside a developer worktree."""
     findings: list[str] = []
@@ -177,6 +179,18 @@ def run_preflight(
     )
     checks["protected_files"] = "warn" if protected else "ok"
 
+    # 4b. Standard delivery template compliance (enforces canonical devflow delivery scripts across all repos)
+    standard_delivery: dict[str, Any] = {"ok": True, "checked": [], "missing": [], "drifted": [], "findings": []}
+    touched_standard = [p for p in all_touched if p in ALL_STANDARD_DELIVERY_FILES]
+    if template_dir is not None and template_dir.is_dir() and touched_standard:
+        standard_delivery = check_standard_delivery_dir(
+            repo_dir, template_dir, repo_cfg=repo_cfg, only_paths=touched_standard
+        )
+        findings.extend(standard_delivery["findings"])
+        checks["standard_delivery"] = "ok" if standard_delivery["ok"] else "fail"
+    else:
+        checks["standard_delivery"] = "ok"
+
     # 5. PR title & body checks (fix -> Lesson, Covers -> valid scenario IDs)
     pr_findings: list[str] = []
     if pr_title and FIX_TITLE_RE.match(pr_title):
@@ -233,6 +247,7 @@ def run_preflight(
         "file_count": len(files),
         "max_diff_files": max_files,
         "protected_changes": protected,
-        "needs_human_approval": bool(protected),
+        "standard_delivery": standard_delivery,
+        "needs_human_approval": bool(protected) or bool(standard_delivery.get("custom_allowed")),
         "tests": test_outputs,
     }
