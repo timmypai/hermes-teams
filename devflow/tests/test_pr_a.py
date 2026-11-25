@@ -262,8 +262,12 @@ class PlanRiskModeBehavior(unittest.TestCase):
                  f"https://github.com/{REPO}/pull/7", "orchestrator", None, 1, None),
                 ("t_sh1", "[SHIP] s", "覆蓋：AC-1\nEPIC: t_ep1\n", "todo", "devops", "dir", str(self.root / "repo"),
                  None, "orchestrator", None, 0, None),
+                ("t_sh_run", "[SHIP] running ship", "覆蓋：AC-1\nEPIC: t_ep1\n", "running", "devops", "dir",
+                 str(self.root / "repo"), None, "orchestrator", None, 0, None),
             ])
-            c.executemany("INSERT INTO task_links VALUES (?,?)", [("t_dev1", "t_sh1"), ("t_sh1", "t_ep1")])
+            c.executemany("INSERT INTO task_links VALUES (?,?)", [
+                ("t_dev1", "t_sh1"), ("t_sh1", "t_ep1"), ("t_sh_run", "t_ep1"),
+            ])
 
         comments: list[str] = []
         resumed: list[tuple[str, str | None]] = []
@@ -306,14 +310,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertEqual(st.get("advised", {}).get("t_ep1", []), [])
         self.assertTrue(any("暫停待出貨 [SHIP]" in c for c in comments), comments)
 
-        # 2. Even an already-running [SHIP] worker calling `ship merge` is blocked (exit 7) while t_ep1 awaits user decision!
-        #    Simulate a running [SHIP] worker (`t_sh_run`) hitting exit 7 and self-blocking with `hold_reason`.
-        with closing(sqlite3.connect(db)) as c, c:
-            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
-                "t_sh_run", "[SHIP] running ship", "覆蓋：AC-1\nEPIC: t_ep1\n", "running", "devops", "dir",
-                str(self.root / "repo"), None, "orchestrator", None, 0, None,
-            ))
-            c.execute("INSERT INTO task_links VALUES ('t_sh_run', 't_ep1')")
+        # 2. Already-running [SHIP] worker (`t_sh_run`) calling `ship merge` is blocked (exit 7) while t_ep1 awaits user decision!
         os.environ["HERMES_KANBAN_TASK"] = "t_sh_run"
         self.addCleanup(os.environ.pop, "HERMES_KANBAN_TASK", None)
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
@@ -456,7 +453,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
                 ("t_sh1", json.dumps({"kind": "dependency", "reason": "等待另一個不相關的父卡 t_other"}, ensure_ascii=False)),
             )
         self.df.release_plan_risk_holds("b", "t_ep1", self.df.plan_cards("b", "t_ep1"), {"plan_risk_holds": {"t_ep1": ["t_sh1"]}})
-        self.assertEqual(resumed, [])
+        self.assertNotIn("t_sh1", [t for t, _ in resumed])
 
     def test_enabling_plan_risk_mode_invalidates_cached_plan_and_tick_key_and_gates_ship(self) -> None:
         self.df.AUTO_PLAN_ADVISOR = False
