@@ -198,13 +198,34 @@ def collect_board_stats(
     j_findings = sum(1 for v in j_entries if v.get("findings"))
     j_human = sum(1 for v in j_entries if v.get("needs_human_approval"))
 
+    approved_heads: dict[tuple[str, int], str] = {}
+    for k, v in (human_approvals or {}).items():
+        if k == "_pending" or not isinstance(v, dict):
+            continue
+        r_repo = str(v.get("repo") or "").lower()
+        r_pr = v.get("pr")
+        r_sha = str(v.get("head_sha") or "").strip().lower()
+        if r_repo and isinstance(r_pr, int) and len(r_sha) == 40:
+            approved_heads[(r_repo, r_pr)] = r_sha
+        elif isinstance(k, str) and "#" in k and len(r_sha) == 40:
+            kr, _, kp = k.rpartition("#")
+            if kr and kp.isdigit():
+                approved_heads[(kr.lower(), int(kp))] = r_sha
+
     pending_map = (human_approvals or {}).get("_pending")
     pending_human = 0
     if isinstance(pending_map, dict):
-        pending_human = sum(
-            1 for v in pending_map.values()
-            if isinstance(v, dict) and str(v.get("repo") or "").lower() == repo.lower()
-        )
+        for v in pending_map.values():
+            if not isinstance(v, dict):
+                continue
+            p_repo = str(v.get("repo") or "").lower()
+            if p_repo != repo.lower():
+                continue
+            p_pr = v.get("pr")
+            p_sha = str(v.get("head_sha") or "").strip().lower()
+            if isinstance(p_pr, int) and p_sha and approved_heads.get((p_repo, p_pr)) == p_sha:
+                continue
+            pending_human += 1
 
     pending_plan_risk = sum(
         1 for v in (plan_risk_state or {}).values()

@@ -260,6 +260,21 @@ class ReadOnlyStatsTelemetry(unittest.TestCase):
         # Strictly read-only: DB untouched byte-for-byte
         self.assertEqual(db.read_bytes(), before_bytes)
 
+        # Satisfying exact-head approval for head 'a'*40 drops pending_human_approvals from 1 -> 0;
+        # a new pending request for a DIFFERENT head 'b'*40 stays counted as pending (1).
+        approvals_path = self.root / "state" / "human-approvals.json"
+        self.df.trust_lib.record_human_approval(approvals_path, repo=REPO, pr_number=2, head_sha="a" * 40)
+        buf_app = io.StringIO()
+        with redirect_stdout(buf_app):
+            self.df.cmd_stats(SimpleNamespace(slug="alpha", json=True))
+        self.assertEqual(json.loads(buf_app.getvalue())["boards"][0]["gates"]["pending_human_approvals"], 0)
+
+        self.df.trust_lib.record_pending_approval(approvals_path, repo=REPO, pr_number=2, head_sha="b" * 40)
+        buf_diff = io.StringIO()
+        with redirect_stdout(buf_diff):
+            self.df.cmd_stats(SimpleNamespace(slug="alpha", json=True))
+        self.assertEqual(json.loads(buf_diff.getvalue())["boards"][0]["gates"]["pending_human_approvals"], 1)
+
         # Text output across all boards (beta has no DB -> graceful [no db])
         buf_txt = io.StringIO()
         with redirect_stdout(buf_txt):
