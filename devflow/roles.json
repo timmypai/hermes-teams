@@ -19,7 +19,9 @@
     "advisor_max_retries": 6,
     "default_merge_method": "squash",
     "auto_plan_advisor": false,
-    "auto_flow_adj": false
+    "plan_risk_mode": "off",
+    "auto_flow_adj": false,
+    "require_human_approval_for_protected": true
   },
   "worker_config": {
     "agent.max_turns": "150",

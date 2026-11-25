@@ -24,7 +24,7 @@ metadata:
    - 已接入 → 用該 slug。
    - 未接入的既有 repo → `devflow repo add OWNER/REPO`（自動建 board、clone、設定權限、申請部署 runner；確定不部署加 `--no-runner`）。
    - 全新專案 → `devflow repo add OWNER/NAME --create`（預設 private；使用者說公開才加 `--public`）。GitHub owner 沒講就用 builder 帳號（`gh api user --jq .login`）。
-2. **釐清三件事**：要達成什麼、怎樣算完成、有沒有不能碰的東西。一次最多問 2 題，只問答案會改變做法的；其他用合理預設並寫進卡片「提示」。使用者說「grill me」才用 `grilling`。
+2. **釐清三件事**：要達成什麼、怎樣算完成、有沒有不能碰的東西。一次最多問 2 題，只問答案會改變做法的；其他合理預設與明確取捨記進 EPIC 的 `## 使用者決定`（不另設技術「提示」段落）。使用者說「grill me」才用 `grilling`。
 3. **寫成給人看與判讀的白話驗收條件**：把「怎樣算完成」寫成編號的 `AC-1`、`AC-2`…，每條都是**非工程師也能一眼看懂、可以實際操作檢查的白話結果**（「打開登入頁輸入管理密碼可進入後台」「加入 Teams 會議後語音問 1+1 會聽到回答 2」），**不寫技術做法、不寫內部參數／SHA／檔名**。編號後緊接類型標記：`[ui]`（瀏覽器畫面）、`[api]`（HTTP API）、`[cli]`（命令列／批次）、`[lib]`（函式庫呼叫）、`[manual]`（真的無法自動執行，例如真人語音互動或外部帳號設定；盡量少用，會送 advisor 確認）。例：`- AC-1 [ui] 在待辦頁新增「買牛奶」後清單出現這一筆，重新整理仍在`。
    - 只寫使用者要的結果，不替他加機制（稽核、白名單、准入、專屬帳號、自訂審查）。部署後的網頁一律用 `devflow repo access <slug>` 的 SSH tunnel 打開，不另寫「安全入口」；使用者明確要公開網址時才寫，並當成不可回復操作。
 4. **檢查 AC（D0）**：`terminal: printf '%s\n' '<AC 行>' | /opt/data/devflow/bin/devflow check ac --said '<使用者原話>'`。
@@ -50,7 +50,7 @@ metadata:
 - 你在聊天中（不是 worker）要重跑卡片時，用 `devflow resume <slug> <task> [--note "..."]`，不要直接 `kanban_unblock`：已開過 PR 的卡，Hermes dispatcher 會擋 24 小時不重派，`resume` 會做原生的交接動作解除，並重設失敗計數。
 
 ## 3. 被卡住的卡片
-`kanban_show(task)` 讀 block reason / 最後事件，依類型處理。needs_input / capability 先跑 `terminal: devflow pending`：`handled_by` 有值時，這是流程問題（工具、權限、卡片寫法、交接卡住），dispatcher tick 已自動建該 `[ADJ]` 交 orchestrator：只說一行「<task> 卡在流程問題，已交 <handled_by> 處理，不用你回答」，不要問使用者。`ask_in` 不是 `default` 時，完整問題已送到那個 bot 的 Bot Chat，你不要自己問，只回三行：「需要你決定：<task>（<board>）<卡片標題>\n問題：<question 第一行>\n請到 <ask_in> 的 Bot Chat 回答（那裡有背景與選項說明），在這裡直接回也可以」。使用者在這裡回答也照收：`devflow answer <slug> <task> --event <block_event> --where "App 對話" "<回答>"`；回 `not applied` 時照 `devflow` skill「在自己的 Bot Chat 回答卡片問題」第 4、5 點說明。`comments_since` 的留言不是答案，處理方式同該節第 1 點。`ask_in` 是 `default` 才照下面問，訊息內容同該節第 2 點的格式：
+`kanban_show(task)` 讀 block reason / 最後事件，依類型處理。needs_input / capability 先跑 `terminal: devflow pending`：`handled_by` 有值時（`auto_flow_adj=true` 啟用時 tick 會自動建該 `[ADJ]` 交 orchestrator），只說一行「<task> 卡在流程問題，已交 <handled_by> 處理，不用你回答」，不要問使用者（`auto_flow_adj` 預設關閉，未自動分派時照常向使用者或由 orchestrator 處理）。`ask_in` 不是 `default` 時，完整問題已送到那個 bot 的 Bot Chat，你不要自己問，只回三行：「需要你決定：<task>（<board>）<卡片標題>\n問題：<question 第一行>\n請到 <ask_in> 的 Bot Chat 回答（那裡有背景與選項說明），在這裡直接回也可以」。使用者在這裡回答也照收：`devflow answer <slug> <task> --event <block_event> --where "App 對話" "<回答>"`（若問題為受保護檔合併核准，**只有使用者明確確認核准合併（選 A／同意）時**才以原提問的 `核准請求碼：` 執行 `devflow approve <slug> <pr> --request <12碼核准請求碼>` 記錄原始提交核准再 `devflow answer`，**嚴禁改查最新 head 代填**；若使用者拒絕／選 B 退回，**絕不執行 `devflow approve`**，直接以 `devflow answer` 交回拒絕回覆；若問題為計畫風險定錨，**只有使用者明確核准目前計畫（選 B）時**才執行 `devflow approve-plan <slug> <epic> --plan-hash <12碼雜湊>`，選 A 調整時絕不執行 `approve-plan`）；回 `not applied` 時照 `devflow` skill「在自己的 Bot Chat 回答卡片問題」第 4、5 點說明。`comments_since` 的留言不是答案，處理方式同該節第 1 點。`ask_in` 是 `default` 才照下面問，訊息內容同該節第 2 點的格式：
 - **needs_input**（要使用者決定）：reason 第一行是 `問題：…？選項：A / B（建議 A）`，細節在後面。
   1. 用 `clarify` 問：一題，choices 是選項（建議的放第一個），question 是上面格式的整段（卡號、在做什麼、卡在哪、問題、各選項後果）。
   2. `clarify` 回報無法使用或被拒（被通知喚醒時沒人在看這個聊天）：把同一整段留成訊息，然後結束這一輪。使用者之後在這個聊天回覆，就是這張卡的答案。
@@ -59,7 +59,7 @@ metadata:
 - **capability**（缺權限或資源，只有人給得了：主機管理權、帳號、金鑰、付費服務）：從 block reason 找出「缺什麼、誰能給」，照 needs_input 的 1–3 問使用者。先分清楚誰動手：
   - 由 Bot 做、只要使用者核准（例「t_xxxx（<repo>）：缺主機上的部署 runner，要我用 devflow 共用 runner 註冊嗎？」）：選項「同意，由 <Bot> 做」和「先不要」；回「同意」就是答案。
   - 要使用者自己動手（設 GitHub secret、用本人帳號 OAuth、在主機執行指令）：照 block reason 的步驟寫成「請你 <動作>，做完回覆『完成』」，選項「已完成」和「暫緩」，不要改寫成「是否同意」。他只回「同意」「好」時**不要** `devflow answer`：卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage。回他「做完回覆『完成』，我再交回」，卡片繼續等；他說做完了或暫緩才交。
-  缺的是 worker 工具或卡片設定（不是人給得了的）時，tick 會自動建 `[ADJ]`（`handled_by`），你不用另建。
+  缺的是 worker 工具或卡片設定（不是人給得了的）時，若已啟用 `auto_flow_adj=true` 則 tick 會自動建 `[ADJ]`（`handled_by`）；預設關閉時直接由 orchestrator 建 `[ADJ]` 或交使用者指示。
 - **gave_up / crashed / timed_out**（執行失敗，不用問使用者）：建 `kanban_create(board=slug, assignee="orchestrator", workspace_kind="dir", title="[ADJ] 處理失敗卡 <task>", body="EPIC: <id>\n處理：<task id>\n<失敗原因摘要>")`，告訴使用者「t_xxx 失敗，已交 orchestrator 處理」。被卡住的就是 `[ADJ]` 本身時不要再建 `[ADJ]`：用一句話把 block reason 轉述給使用者，問要怎麼處理。`處理：` 一行只寫這張 `[ADJ]` 要修的卡（devflow 用它判斷同一張卡繞了幾圈、新的阻塞該交給誰），其他相關卡寫在內文。
 
 被卡片通知喚醒的每一輪，最後都要留一則使用者看得到的訊息，第一句說「需要你決定」或「不用你處理」。需要時就是上面的問題（卡號、具體動作、選項）；不要只寫「需要取得…」「待確認…」這種沒有問題、使用者不知道要回什麼的結論。

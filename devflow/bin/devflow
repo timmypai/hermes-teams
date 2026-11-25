@@ -755,9 +755,9 @@ def channel_question(slug: str, failing: list[dict]) -> str:
 
 
 def cmd_resume(a) -> None:
-    """Re-run a blocked/held card from Hermes chat (workers: `board_ops` resume in the handoff)."""
+    """Re-run a blocked/held card from Hermes chat (workers: `devflow-ops` block in a card comment)."""
     if os.environ.get("HERMES_KANBAN_TASK"):
-        die("resume runs from Hermes chat, not inside a kanban worker; put it in metadata.board_ops")
+        die("resume runs from Hermes chat, not inside a kanban worker; put a ```devflow-ops``` block in your card comment")
     print(resume(a.slug, a.task, a.note))
 
 
@@ -1229,6 +1229,7 @@ MAX_REVIEW_ROUNDS = int(POLICY["max_review_rounds"])
 MAX_EPIC_CARDS = int(POLICY["max_epic_cards"])
 MAX_DIFF_FILES = int(POLICY["max_diff_files"])
 AUTO_PLAN_ADVISOR = bool(POLICY.get("auto_plan_advisor", False))
+PLAN_RISK_MODE = policy_lib.effective_plan_risk_mode(POLICY)
 AUTO_FLOW_ADJ = bool(POLICY.get("auto_flow_adj", False))
 
 
@@ -1598,13 +1599,29 @@ def open_advisor_card(board: str, epic: str, cards: dict[str, dict], findings: l
     return adv
 
 
+def _evaluate_plan_risks(epic: str, cards: dict[str, dict]) -> tuple[dict[str, float], str, dict[str, str], list[str]]:
+    """Run Decisions risk predicates against `cards`, failing closed on Decisions errors."""
+    questions = plan_questions(cards[epic]["body"])
+    risks, note = plan_risks(epic, cards, questions)
+    if note:
+        # Unjudged is not "no risk": the [ADV] advisor or user confirmation must still gate [SHIP]
+        # because an irreversible or out-of-scope operation cannot be ruled out. Stable text
+        # (no error message) so a later failure does not open another [ADV] for the same plan.
+        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
+    else:
+        flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
+        risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
+    gating_texts = sorted({risk[n] for n in SHIP_GATING_RISKS if n in risk})
+    return risks, note, risk, gating_texts
+
+
 def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | None = None,
-               advised: frozenset[str] = frozenset()) -> dict:
-    """Rules + Decisions risks. With `advise`, advisory findings ([manual] AC confirmations and
-    Decisions risks) not in `advised` open an [ADV] card; deterministic schema findings stay in
+               advised: frozenset[str] = frozenset(), run_llm: bool = True) -> dict:
+    """Rules + optional Decisions risks. With `advise`, advisory findings ([manual] AC confirmations
+    and Decisions risks) not in `advised` open an [ADV] card; deterministic schema findings stay in
     `findings` and `actionable_rules` (excluding body-length reminders) without spending an Opus
-    advisor run. `report["advised"]` keys `irreversible` per pending [SHIP] and other Decisions
-    risks per pending work card so newly added cards re-arm scope/goal checks."""
+    advisor run. When `run_llm=False` (e.g. `plan_risk_mode="off"` in tick), skips Decisions calls
+    and never populates `advised` so un-advised risks are not silently suppressed."""
     cards = cards or plan_cards(board, epic)
     if card_type(cards[epic]["title"]) != "EPIC":
         die(f"{epic} is not an [EPIC] card")
@@ -1614,23 +1631,16 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
     readiness = readiness_rules(board, cards)
     actionable_rules = [f for f in (rules + readiness) if f not in manual and f not in body_notes]
     findings = rules + readiness
-    questions = plan_questions(cards[epic]["body"])
-    risks, note = plan_risks(epic, cards, questions)
-    if note:
-        # Unjudged is not "no risk": the [ADV] advisor answers the questions instead, and it gates
-        # [SHIP] because an irreversible or out-of-scope operation cannot be ruled out. Stable text
-        # (no error message) so a later failure does not open another [ADV] for the same plan.
-        flagged = {n for n, _ in questions}
-        risk = {n: f"Decisions 無法判斷計畫風險，請 advisor 代為回答 {n}：{q}" for n, q in questions}
+    if run_llm:
+        risks, note, risk, gating_list = _evaluate_plan_risks(epic, cards)
+        gating_texts = set(gating_list)
     else:
-        flagged = {n for n, p in risks.items() if p >= DECISIONS["flag"]}
-        risk = {n: f"Decisions {n}：{q}" for n, q in questions if n in flagged}
+        risks, note, risk, gating_texts = {}, "", {}, set()
     findings += list(risk.values())
     advisory = [f for f in rules if f in manual] + list(risk.values())
     ships = pending_ships(cards)
     work = pending_work_cards(epic, cards)
     non_ship_work = [w for w in work if card_type(cards[w]["title"]) != "SHIP"]
-    gating_texts = {risk[n] for n in SHIP_GATING_RISKS if n in risk}
     keys: dict[str, list[str]] = {}
     for f in advisory:
         if f in manual:
@@ -1643,8 +1653,9 @@ def check_plan(board: str, epic: str, *, advise: bool, cards: dict[str, dict] | 
         else:
             keys[f] = [f"{f} @ {w}" for w in work] or [f]
     report = {"board": board, "epic": epic, "cards": len(cards), "findings": findings,
-              "actionable_rules": actionable_rules, "risks": risks, "note": note,
-              "advised": sorted({k for ks in keys.values() for k in ks})}
+              "actionable_rules": actionable_rules, "gating_risks": sorted(gating_texts),
+              "risks": risks, "note": note, "llm_skipped": not run_llm,
+              "advised": sorted({k for ks in keys.values() for k in ks}) if advise else []}
     new = [f for f in advisory if any(k not in advised for k in keys[f])]
     gate_ships = any(f in gating_texts for f in new)
     if new and advise:
@@ -1718,18 +1729,28 @@ BOARD_OPS = {"archive", "link", "unlink", "assign", "edit", "resume"}
 
 def tick_key(board: str) -> str:
     """What a tick depends on: the board's files, pending PR judgments (written by workers while
-    kanban.db is idle), and the kit's own rules. A board idle since the last tick is skipped, but
-    not after a judgment write or a kit update."""
+    kanban.db is idle), runtime policy (`config.json`, `plan_risk_mode`, `auto_flow_adj`), and the
+    kit's own rules. A board idle since the last tick is skipped, but not after a judgment write,
+    policy change, or kit update."""
     import hashlib
     board_mtime = 0.0
     for p in (BOARDS / board).glob("kanban.db*"):
         with suppress(FileNotFoundError):  # SQLite removes -wal/-shm between glob and stat
             board_mtime = max(board_mtime, p.stat().st_mtime)
     j_mtime = 0.0
-    with suppress(FileNotFoundError):
-        j_mtime = JUDGMENTS.stat().st_mtime
-    kit = hashlib.sha1(Path(__file__).resolve().read_bytes() + (ROOT / "roles.json").read_bytes()).hexdigest()[:12]
-    return f"{board_mtime}:{j_mtime}:{kit}"
+    for p in (JUDGMENTS, PLAN_RISK_STATE):
+        with suppress(FileNotFoundError):
+            j_mtime = max(j_mtime, p.stat().st_mtime)
+    h = hashlib.sha1()
+    h.update(Path(__file__).resolve().read_bytes())
+    h.update((ROOT / "roles.json").read_bytes())
+    cfg_path = ROOT / "config.json"
+    if cfg_path.is_file():
+        with suppress(OSError):
+            h.update(cfg_path.read_bytes())
+    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+    h.update(f"\x00risk_mode={risk_mode}\x00auto_flow_adj={int(AUTO_FLOW_ADJ)}".encode())
+    return f"{board_mtime}:{j_mtime}:{h.hexdigest()[:12]}"
 
 
 def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
@@ -1746,6 +1767,8 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
         elif card_type(c["title"]) == "SHIP":
             row.append(c.get("status") in SHIP_PENDING)
         rows.append(row)
+    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+    rows.append(["__policy__", risk_mode])
     return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:12]
 
 
@@ -1915,6 +1938,333 @@ def mark_plan_needs_input(board: str, epic: str, reason: str) -> tuple[int | Non
     return kanban_adapter.mark_plan_needs_input(run, HERMES_PY, BOARDS, board, epic, reason)
 
 
+PLAN_RISK_STATE = ROOT / "state" / "plan-risk.json"
+PLAN_RISK_HOLD_PREFIX = "plan-risk-hold:"
+
+
+def load_plan_risk_state() -> dict[str, dict]:
+    if not PLAN_RISK_STATE.is_file():
+        return {}
+    try:
+        data = json.loads(PLAN_RISK_STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_plan_risk_state(data: dict[str, dict]) -> None:
+    PLAN_RISK_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PLAN_RISK_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(PLAN_RISK_STATE)
+
+
+def plan_risk_key(board: str, epic: str) -> str:
+    return f"{board}/{epic}"
+
+
+def plan_risk_hold_reason(epic: str) -> str:
+    return f"{PLAN_RISK_HOLD_PREFIX}{epic} 等待 {epic} 的計畫風險由使用者定錨（plan_risk_mode=needs_input）"
+
+
+def is_plan_risk_accepted(board: str, epic: str, rhash: str, epic_body: str | None = None) -> bool:
+    """Explicit consent bound to exact `(epic, rhash)`: either via `devflow approve-plan` or an exact
+    `- 核准計畫風險：<epic> <plan_hash>` entry under EPIC `## 使用者決定`. Leaving blocked/waiting status
+    (e.g. Option A rejection or manual resume) NEVER counts as acceptance."""
+    want = (rhash or "").strip().lower()
+    if not trust_lib.PLAN_HASH_RE.fullmatch(want):
+        return False
+    rec = load_plan_risk_state().get(plan_risk_key(board, epic))
+    if isinstance(rec, dict) and rec.get("status") == "accepted" and str(rec.get("rhash") or "").lower() == want:
+        return True
+    return (epic, want) in trust_lib.epic_plan_risk_approvals(epic_body)
+
+
+def register_plan_risk_pending(board: str, epic: str, rhash: str, gating: list[str], *,
+                               ship_ids: list[str] | None = None,
+                               question_event_id: int | None = None) -> dict:
+    key = plan_risk_key(board, epic)
+    with locked("plan-risk"):
+        data = load_plan_risk_state()
+        cur = data.get(key) if isinstance(data.get(key), dict) else {}
+        existing_ships = list(cur.get("held_ships") or [])
+        for sid in ship_ids or []:
+            if sid and sid not in existing_ships:
+                existing_ships.append(sid)
+        # Preserve explicit acceptance ONLY if it already matches this exact rhash; otherwise fail closed to pending.
+        status = "accepted" if (cur.get("status") == "accepted" and cur.get("rhash") == rhash) else "pending"
+        q_ev = question_event_id
+        if q_ev is None and cur.get("rhash") == rhash:
+            q_ev = cur.get("question_event_id")
+        rec = {
+            "board": board,
+            "epic": epic,
+            "rhash": rhash,
+            "status": status,
+            "gating": sorted(gating),
+            "held_ships": existing_ships,
+            "updated_at": int(time.time()),
+        }
+        if q_ev is not None:
+            rec["question_event_id"] = q_ev
+        data[key] = rec
+        save_plan_risk_state(data)
+        return rec
+
+
+def _plan_risk_question(board: str, epic: str, gating: list[str], rhash: str) -> str:
+    return (
+        f"問題：{epic} 計畫偵測到高風險或超出範圍疑慮，要調整縮減還是核准繼續？"
+        "選項：A 調整並縮減範圍 / B 明確核准目前計畫繼續（建議 A）\n"
+        f"背景：自動風險檢查發現：{'; '.join(gating)[:800]}\n"
+        f"計畫雜湊：{rhash}\n"
+        "A：由 orchestrator 依你的指示刪除多餘卡片或縮小範圍（調整消除風險前維持暫停出貨）。\n"
+        f"B：明確確認核准目前計畫（由 Hermes 執行 `devflow approve-plan {board} {epic} --plan-hash {rhash}` 後解除出貨暫停）。\n"
+        "建議：先確認沒有多做未要求項目再決定。"
+    )
+
+
+def _epic_waiting_on_plan_risk_gate(board: str, epic: str, pr_rec: dict | None = None) -> bool:
+    """True when `epic`'s current active block event belongs to this plan-risk gate (safe to supersede
+    when the plan hash changes, without ever overwriting an unrelated user question)."""
+    db = BOARDS / board / "kanban.db"
+    if not db.exists():
+        return False
+    try:
+        ev = block_event(board, epic)
+        if ev is None:
+            return False
+        if isinstance(pr_rec, dict) and pr_rec.get("question_event_id") is not None and pr_rec.get("question_event_id") == ev:
+            return True
+        reason = block_reason(board, ev)
+        return f"devflow approve-plan {board} {epic} --plan-hash " in reason
+    except sqlite3.Error:
+        return False
+
+
+def _apply_plan_risk_needs_input(
+    board: str, epic: str, cards: dict[str, dict], gating: list[str], st: dict,
+) -> tuple[bool, bool]:
+    """Reconcile `state/plan-risk.json`, EPIC `needs_input` confirmation question, and [SHIP] holds
+    for a freshly evaluated gating risk set. Returns `(risk_escalated, retry)`."""
+    if not gating:
+        clear_plan_risk_state(board, epic)
+        (st.get("plan_risk_escalated") or {}).pop(epic, None)
+        return False, release_plan_risk_holds(board, epic, cards, st)
+
+    prev_rec = load_plan_risk_state().get(plan_risk_key(board, epic))
+    rhash = plan_risk_fingerprint(epic, cards, gating)
+    esc_map = st.setdefault("plan_risk_escalated", {})
+    epic_card = cards.get(epic) or {}
+    accepted = is_plan_risk_accepted(board, epic, rhash, epic_card.get("body"))
+    if accepted:
+        register_plan_risk_pending(board, epic, rhash, gating)
+        with locked("plan-risk"):
+            data = load_plan_risk_state()
+            if (cur := data.get(plan_risk_key(board, epic))) and isinstance(cur, dict):
+                cur["status"] = "accepted"
+                cur["rhash"] = rhash
+                save_plan_risk_state(data)
+        return False, release_plan_risk_holds(board, epic, cards, st)
+
+    register_plan_risk_pending(board, epic, rhash, gating)
+    epic_status = epic_card.get("status") or ""
+    is_waiting = waiting(epic_card)
+    can_escalate = epic_status in ("todo", "ready", "scheduled", "blocked", "triage") and (
+        (not is_waiting) or _epic_waiting_on_plan_risk_gate(board, epic, prev_rec)
+    )
+    risk_escalated = False
+    retry = False
+    if esc_map.get(epic) != rhash and can_escalate:
+        bev, esc_failed = mark_plan_needs_input(board, epic, _plan_risk_question(board, epic, gating, rhash))
+        if bev is not None:
+            if epic_status in ("todo", "ready", "scheduled"):
+                cards[epic]["status"] = "blocked"
+            cards[epic]["block_kind"] = "needs_input"
+            register_plan_risk_pending(board, epic, rhash, gating, question_event_id=bev)
+            esc_map[epic] = rhash
+            risk_escalated = True
+        elif esc_failed:
+            retry = True
+    retry = hold_pending_ships_for_plan_risk(board, epic, cards, st) or retry
+    return risk_escalated, retry
+
+
+def register_ship_plan_risk_hold(board: str, epic: str, ship_id: str) -> None:
+    """Attach `ship_id` to an EXISTING plan-risk record only; never fabricate a hashless record
+    for an ordinary EPIC needs_input/capability wait."""
+    if not ship_id:
+        return
+    key = plan_risk_key(board, epic)
+    with locked("plan-risk"):
+        data = load_plan_risk_state()
+        cur = data.get(key)
+        if not isinstance(cur, dict) or not cur.get("rhash") or not cur.get("gating"):
+            return
+        held = list(cur.get("held_ships") or [])
+        if ship_id not in held:
+            held.append(ship_id)
+            cur["held_ships"] = held
+            cur["updated_at"] = int(time.time())
+            data[key] = cur
+            save_plan_risk_state(data)
+
+
+def clear_plan_risk_state(board: str, epic: str) -> None:
+    key = plan_risk_key(board, epic)
+    with locked("plan-risk"):
+        data = load_plan_risk_state()
+        if key in data:
+            del data[key]
+            save_plan_risk_state(data)
+
+
+def _epic_body_without_plan_consent(body: str | None) -> str:
+    """Strip exact `核准計畫風險` consent lines (and any `## 使用者決定` heading left empty by removing
+    them) so recording the consent directive under `## 使用者決定` never mutates the plan hash."""
+    lines = [ln for ln in (body or "").splitlines() if not trust_lib.PLAN_RISK_APPROVAL_RE.fullmatch(ln)]
+    text = "\n".join(lines)
+    text = re.sub(r"(?:^|\n)##[ \t]*使用者決定[ \t]*(?=\n[ \t]*## |\n*[ \t]*\Z)", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def plan_risk_fingerprint(epic: str, cards: dict[str, dict], gating: list[str]) -> str:
+    """Bind a plan-risk escalation decision to the reviewed plan content (EPIC + non-archived work
+    cards' titles/bodies/parents) plus flagged gating risk categories, excluding volatile status/
+    block_kind transitions and `核准計畫風險` consent directives so answering or recording consent
+    does not mutate the hash, while any material plan change re-arms escalation and shipping holds."""
+    import hashlib
+    content_rows = []
+    for tid, c in sorted(cards.items()):
+        kind = card_type(c.get("title") or "")
+        if c.get("status") == "archived" or kind in ("ADV", "ADJ"):
+            continue
+        if tid == epic or kind in ("RES", "ARCH", "DEV", "OPS", "SHIP"):
+            body = _epic_body_without_plan_consent(c.get("body")) if tid == epic else (c.get("body") or "")
+            content_rows.append([
+                tid,
+                c.get("title") or "",
+                body,
+                sorted(c.get("parents") or []),
+            ])
+    payload = {"gating": sorted(gating), "plan": content_rows}
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+def _live_plan_risk_hash(board: str, epic: str, pr_rec: dict, cards: dict[str, dict] | None = None) -> str | None:
+    """Recompute the plan-risk fingerprint against the LIVE plan in `kanban.db` (or `cards`),
+    returning None if the live plan cannot be loaded (caller fails closed)."""
+    gating = list(pr_rec.get("gating") or [])
+    if not gating:
+        return None
+    if cards is None:
+        try:
+            cards = plan_cards(board, epic)
+        except (SystemExit, Exception):
+            return None
+    if not cards or epic not in cards:
+        return None
+    return plan_risk_fingerprint(epic, cards, gating)
+
+
+def _ship_has_plan_risk_hold_marker(board: str, epic: str, ship_id: str) -> bool:
+    """True when `ship_id`'s latest `blocked` event carries this EPIC's durable `plan-risk-hold:` prefix."""
+    db = BOARDS / board / "kanban.db"
+    if not db.exists():
+        return False
+    try:
+        ev = block_event(board, ship_id)
+        if ev is None:
+            return False
+        reason = block_reason(board, ev)
+        return reason.startswith(f"{PLAN_RISK_HOLD_PREFIX}{epic}")
+    except sqlite3.Error:
+        return False
+
+
+def hold_pending_ships_for_plan_risk(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
+    """Park every pending [SHIP] card in `blocked (dependency)` while `epic` has an unresolved
+    plan-risk decision, and register any already-blocked plan-risk [SHIP] cards so release_plan_risk_holds
+    always knows about self-blocked running workers too. Returns True on any transient failure."""
+    holds = st.setdefault("plan_risk_holds", {})
+    held_list = holds.setdefault(epic, [])
+    retry = False
+    hold_reason = plan_risk_hold_reason(epic)
+    for ship_id in pending_ships(cards):
+        status = cards[ship_id].get("status")
+        if status == "blocked" and cards[ship_id].get("block_kind") == "dependency":
+            if _ship_has_plan_risk_hold_marker(board, epic, ship_id):
+                if ship_id not in held_list:
+                    held_list.append(ship_id)
+                register_ship_plan_risk_hold(board, epic, ship_id)
+            continue
+        if status not in ("todo", "ready", "scheduled"):
+            continue
+        ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, ship_id, hold_reason)
+        if failed:
+            retry = True
+        elif ok:
+            cards[ship_id]["status"] = "blocked"
+            cards[ship_id]["block_kind"] = "dependency"
+            if ship_id not in held_list:
+                held_list.append(ship_id)
+            register_ship_plan_risk_hold(board, epic, ship_id)
+    return retry
+
+
+def release_plan_risk_holds(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
+    """Release [SHIP] cards whose CURRENT block event carries this EPIC's `plan-risk-hold:` marker,
+    ONLY once the LIVE plan's risk hash is explicitly accepted or cleared by plan adjustment.
+    Never resumes an unrelated dependency block based on stale bookkeeping alone."""
+    holds = st.setdefault("plan_risk_holds", {})
+    pr_rec = load_plan_risk_state().get(plan_risk_key(board, epic))
+    epic_body = (cards.get(epic) or {}).get("body")
+    if pr_rec:
+        live_hash = _live_plan_risk_hash(board, epic, pr_rec, cards=cards)
+        if not live_hash or not is_plan_risk_accepted(board, epic, live_hash, epic_body):
+            return False
+    candidates = set(holds.get(epic) or []) | set((pr_rec or {}).get("held_ships") or [])
+    for sid, c in cards.items():
+        if (
+            card_type(c.get("title") or "") == "SHIP"
+            and c.get("status") == "blocked"
+            and c.get("block_kind") == "dependency"
+            and _ship_has_plan_risk_hold_marker(board, epic, sid)
+        ):
+            candidates.add(sid)
+    if not candidates:
+        holds.pop(epic, None)
+        return False
+    retry = False
+    remaining: list[str] = []
+    for ship_id in sorted(candidates):
+        c = cards.get(ship_id)
+        if not c or c.get("status") != "blocked" or c.get("block_kind") != "dependency":
+            continue
+        # Only resume when the card's CURRENT block is actually our plan-risk hold (never an unrelated dependency).
+        if not _ship_has_plan_risk_hold_marker(board, epic, ship_id):
+            continue
+        try:
+            resume(board, ship_id, f"devflow tick：{epic} 計畫風險已獲核准或修正消除，解除 [SHIP] 暫停。")
+            c["status"] = "ready"
+            c["block_kind"] = None
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - retry on next tick
+            retry = True
+            remaining.append(ship_id)
+            print(f"devflow: release plan-risk hold for {board}/{ship_id} failed: {err}", file=sys.stderr)
+    if remaining:
+        holds[epic] = remaining
+    else:
+        holds.pop(epic, None)
+        if pr_rec:
+            with locked("plan-risk"):
+                data = load_plan_risk_state()
+                if (cur := data.get(plan_risk_key(board, epic))) and isinstance(cur, dict):
+                    cur["held_ships"] = []
+                    save_plan_risk_state(data)
+    return retry
+
+
 def plan_cap_reason(epic: str, epic_card: dict, rules: list[str], adjs: list[str]) -> str:
     adj_list = ", ".join(sorted(adjs))
     rule_list = "；".join(rules)
@@ -2070,27 +2420,113 @@ def tick_board(board: str, st: dict) -> bool:
                 )
             )
             if plans.get(tid) != fp or repair_ended:
-                rep = check_plan(board, tid, advise=AUTO_PLAN_ADVISOR, cards=cards, advised=frozenset(advised.get(tid, [])))
-                advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
+                risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+                run_llm = risk_mode != "off"
+                advise_on = risk_mode == "advisor"
+                rep = check_plan(board, tid, advise=advise_on, cards=cards,
+                                 advised=frozenset(advised.get(tid, [])), run_llm=run_llm)
+                if advise_on and rep.get("advised"):
+                    advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
                 adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
                 retry = adj_retry or retry
+                risk_escalated = False
+                if risk_mode == "needs_input":
+                    risk_escalated, pr_retry = _apply_plan_risk_needs_input(
+                        board, tid, cards, rep.get("gating_risks") or [], st
+                    )
+                    retry = pr_retry or retry
                 suffix = []
                 if rep.get("advisor_card"):
                     suffix.append(f"已建 {rep['advisor_card']}")
+                if risk_escalated:
+                    suffix.append("高風險／範圍疑慮已轉 needs_input 並暫停待出貨 [SHIP] 等待使用者定錨")
                 if adj_id == "user":
                     suffix.append("已達 [ADJ] 修正上限，已轉 needs_input 通知使用者決定")
                 elif adj_id:
                     suffix.append(f"已交 {adj_id} 喚醒 orchestrator 修正")
-                note_tail = ("\n" + "；".join(suffix)) if suffix else (
-                    "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）")
+                if suffix:
+                    note_tail = "\n" + "；".join(suffix)
+                elif not run_llm:
+                    note_tail = "（plan_risk_mode=off：僅執行確定性規則檢查，未啟用自動計畫顧問）"
+                else:
+                    note_tail = "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）"
                 kanban(board, "comment", tid, "devflow check plan：" + (
                     "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
-                if not adj_retry:
+                if not adj_retry and not retry:
                     plans[tid] = plan_fingerprint(tid, cards, repo)
+            else:
+                pr_rec = load_plan_risk_state().get(plan_risk_key(board, tid))
+                if pr_rec:
+                    live_hash = _live_plan_risk_hash(board, tid, pr_rec, cards=cards)
+                    if live_hash and is_plan_risk_accepted(board, tid, live_hash, (cards.get(tid) or {}).get("body")):
+                        retry = release_plan_risk_holds(board, tid, cards, st) or retry
+                    else:
+                        retry = hold_pending_ships_for_plan_risk(board, tid, cards, st) or retry
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
             print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
+    # Reconcile plan-risk [SHIP] holds for EPICs outside waiting_epics (e.g., ready/running/done after user action),
+    # including [SHIP] cards that self-blocked on an ordinary EPIC wait when plan_risk_mode="off".
+    all_risk_epics = set((st.get("plan_risk_holds") or {}).keys()) | {
+        r["epic"] for r in load_plan_risk_state().values() if isinstance(r, dict) and r.get("board") == board and r.get("epic")
+    }
+    for t in tasks:
+        if card_type(t.get("title") or "") == "SHIP" and t.get("status") == "blocked":
+            try:
+                ev = block_event(board, t["id"])
+                reason = block_reason(board, ev) if ev is not None else ""
+                if reason.startswith(PLAN_RISK_HOLD_PREFIX):
+                    rest = reason[len(PLAN_RISK_HOLD_PREFIX):].split(None, 1)[0]
+                    if TASK_ID_RE.fullmatch(rest):
+                        all_risk_epics.add(rest)
+            except sqlite3.Error:
+                pass
+    for eid in sorted(all_risk_epics):
+        if eid in waiting_epics:
+            continue
+        try:
+            cards = plan_cards(board, eid)
+            pr_rec = load_plan_risk_state().get(plan_risk_key(board, eid))
+            if pr_rec:
+                epic_card = cards.get(eid) or {}
+                live_hash = _live_plan_risk_hash(board, eid, pr_rec, cards=cards)
+                if live_hash and is_plan_risk_accepted(board, eid, live_hash, epic_card.get("body")):
+                    with locked("plan-risk"):
+                        data = load_plan_risk_state()
+                        if (cur := data.get(plan_risk_key(board, eid))) and isinstance(cur, dict):
+                            cur["status"] = "accepted"
+                            cur["rhash"] = live_hash
+                            save_plan_risk_state(data)
+                    retry = release_plan_risk_holds(board, eid, cards, st) or retry
+                elif live_hash and live_hash == pr_rec.get("rhash"):
+                    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+                    esc_map = st.setdefault("plan_risk_escalated", {})
+                    if (
+                        risk_mode == "needs_input"
+                        and esc_map.get(eid) != live_hash
+                        and epic_card.get("status") in ("todo", "ready", "scheduled")
+                    ):
+                        _, pr_retry = _apply_plan_risk_needs_input(
+                            board, eid, cards, list(pr_rec.get("gating") or []), st
+                        )
+                        retry = pr_retry or retry
+                    else:
+                        retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
+                elif eid in cards and epic_card.get("status") != "archived":
+                    # Plan content materially changed while EPIC is outside waiting_epics (e.g. ready/running
+                    # after Option A adjustment): re-evaluate gating risks, clear & release only if risks are
+                    # genuinely removed, or update hash / issue fresh confirmation if risks remain.
+                    _, note, _, gating_list = _evaluate_plan_risks(eid, cards)
+                    _, pr_retry = _apply_plan_risk_needs_input(board, eid, cards, gating_list, st)
+                    retry = bool(note) or pr_retry or retry
+                else:
+                    retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
+            elif not waiting(cards.get(eid, {})):
+                retry = release_plan_risk_holds(board, eid, cards, st) or retry
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC hold reconciliation
+            retry = True
+            print(f"devflow: release_plan_risk_holds failed for {board}/{eid}: {err}", file=sys.stderr)
     del applied[:-1000]
     del settled[:-1000]
     del wake_ops[:-1000]
@@ -2734,11 +3170,14 @@ def pending(profile: str | None = None) -> list[dict]:
                                                    "AND created_at >= ? AND author IS NOT ? ORDER BY id",
                                             (t["id"], since, t["assignee"]))]
             handled = flow.get(f"{board}/{t['id']}/{bev}")
+            req_id = trust_lib.extract_approval_request_id(reason)
+            pending_app = trust_lib.get_pending_approval(HUMAN_APPROVALS, req_id) if req_id else None
             if profile is None or ask_in == profile:
                 out.append({"board": board, "task": t["id"], "title": t["title"], "assignee": t["assignee"],
                             "kind": t["block_kind"], "question": reason, "card": (t["body"] or "")[:1500],
                             "ask_in": ask_in, "block_event": bev, "chats": chats,
                             "handled_by": handled if handled and handled != "user" else None,
+                            **({"pending_approval": pending_app} if pending_app else {}),
                             "comments_since": comments})
     return out
 
@@ -3415,12 +3854,12 @@ def cmd_check_acceptance(a) -> None:
 # GitHub. The tick runs the same judgment early (cards in review) so [ADV] is usually done first.
 
 JUDGMENTS = ROOT / "state" / "pr-judgments.json"
+HUMAN_APPROVALS = ROOT / "state" / "human-approvals.json"
 JUDGMENT_CHECK = "devflow-judgment"
 PR_ADVISOR_TITLE = "[ADV] PR 判斷 "
-# Delivery machinery every devflow repo shares (template). Changing these is judged, not only reviewed.
-DELIVERY_FILES = re.compile(r"^(\.devflow/(deploy\.sh|capture\.sh|redact\.py|up\.sh|playwright\.sh|acceptance\.py|"
-                            r"verify-base\.sh)|\.github/workflows/deploy\.yml)$")
-GATE_FILES = re.compile(r"^(\.devflow/(check\.py|check\.sh|test\.sh|rules/)|\.github/workflows/)|" + DELIVERY_FILES.pattern)
+# Single source of truth in `lib/trust.py` so preflight, check pr, and ship merge never drift.
+DELIVERY_FILES = trust_lib.DELIVERY_FILES_RE
+GATE_FILES = trust_lib.TRUSTED_HARNESS_RE
 FIX_TITLE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)   # same as the template check.py
 EXEMPTION = re.compile(r"^\s*(No-(lesson|proof)|Already-met|Base-unverifiable):\s*\S", re.M)
 PR_SCOPE_QUESTION = (
@@ -4139,10 +4578,178 @@ def cmd_check_pr(a) -> None:
                       "judgment_token_isolated": j_isolated}, ensure_ascii=False, indent=2))
 
 
+def _epic_waiting_on_user(board: str, goal_ctx: dict | None, ship_task_id: str | None = None) -> tuple[str, str] | None:
+    """Return `(epic_id, reason)` when the governing EPIC of this PR (or current [SHIP] worker)
+    either has an unaccepted plan-risk gate in `state/plan-risk.json` OR is actively waiting on a
+    user decision (`blocked`/`triage` with `needs_input`/`capability`). Leaving waiting status after
+    rejection or manual resume NEVER lifts a pending plan-risk prohibition."""
+    epic_ids: list[str] = []
+    if goal_ctx and goal_ctx.get("epic_id"):
+        epic_ids.append(goal_ctx["epic_id"])
+    db = BOARDS / board / "kanban.db"
+    if db.exists():
+        try:
+            cols = {r["name"] for r in board_rows(board, "PRAGMA table_info(tasks)")}
+            if not epic_ids and ship_task_id and "body" in cols:
+                s_rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (ship_task_id,))
+                if s_rows and (m := EPIC_REF.search(s_rows[0].get("body") or "")):
+                    epic_ids.append(m.group(1))
+                if not epic_ids:
+                    tables = {r["name"] for r in board_rows(board, "SELECT name FROM sqlite_master WHERE type='table'")}
+                    if "task_links" in tables and "title" in cols:
+                        for lk in board_rows(board, "SELECT child_id FROM task_links WHERE parent_id = ?", (ship_task_id,)):
+                            c_rows = board_rows(board, "SELECT id, title FROM tasks WHERE id = ?", (lk["child_id"],))
+                            if c_rows and card_type(c_rows[0].get("title") or "") == "EPIC":
+                                epic_ids.append(c_rows[0]["id"])
+            pr_state = load_plan_risk_state()
+            for eid in dict.fromkeys(epic_ids):
+                ebody = None
+                if "body" in cols:
+                    b_rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (eid,))
+                    ebody = b_rows[0].get("body") if b_rows else None
+                pr_rec = pr_state.get(plan_risk_key(board, eid))
+                if isinstance(pr_rec, dict):
+                    live_hash = _live_plan_risk_hash(board, eid, pr_rec)
+                    if not live_hash or not is_plan_risk_accepted(board, eid, live_hash, ebody):
+                        gating = "; ".join(pr_rec.get("gating") or [])
+                        return eid, (
+                            f"{eid} 尚有未獲使用者核准的計畫風險（plan_hash={live_hash or pr_rec.get('rhash') or '?'}）："
+                            f"{gating or '請調整計畫消除風險或明確核准'}"
+                        )
+                if {"id", "status", "block_kind"}.issubset(cols):
+                    rows = board_rows(board, "SELECT id, status, block_kind FROM tasks WHERE id = ?", (eid,))
+                    if rows and waiting(rows[0]):
+                        ev = None
+                        try:
+                            ev = block_event(board, eid)
+                        except sqlite3.Error:
+                            ev = None
+                        reason = block_reason(board, ev) if ev else ""
+                        return eid, reason
+        except sqlite3.Error as err:
+            # Fail closed on DB read failure whenever a persisted plan-risk record exists for this
+            # board/EPIC OR we have a governing EPIC whose waiting/consent state cannot be verified.
+            pr_state = load_plan_risk_state()
+            target_eid = next(iter(epic_ids), None)
+            if not target_eid:
+                for rec in pr_state.values():
+                    if isinstance(rec, dict) and rec.get("board") == board and rec.get("epic"):
+                        target_eid = str(rec["epic"])
+                        break
+            if target_eid or ship_task_id:
+                return (
+                    target_eid or "unknown",
+                    f"無法讀取看板資料庫以驗證計畫風險與等待狀態（{err}），已 fail closed 拒絕合併",
+                )
+            return None
+    else:
+        pr_state = load_plan_risk_state()
+        for eid in dict.fromkeys(epic_ids):
+            pr_rec = pr_state.get(plan_risk_key(board, eid))
+            if isinstance(pr_rec, dict) and not is_plan_risk_accepted(board, eid, str(pr_rec.get("rhash") or "")):
+                return eid, f"{eid} 尚有未獲使用者核准的計畫風險（plan_hash={pr_rec.get('rhash')}）"
+    return None
+
+
+def _epic_body_for_pr(board: str, goal_ctx: dict | None) -> str | None:
+    if not goal_ctx:
+        return None
+    epic_id = goal_ctx.get("epic_id")
+    if epic_id and (BOARDS / board / "kanban.db").exists():
+        try:
+            rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (epic_id,))
+            if rows and rows[0].get("body"):
+                return rows[0]["body"]
+        except sqlite3.Error:
+            pass
+    if ud := goal_ctx.get("user_decisions"):
+        return f"## 使用者決定\n{ud}\n"
+    return None
+
+
+def protected_approval_question(repo: str, number: int, rec: dict, *, request_id: str) -> str:
+    paths = sorted({p.get("filename") or "" for p in (rec.get("protected_changes") or []) if p.get("filename")})
+    shown = "、".join(paths[:5]) + (f" 等 {len(paths)} 檔" if len(paths) > 5 else "")
+    return (
+        f"問題：{repo} PR #{number} 改動了受保護檔案（{shown}），確認核准合併嗎？選項：A 核准合併 / B 退回修改（建議 B）\n"
+        f"背景：PR #{number} 已通過 CI 與審查，但觸及保護／設定／交付檔，需由你確認沒有放寬檢查或未授權變更。\n"
+        f"核准請求碼：{request_id}\n"
+        f"A：由你確認後透過 `devflow approve <board> {number} --request {request_id}` 記錄原提交核准並繼續合併。\n"
+        "B：退回修改或還原受保護檔案。\n"
+        "建議：先確認受保護檔案改動符合本次需求再選 A。"
+    )
+
+
+def cmd_approve(a) -> None:
+    """Record exact-head human approval for a PR touching protected files (Hermes chat only).
+    Binds approval to the original head SHA presented in the question (`--request <request_id>`
+    and/or full 40-char `--head <sha>`) and fails closed if the live PR head has moved."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("approve runs from Hermes chat after explicit user confirmation, not inside a kanban worker")
+    e = entry(a.board)
+    repo = e["repo"]
+    req_id = (getattr(a, "request", None) or "").strip().lower()
+    want = (getattr(a, "head", None) or "").strip().lower()
+    if req_id:
+        pending_rec = trust_lib.get_pending_approval(HUMAN_APPROVALS, req_id)
+        if not pending_rec:
+            die(f"找不到核准請求碼 {req_id!r} 的待確認紀錄；請重新向使用者確認再核准")
+        if pending_rec.get("repo") != repo or int(pending_rec.get("pr") or 0) != int(a.pr):
+            die(f"核准請求碼 {req_id} 對應 {pending_rec.get('repo')}#{pending_rec.get('pr')}，與 {repo}#{a.pr} 不符")
+        req_head = str(pending_rec.get("head_sha") or "").strip().lower()
+        if want and want != req_head:
+            die(f"--head {want[:12]} 與核准請求碼 {req_id} 原記錄提交 {req_head[:12]} 不符；請重新確認")
+        want = req_head
+    if not trust_lib.FULL_SHA_RE.fullmatch(want):
+        die("必須提供 --request <12碼核准請求碼> 或完整 40 碼 --head SHA（不得省略或查最新 head 代填）")
+    pr = pr_meta(repo, a.pr)
+    head = (pr.get("headRefOid") or "").strip().lower()
+    if head != want:
+        die(f"PR #{a.pr} 目前 head 是 {head[:12]}，與原提問確認的提交 {want[:12]} 不符；PR 已有新提交，請重新確認再核准")
+    with locked("human-approvals"):
+        rec = trust_lib.record_human_approval(
+            HUMAN_APPROVALS,
+            repo=repo,
+            pr_number=a.pr,
+            head_sha=head,
+            note=a.note or "",
+            approved_by=a.by or "operator",
+        )
+    print(json.dumps({"approved": True, **({"request_id": req_id} if req_id else {}), **rec}, ensure_ascii=False, indent=2))
+
+
+def cmd_approve_plan(a) -> None:
+    """Record explicit human acceptance of a flagged plan-risk hash (Hermes chat only)."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("approve-plan runs from Hermes chat after explicit user confirmation, not inside a kanban worker")
+    want = (a.plan_hash or "").strip().lower()
+    if not trust_lib.PLAN_HASH_RE.fullmatch(want):
+        die("--plan-hash 必須提供 12 碼計畫雜湊（來自計畫風險提問）")
+    e = entry(a.board)
+    key = plan_risk_key(e["slug"], a.epic)
+    with locked("plan-risk"):
+        data = load_plan_risk_state()
+        cur = data.get(key)
+        if not isinstance(cur, dict):
+            die(f"{key} 沒有待核准的計畫風險紀錄")
+        cur_hash = _live_plan_risk_hash(e["slug"], a.epic, cur) or str(cur.get("rhash") or "").lower()
+        if cur_hash != want:
+            die(f"{key} 目前計畫雜湊是 {cur_hash}，與指定 --plan-hash {want} 不符；計畫已變動，請重新確認")
+        cur["rhash"] = cur_hash
+        cur["status"] = "accepted"
+        cur["approved_at"] = int(time.time())
+        cur["approved_by"] = a.by or "operator"
+        cur["note"] = a.note or ""
+        data[key] = cur
+        save_plan_risk_state(data)
+    print(json.dumps({"approved": True, **cur}, ensure_ascii=False, indent=2))
+
+
 def cmd_ship_merge(a) -> None:
     """Exit 0 merged (or already merged); 3 waiting for the [ADV] verdict; 4 advisor says revise;
-    5 the shared deploy channel is not ready (output: capability question); 1 anything else (no
-    judgment, PR changed meanwhile, invalid merge method, merge refused)."""
+    5 the shared deploy channel is not ready (output: capability question); 6 PR touches protected
+    files and lacks exact-head human approval; 7 governing EPIC is awaiting a user plan-risk
+    decision; 1 anything else (no judgment, PR changed meanwhile, invalid merge method, merge refused)."""
     e = entry(a.board)
     repo = e["repo"]
     pr = pr_meta(repo, a.pr)
@@ -4175,12 +4782,55 @@ def cmd_ship_merge(a) -> None:
     # A body, card scope, or repo policy edit after judging leaves the head unchanged: re-judge the
     # new effective fingerprint, which publishes its own state, and stop.
     now = pr_meta(repo, a.pr)
-    _, _, now_fp = resolve_pr_judgment_inputs(e["slug"], repo, a.pr, now)
+    goal_ctx, now_cfg, now_fp = resolve_pr_judgment_inputs(e["slug"], repo, a.pr, now)
     if now_fp != rec["fingerprint"]:
         try:
             gate(e["slug"], repo, a.pr, now)
         finally:
             die("未合併：PR 或其卡片範圍／政策在判斷後被修改，重跑 devflow ship merge")
+    ship_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if pending_epic := _epic_waiting_on_user(e["slug"], goal_ctx, ship_task_id):
+        eid, ereason = pending_epic
+        if ship_task_id:
+            register_ship_plan_risk_hold(e["slug"], eid, ship_task_id)
+        print(json.dumps({
+            "merged": False,
+            "plan_risk_blocked": True,
+            "epic": eid,
+            "hold_reason": plan_risk_hold_reason(eid),
+            "reason": ereason or f"{eid} 正等待使用者決定（needs_input），未定錨前禁止合併出貨",
+        }, ensure_ascii=False, indent=2))
+        sys.exit(7)
+    if rec.get("needs_human_approval") and policy_lib.repo_require_human_approval(now_cfg, POLICY):
+        approved, approval_source = trust_lib.is_human_approved(
+            HUMAN_APPROVALS,
+            repo=repo,
+            pr_number=a.pr,
+            head_sha=pr["headRefOid"],
+            epic_body=_epic_body_for_pr(e["slug"], goal_ctx),
+        )
+        if not approved:
+            prot_paths = sorted({p.get("filename") or "" for p in (rec.get("protected_changes") or []) if p.get("filename")})
+            with locked("human-approvals"):
+                pending_req = trust_lib.record_pending_approval(
+                    HUMAN_APPROVALS,
+                    repo=repo,
+                    pr_number=a.pr,
+                    head_sha=pr["headRefOid"],
+                    protected_files=prot_paths,
+                )
+            print(json.dumps({
+                "merged": False,
+                "needs_human_approval": True,
+                "request_id": pending_req["request_id"],
+                "head_sha": pr["headRefOid"],
+                "protected_changes": rec.get("protected_changes") or [],
+                "gate_files": rec.get("gate_files") or [],
+                "question": protected_approval_question(repo, a.pr, rec, request_id=pending_req["request_id"]),
+            }, ensure_ascii=False, indent=2))
+            sys.exit(6)
+    else:
+        approval_source = ""
     p = run(["gh", "pr", "merge", str(a.pr), "-R", repo, f"--{merge_method}", "--match-head-commit", pr["headRefOid"]],
             gh="builder", check=False)
     if p.returncode != 0:
@@ -4188,6 +4838,7 @@ def cmd_ship_merge(a) -> None:
     done = pr_meta(repo, a.pr)
     print(json.dumps({"merged": done["state"] == "MERGED", "merged_sha": (done.get("mergeCommit") or {}).get("oid"),
                       "merge_method": merge_method, "fingerprint": rec["fingerprint"], "advisor": rec.get("advisor"),
+                      **({"human_approval": approval_source} if approval_source else {}),
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
 
@@ -4321,6 +4972,19 @@ def main() -> None:
     p.add_argument("--no-test", action="store_true", help="skip local check.sh / test command")
     p.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes in worktree")
     p.set_defaults(fn=cmd_preflight)
+    p = sub.add_parser("approve", help="record exact-head human approval for a PR touching protected files (Hermes chat only)")
+    p.add_argument("board"); p.add_argument("pr", type=int)
+    p.add_argument("--request", help="12-char approval request ID from the block question (`核准請求碼：`) / `devflow pending`")
+    p.add_argument("--head", help="exact 40-char PR head SHA confirmed by the operator (or verified against --request)")
+    p.add_argument("--note", default="", help="reason or operator confirmation summary")
+    p.add_argument("--by", default="operator", help="approver label (default: operator)")
+    p.set_defaults(fn=cmd_approve)
+    p = sub.add_parser("approve-plan", help="record explicit human acceptance of a flagged plan-risk hash (Hermes chat only)")
+    p.add_argument("board"); p.add_argument("epic")
+    p.add_argument("--plan-hash", required=True, help="exact 12-char plan risk hash confirmed by the operator")
+    p.add_argument("--note", default="", help="reason or operator confirmation summary")
+    p.add_argument("--by", default="operator", help="approver label (default: operator)")
+    p.set_defaults(fn=cmd_approve_plan)
     ship = sub.add_parser("ship").add_subparsers(dest="sub", required=True)
     p = ship.add_parser("merge", help="merge a PR only with a judgment (and [ADV] ok) for its current head + body")
     p.add_argument("board"); p.add_argument("pr", type=int); p.set_defaults(fn=cmd_ship_merge)

@@ -80,7 +80,7 @@ metadata:
 - 有 contract 的卡，`kanban_request_review` / `kanban_complete` 的 metadata 一定帶 `published_pr`（PR URL）。
 - worker 只能用 `kanban_*` 工具改看板（Hermes 原生限制）：`hermes kanban` CLI 的寫入（edit、archive、unlink、assign、unblock）在 worker 內一律被擋，不要繞過。orchestrator 需要時在自己的卡留 `devflow-ops` 留言（見 `devflow-orchestrate`），由 dispatcher tick 執行；其他 Bot 需要時寫進 summary/`followups` 交 orchestrator。
 - 不改 Hermes 本身（`/opt/hermes`、容器 image、Hermes 原始碼）。碰到 Hermes 原生限制，用 devflow 已有的對應（見 `/opt/data/devflow/README.md`「Hermes 原生限制與對應」）；沒有對應就在 summary/`followups` 寫清楚，交 Hermes 回報使用者，不建修 Hermes 的卡。
-- worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：dispatcher tick 會判斷是流程問題，自動建 `[ADJ]` 交 orchestrator。
+- worker 的 `kanban_block(kind="needs_input")` 只問使用者能決定的事（產品方向、範圍、不可回復操作、付費、他擁有的帳號或權限、受保護檔合併核准）。工具不夠、權限、卡片寫法、交接卡住這類流程問題也照實 block（寫清楚缺什麼、試過什麼），不要寫成「請管理端…」的選擇題：啟用 `auto_flow_adj=true` 時 tick 會自動建 `[ADJ]` 交 orchestrator；預設 `auto_flow_adj=false` 時不跑額外 LLM 元循環，直接依 `devflow pending` 呈現或由 orchestrator 接手。
 - 已部署服務的畫面操作（登入管理頁、建立或選擇資料、按按鈕、讀出 id 或畫面文字）由 Bot 自己做：`devflow operate <slug> <op>`（`devflow-devops` §5，經 VM runner 的 Playwright；Bot 的容器連不到服務），不要請使用者開瀏覽器代做。只有使用者本人才做得到的事才問他：本人在場、說話或聽到、明確同意、他自己帳號的登入或 MFA、只有他有的資料。問的時候寫清楚其餘步驟由 Bot 做。
 
 ## 在自己的 Bot Chat 回答卡片問題（不是 worker 時）
@@ -99,7 +99,10 @@ metadata:
    直接回覆編號或你的想法。
    ```
    reason 沒寫背景或選項說明時，自己用 `terminal: hermes kanban --board <board> show <task>`（留言、最後一次 run 的 summary）補齊；仍不清楚就照實說「卡片沒說明 X」，不要編。先用 `clarify` 問（question 放上面整段，choices 是選項，建議的放第一個）；`clarify` 被拒（喚醒時沒人在看）就把上面整段留成訊息，結束這一輪。
-3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。題目要使用者自己動手（設 secret、OAuth、在主機執行指令）時，只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
+3. 使用者回覆：對應到哪張卡（只有一張就是它；多張不確定就用 `clarify` 讓他選），然後依題型處理再呼叫 `terminal: devflow answer <board> <task> --event <block_event> --where "<你的 profile> 頁面" "<使用者的回答>"`（`block_event` 取自 `devflow pending`），回一句「已交回繼續執行」。不要用 `devflow resume` 交答案：同一題在 App 對話也問了，`answer` 保證一題只收一次答案。
+   - **受保護檔合併核准題**：**只有使用者明確確認核准合併（選 A／同意）時**，從原提問的 `核准請求碼：`（或 `devflow pending` 的 `pending_approval.request_id`）取出原本向使用者確認的請求碼，執行 `terminal: devflow approve <board> <pr> --request <12碼核准請求碼>` 記錄核准，再執行 `devflow answer`（**嚴禁改查 `devflow check pr` 或 `gh pr view` 的最新 head 代填**，以免把原提交的同意套用到後推的新 commit；若 PR 已換新 head，`approve` 會直接拒絕，請重新向使用者確認）；若使用者拒絕或選 B 退回，**絕不執行 `devflow approve`**，直接以 `devflow answer` 交回拒絕回覆。
+   - **計畫風險定錨題**：**只有使用者明確選擇核准目前計畫（選 B）時**，先從 `question` 的 `計畫雜湊：` 取得 12 碼雜湊，執行 `terminal: devflow approve-plan <board> <epic> --plan-hash <12碼雜湊>` 記錄明確同意，再執行 `devflow answer`；若使用者選擇調整縮減（選 A）或拒絕，**絕不執行 `devflow approve-plan`**，直接以 `devflow answer` 交回調整指示（調整消除風險前維持暫停出貨）。
+   - **要使用者自己動手的題目**（設 secret、OAuth、在主機執行指令）：只有他說做完了、或說暫緩／不做，才 `answer`；只回「同意」「好」時不要交（卡片會重跑、重查仍缺、再 block 同一題而被轉進 triage），回他「做完回覆『完成』，我再交回」並附上步驟，卡片繼續等。
 4. `answer` 回 `not applied: ...`（或回覆對不上 `devflow pending` 的任何卡）：不要套到別張卡。照輸出的 status 與 `events since` 照實說明，例如「你的回覆沒有套用：這張卡在你回覆前已經 unblocked（恢復執行）」或「已封存」或「它已改問新的問題（事件 N）」；只有 `hermes kanban --board <board> show <task>` 的留言裡看得到另一則「使用者回覆（<地方>，問題事件 N）」時，才說「已在 <地方> 回答過」。然後列出 `devflow pending` 裡還在等他的題目（沒有就說沒有）。
 5. 說「有沒有送到」只看 `devflow pending` 的 `chats[]`，它讀的是那個對話自己的紀錄：`woken` = 通知已進入那個對話，`replied` = 那個 bot 之後有回話。`woken` 為 false 時說「那邊還沒看到這則通知（Hermes 一次叫醒一個 bot，常晚約 1 分鐘）」，不要說「未送達」；超過 10 分鐘仍為 false 才說「那邊沒收到」，並請使用者在這裡直接回答。
 
@@ -131,7 +134,9 @@ metadata:
 | `devflow check card --title TITLE [--body-file F]` | 建卡／改卡前確定性檢查卡型、assignee、workspace、固定完成條件、body 長度與技術資訊洩漏 |
 | `devflow preflight SLUG [TASK] [--dir DIR]` | developer 送審前一站式確定性自檢：範圍（`Allowed-Scope`/`Out-of-Scope`）、變更檔數、保護檔 hash、PR 格式與快速測試 |
 | `devflow check pr SLUG PR` | PR 判斷：保護／gate 檔變更、EPIC 目標與 diff 範圍對齊（`out_of_scope_diff`）、review 往復熔斷與 Decisions 檢查 |
-| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve 與 judgment 後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
+| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment、受保護檔人類 exact-head 核准（必要時 exit 6）與 EPIC 計畫風險定錨（必要時 exit 7）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
+| `devflow approve SLUG PR --request REQ_ID [--head FULL_SHA] [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准後，以原提問的 `核准請求碼` 綁定原始確認提交並記錄 exact-head 核准（head 已變動即拒絕） |
+| `devflow approve-plan SLUG EPIC --plan-hash HASH [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准計畫風險（選 B）後，記錄該計畫雜湊的明確同意並解除 `[SHIP]` 暫停 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能
