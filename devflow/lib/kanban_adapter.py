@@ -6,12 +6,120 @@ scattered as inline Python strings across `bin/devflow`.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+
+def _parse_ts(val) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        f = float(s)
+        return f if f > 0 else None
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _adj_targets_card(adj_title: str, adj_body: str, tid: str) -> bool:
+    """True when an [ADJ] card explicitly targets `tid` (flow-block, failure-fix, or plan-rule repair)."""
+    if not adj_title or not adj_title.lstrip().startswith("[ADJ]"):
+        return False
+    pat = re.compile(rf"(?<![0-9A-Za-z_]){re.escape(tid)}(?![0-9A-Za-z_])")
+    if pat.search(adj_title):
+        return True
+    for m in re.finditer(r"^\s*處理[：:][ \t]*([^\n]+)$", adj_body or "", re.M):
+        if pat.search(m.group(1)):
+            return True
+    if adj_title.lstrip().startswith("[ADJ] 計畫規則修正") and pat.search(adj_body or ""):
+        return True
+    return False
+
+
+def card_review_reset_watermark(boards_dir: Path, board: str, tid: str) -> tuple[int, float]:
+    """Return `(reset_event_id, reset_timestamp)` for `tid`'s review-round breaker.
+
+    A reset watermark advances ONLY on deliberate intervention:
+      1. A completed (`status='done'`) `[ADJ]` card on the same board that explicitly targets `tid`.
+      2. A human-anchored `unblocked` event on `tid` following a `needs_input` or `capability` block.
+    Transient retries never reset the counter.
+    """
+    db = boards_dir / board / "kanban.db"
+    if not tid or not db.exists():
+        return 0, 0.0
+    wm_ev = 0
+    wm_ts = 0.0
+    try:
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            # 1. Human-anchored unblock after needs_input / capability block on tid
+            if "task_events" in tables:
+                ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
+                sel = "id, kind, payload" + (", created_at" if "created_at" in ev_cols else "")
+                waiting_human = False
+                for ev in conn.execute(
+                    f"SELECT {sel} FROM task_events WHERE task_id = ? ORDER BY id ASC", (tid,)
+                ):
+                    kind = ev["kind"]
+                    if kind in ("blocked", "block_loop_detected"):
+                        try:
+                            payload = json.loads(ev["payload"] or "{}")
+                        except ValueError:
+                            payload = {}
+                        bkind = (payload.get("kind") or "") if isinstance(payload, dict) else ""
+                        if bkind in ("needs_input", "capability"):
+                            waiting_human = True
+                    elif kind == "unblocked" and waiting_human:
+                        waiting_human = False
+                        wm_ev = max(wm_ev, int(ev["id"]))
+                        if "created_at" in ev_cols:
+                            ts = _parse_ts(ev["created_at"])
+                            if ts is not None:
+                                wm_ts = max(wm_ts, ts)
+            # 2. Completed [ADJ] card targeting tid
+            if "tasks" in tables:
+                t_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+                if {"id", "title", "status"}.issubset(t_cols):
+                    sel = "id, title" + (", body" if "body" in t_cols else "") + (", completed_at" if "completed_at" in t_cols else "")
+                    for row in conn.execute(f"SELECT {sel} FROM tasks WHERE status = 'done'"):
+                        body = row["body"] if "body" in t_cols else ""
+                        if not _adj_targets_card(row["title"] or "", body or "", tid):
+                            continue
+                        if "completed_at" in t_cols:
+                            ts = _parse_ts(row["completed_at"])
+                            if ts is not None:
+                                wm_ts = max(wm_ts, ts)
+                        if "task_events" in tables:
+                            ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
+                            q = "SELECT MAX(id) AS mid" + (", MAX(created_at) AS mts" if "created_at" in ev_cols else "") + " FROM task_events WHERE task_id = ?"
+                            er = conn.execute(q, (row["id"],)).fetchone()
+                            if er and er["mid"] is not None:
+                                wm_ev = max(wm_ev, int(er["mid"]))
+                            if er and "mts" in er.keys():
+                                ts = _parse_ts(er["mts"])
+                                if ts is not None:
+                                    wm_ts = max(wm_ts, ts)
+    except sqlite3.Error:
+        return 0, 0.0
+    return wm_ev, wm_ts
 
 
 def board_rows(boards_dir: Path, board: str, sql: str, args: tuple = ()) -> list[dict]:
@@ -35,17 +143,31 @@ def goal_modes(boards_dir: Path, board: str, ids: list[str]) -> set[str]:
 
 
 def card_changes_requested_count(boards_dir: Path, board: str, tid: str) -> int:
-    """Count `changes_requested` events recorded on a card in kanban.db (0 if table/db absent)."""
+    """Count `changes_requested` events on `tid` strictly after its latest intervention reset
+    watermark (completed targeting `[ADJ]` or human `needs_input`/`capability` unblock)."""
     db = boards_dir / board / "kanban.db"
     if not db.exists():
         return 0
+    wm_ev, wm_ts = card_review_reset_watermark(boards_dir, board, tid)
     try:
         with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+            conn.row_factory = sqlite3.Row
+            ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
+            sel = "id" + (", created_at" if "created_at" in ev_cols else "")
+            rows = conn.execute(
+                f"SELECT {sel} FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
                 (tid,),
-            ).fetchone()
-            return int(row[0]) if row else 0
+            ).fetchall()
+            count = 0
+            for r in rows:
+                if wm_ev > 0 and int(r["id"]) <= wm_ev:
+                    continue
+                if wm_ts > 0.0 and "created_at" in ev_cols:
+                    ev_ts = _parse_ts(r["created_at"])
+                    if ev_ts is not None and (ev_ts < wm_ts or (ev_ts == wm_ts and wm_ev == 0)):
+                        continue
+                count += 1
+            return count
     except sqlite3.Error:
         return 0
 

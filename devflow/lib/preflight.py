@@ -7,8 +7,16 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .policy import env_values, load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
-from .scope import check_files_against_scope, parse_card_contract, touched_paths
+from .policy import (
+    env_values,
+    load_repo_config,
+    repo_max_diff_files,
+    repo_protected_paths,
+    repo_require_allowed_scope,
+    repo_review_test_cmd,
+    repo_test_paths,
+)
+from .scope import allowed_scope_problems, check_files_against_scope, parse_card_contract, touched_paths
 from .standard import check_standard_delivery_dir, dependent_standard_paths
 from .trust import is_protected_file, protected_file_changes, sha256_text
 
@@ -110,6 +118,9 @@ def run_preflight(
     run_tests: bool = True,
     allow_dirty: bool = False,
     template_dir: Path | None = None,
+    review_loop: dict[str, Any] | None = None,
+    extra_findings: list[str] | None = None,
+    require_scope_for_card: bool = True,
 ) -> dict[str, Any]:
     """Run all deterministic local preflight checks inside a developer worktree."""
     findings: list[str] = []
@@ -150,16 +161,35 @@ def run_preflight(
     repo_cfg = load_repo_config(repo_dir)
     contract = parse_card_contract(card_body)
     max_files = repo_max_diff_files(repo_cfg, policy)
+    test_paths = repo_test_paths(repo_cfg)
     all_touched = touched_paths(files)
-    scope_findings = check_files_against_scope(
+    scope_findings: list[str] = []
+    if card_body is not None:
+        scope_findings.extend(allowed_scope_problems(
+            contract["allowed_scope"],
+            required=require_scope_for_card and repo_require_allowed_scope(repo_cfg, policy) and bool(card_body.strip()),
+        ))
+    scope_findings.extend(check_files_against_scope(
         all_touched,
         allowed_scope=contract["allowed_scope"],
         out_of_scope=contract["out_of_scope"],
+        test_paths=test_paths,
         max_diff_files=max_files,
         file_count=len(files),
-    )
+    ))
     findings.extend(scope_findings)
     checks["scope"] = "fail" if scope_findings else "ok"
+
+    if review_loop is not None:
+        if review_loop.get("tripped"):
+            checks["review_loop"] = "fail"
+            findings.append(review_loop.get("reason") or "review 退件已達熔斷上限，請先由 orchestrator／architect 介入")
+        else:
+            checks["review_loop"] = "ok"
+
+    if extra_findings:
+        checks["scenarios"] = "fail"
+        findings.extend(extra_findings)
 
     # 4. Protected / trusted harness hash lock (raw bytes, only for protected paths)
     extra_protected = repo_protected_paths(repo_cfg)
@@ -256,4 +286,5 @@ def run_preflight(
         "standard_delivery": standard_delivery,
         "needs_human_approval": bool(protected) or bool(standard_delivery.get("custom_allowed")),
         "tests": test_outputs,
+        **({"review_loop": review_loop} if review_loop is not None else {}),
     }

@@ -72,6 +72,9 @@ workflow_dispatch ──operate.yml (self-hosted, default branch tip only)：`de
    - `7`：所屬 EPIC 正等待使用者定錨計畫風險（輸出 `plan_risk_blocked=true`、`epic`、`hold_reason`、`reason`）。不要另提受保護檔核准問題，直接 `kanban_block(kind="dependency", reason=<輸出的 hold_reason 原文>)`，待計畫調整消除風險或使用者明確核准計畫雜湊後由 tick 自動解鎖再重跑。
    - `1`：其他錯誤（PR 在判斷後被修改、merge 被拒）→ 看訊息；PR 被修改就直接重跑。訊息是 reviewer 沒核准目前 head（沒核准、核准後退件或被撤銷、只核准過舊 head）→ 不要自己核准或合併，`kanban_complete(summary="未出貨：reviewer 未核准 PR #N 目前的 head <sha 前 7 碼>", metadata={"shipped": false})`，由 orchestrator 安排重新審查。
 4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：追部署（第 2 步已 merged 而跳過第 3 步時，先 `devflow repo doctor <slug>`，`runner-online`／`runner-request` 沒過照第 3 步 `5` 處理）：
+   - **先看 `DEVFLOW_DEPLOY_MANUAL_ONLY`（`ship merge` 輸出的 `deploy_manual_only` 欄位）**：
+     - 若為 `true`：merge 不會自動觸發 `deploy.yml`（**不要空等 `push` run**）。檢查 EPIC 與 `## 使用者決定` 是否明確授權由本次 `[SHIP]` 觸發部署；已授權才手動執行 `gh workflow run deploy.yml -R <OWNER/REPO> --ref <default>` 並追該次 run；若政策或使用者要求僅由人工手動部署，則 `kanban_block(kind="needs_input", reason="問題：<repo> 設為 DEVFLOW_DEPLOY_MANUAL_ONLY=true，PR #N 已合併（<sha 前 7 碼>），要由我觸發手動部署還是由你自行部署後回覆？選項：A 由我觸發 deploy.yml / B 你手動部署後回覆（建議 A）")` 或依明確指示完成合併交接。
+     - 若為 `false`（預設）：merge 自動觸發 `push` 部署 run，直接追該 commit 的 run：
    ```bash
    gh run list --workflow deploy.yml --commit <sha> --json databaseId,status,conclusion,url   # 剛 merge 可能要等幾秒才出現
    gh run watch <id> --exit-status

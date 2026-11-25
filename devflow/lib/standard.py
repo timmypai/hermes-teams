@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .policy import repo_allow_custom_delivery, repo_deploy_manual_only
+from .policy import repo_allow_custom_delivery, repo_deploy_manual_only, repo_deploys
 
 STANDARD_CORE_FILES: tuple[str, ...] = (
     ".devflow/capture.sh",
@@ -59,8 +59,7 @@ def templates_digest(template_dir: Path) -> str:
 
 def required_standard_files(repo_cfg: dict[str, str] | None = None) -> tuple[str, ...]:
     cfg = repo_cfg or {}
-    deploys = (cfg.get("DEVFLOW_DEPLOY") or "true").strip().lower() != "false"
-    return ALL_STANDARD_DELIVERY_FILES if deploys else STANDARD_CORE_FILES
+    return ALL_STANDARD_DELIVERY_FILES if repo_deploys(cfg) else STANDARD_CORE_FILES
 
 
 def dependent_standard_paths(
@@ -80,8 +79,8 @@ def dependent_standard_paths(
     req_set = set(required_standard_files(head))
     paths: list[str] = [p for p in touched_paths if p in req_set]
     if ".devflow/config.env" in touched_paths:
-        base_deploy = (base.get("DEVFLOW_DEPLOY") or "true").strip().lower() != "false"
-        head_deploy = (head.get("DEVFLOW_DEPLOY") or "true").strip().lower() != "false"
+        base_deploy = repo_deploys(base)
+        head_deploy = repo_deploys(head)
         base_manual = repo_deploy_manual_only(base)
         head_manual = repo_deploy_manual_only(head)
         if head_deploy and not base_deploy:
