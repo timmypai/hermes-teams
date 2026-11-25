@@ -74,20 +74,24 @@ def sync_pinned_git_repo(
             raise RuntimeError(f"pinned commit {want} not found in {repo_url}")
 
     cur_head = _git(["git", "-C", str(vendor_dir), "rev-parse", "HEAD"])
-    cur_dirty = _git(["git", "-C", str(vendor_dir), "status", "--porcelain"])
+    cur_dirty = _git(["git", "-C", str(vendor_dir), "status", "--porcelain", "--ignored=matching", "--untracked-files=all"])
     if cur_head.returncode != 0 or cur_head.stdout.strip().lower() != want or cur_dirty.stdout.strip():
         co_p = _git(["git", "-C", str(vendor_dir), "checkout", "-q", "--detach", "--force", want])
         if co_p.returncode != 0:
             raise RuntimeError(f"git checkout {want[:12]} failed: {(co_p.stderr or co_p.stdout).strip()[:300]}")
-        cl_p = _git(["git", "-C", str(vendor_dir), "clean", "-q", "-fdx"])
-        if cl_p.returncode != 0:
-            raise RuntimeError(f"git clean failed: {(cl_p.stderr or cl_p.stdout).strip()[:300]}")
+    # Always purge untracked, ignored, and nested git directories (-ffdx) so injected files
+    # hidden via .gitignore / .git/info/exclude or nested repos can never survive sync.
+    cl_p = _git(["git", "-C", str(vendor_dir), "clean", "-q", "-ffdx"])
+    if cl_p.returncode != 0:
+        raise RuntimeError(f"git clean failed: {(cl_p.stderr or cl_p.stdout).strip()[:300]}")
 
     actual_p = _git(["git", "-C", str(vendor_dir), "rev-parse", "HEAD"])
     actual = actual_p.stdout.strip().lower() if actual_p.returncode == 0 else ""
     if actual != want:
         raise RuntimeError(f"pinned checkout verification failed: expected {want}, got {actual or 'none'}")
-    dirty_after = _git(["git", "-C", str(vendor_dir), "status", "--porcelain"]).stdout.strip()
+    dirty_after = _git(
+        ["git", "-C", str(vendor_dir), "status", "--porcelain", "--ignored=matching", "--untracked-files=all"]
+    ).stdout.strip()
     if dirty_after:
         raise RuntimeError(f"vendor repo {vendor_dir} is not clean after checkout: {dirty_after[:200]}")
 
@@ -97,8 +101,23 @@ def sync_pinned_git_repo(
 
 
 def discover_mattpocock_skills(vendor_dir: Path) -> dict[str, Path]:
-    """Return `{skill_name: skill_dir}` for all vendored `skills/*/*/SKILL.md` entries."""
+    """Return `{skill_name: skill_dir}` for verified `skills/*/*/SKILL.md` entries.
+
+    When `vendor_dir` is a git checkout, restricts discovery strictly to files tracked in
+    `HEAD` (`git ls-tree`) as defense-in-depth against untracked/ignored injections.
+    """
     found: dict[str, Path] = {}
+    if (vendor_dir / ".git").exists():
+        ls_p = _git(["git", "-C", str(vendor_dir), "ls-tree", "-r", "--name-only", "HEAD", "--", "skills"])
+        if ls_p.returncode != 0:
+            raise RuntimeError(f"failed to list tracked skills in {vendor_dir}: {(ls_p.stderr or ls_p.stdout).strip()[:200]}")
+        for rel in sorted(ls_p.stdout.splitlines()):
+            parts = Path(rel).parts
+            if len(parts) == 4 and parts[0] == "skills" and parts[3] == "SKILL.md":
+                skill_md = vendor_dir / rel
+                if skill_md.is_file():
+                    found.setdefault(skill_md.parent.name, skill_md.parent)
+        return found
     skills_root = vendor_dir / "skills"
     if not skills_root.is_dir():
         return found

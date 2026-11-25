@@ -92,6 +92,29 @@ class PinnedMattpocockSkills(unittest.TestCase):
         self.assertEqual((vendor_dir / "skills" / "engineering" / "tdd" / "SKILL.md").read_text(encoding="utf-8"), "# tdd v1\n")
         self.assertFalse((vendor_dir / "skills" / "engineering" / "rogue.txt").exists())
 
+        # 2b. Already-pinned clean-status checkout with ignored injected SKILL.md (via .git/info/exclude)
+        #     AND an untracked nested git repo MUST both be purged and never discovered.
+        exclude = vendor_dir / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("skills/engineering/rogue/\n", encoding="utf-8")
+        ignored_skill = vendor_dir / "skills" / "engineering" / "rogue" / "SKILL.md"
+        ignored_skill.parent.mkdir(parents=True, exist_ok=True)
+        ignored_skill.write_text("# rogue ignored skill\n", encoding="utf-8")
+        # Even before sync, tracked-only discovery must ignore untracked/ignored SKILL.md
+        self.assertEqual(sorted(vendor_lib.discover_mattpocock_skills(vendor_dir)), ["tdd"])
+        # Plain git status is clean, yet sync_pinned_git_repo MUST still purge the ignored skill
+        self.assertEqual(_git(vendor_dir, "status", "--porcelain"), "")
+        vendor_lib.sync_pinned_git_repo(vendor_dir, str(bare), c1)
+        self.assertFalse(ignored_skill.exists())
+
+        nested_repo = vendor_dir / "skills" / "engineering" / "nested-rogue"
+        nested_repo.mkdir(parents=True, exist_ok=True)
+        _git(nested_repo, "init", "-q", "-b", "main")
+        (nested_repo / "SKILL.md").write_text("# nested git rogue skill\n", encoding="utf-8")
+        vendor_lib.sync_pinned_git_repo(vendor_dir, str(bare), c1)
+        self.assertFalse(nested_repo.exists())
+        self.assertEqual(sorted(vendor_lib.discover_mattpocock_skills(vendor_dir)), ["tdd"])
+
         # 3. Advance pin from c1 -> c2 fetches and checks out exact c2
         actual3 = vendor_lib.sync_pinned_git_repo(vendor_dir, str(bare), c2)
         self.assertEqual(actual3, c2)
