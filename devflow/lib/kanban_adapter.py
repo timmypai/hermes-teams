@@ -131,7 +131,7 @@ def mark_plan_needs_input(
         "try:\n"
         "    with kb.write_txn(c):\n"
         "        cur = c.execute(\n"
-        "            \"UPDATE tasks SET status = CASE WHEN status IN ('todo', 'scheduled') THEN 'blocked' ELSE status END, \"\n"
+        "            \"UPDATE tasks SET status = CASE WHEN status IN ('todo', 'ready', 'scheduled') THEN 'blocked' ELSE status END, \"\n"
         "            \"block_kind = 'needs_input' WHERE id = ? AND status NOT IN ('done', 'archived')\",\n"
         "            (sys.argv[2],),\n"
         "        )\n"
@@ -156,7 +156,7 @@ def mark_plan_needs_input(
         try:
             with closing(sqlite3.connect(db)) as c, c:
                 cur = c.execute(
-                    "UPDATE tasks SET status = CASE WHEN status IN ('todo', 'scheduled') THEN 'blocked' ELSE status END, "
+                    "UPDATE tasks SET status = CASE WHEN status IN ('todo', 'ready', 'scheduled') THEN 'blocked' ELSE status END, "
                     "block_kind = 'needs_input' WHERE id = ? AND status NOT IN ('done', 'archived')",
                     (epic,),
                 )
