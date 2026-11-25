@@ -81,27 +81,31 @@ fail() {
   if [[ -f $LIVE/image ]]; then img=$(<"$LIVE/image"); fi
   if [[ -n $img ]] && docker image inspect "$img" >/dev/null 2>&1; then
     echo "devflow: rolling back to release $(basename "$(readlink "$LIVE")") (image ${img#sha256:})" >&2
-    if rollback_release "$img" && healthy_release; then
+    local rb_sha
+    rb_sha=$(release_source_sha "$img")
+    if rollback_release "$img" "$rb_sha" && healthy_release; then
       echo "devflow: rollback healthy" >&2
       if [[ -x .devflow/deploy-post.sh ]]; then
-        local post_sha="$DEVFLOW_SOURCE_SHA"
-        if [[ -f $LIVE/source_sha ]]; then post_sha=$(<"$LIVE/source_sha"); fi
-        DEVFLOW_DEPLOY_PHASE=rollback DEVFLOW_SOURCE_SHA="$post_sha" bash .devflow/deploy-post.sh || true
+        DEVFLOW_DEPLOY_PHASE=rollback DEVFLOW_SOURCE_SHA="$rb_sha" bash .devflow/deploy-post.sh || true
       fi
     else
       echo "::error::devflow: rollback also unhealthy" >&2
     fi
     capture rollback || true
   elif docker image inspect "${REPO_IMAGE}:live" >/dev/null 2>&1; then
-    # 沒有 release 存檔（首次切換至公版 deploy.sh）：換回映像並沿用切換前的 source SHA。
+    # 沒有 release 存檔（首次切換至公版 deploy.sh）：換回映像並使用切換前的 source SHA（絕不沿用失敗候選版 SHA）。
     local pre_sha=""
-    if [[ -f $LIVE.d/pre-cutover.source_sha ]]; then pre_sha=$(<"$LIVE.d/pre-cutover.source_sha"); fi
+    if [[ -f $LIVE.d/pre-cutover.source_sha ]]; then
+      pre_sha=$(<"$LIVE.d/pre-cutover.source_sha")
+    else
+      pre_sha=$(release_source_sha "${REPO_IMAGE}:live")
+    fi
     echo "devflow: no release snapshot; rolling back the image only to ${REPO_IMAGE}:live" >&2
-    if DEVFLOW_IMAGE="${REPO_IMAGE}:live" DEVFLOW_SOURCE_SHA="${pre_sha:-$DEVFLOW_SOURCE_SHA}" \
+    if DEVFLOW_IMAGE="${REPO_IMAGE}:live" DEVFLOW_SOURCE_SHA="$pre_sha" \
         "${COMPOSE[@]}" up -d --no-build --remove-orphans && healthy; then
       echo "devflow: rollback healthy" >&2
       if [[ -x .devflow/deploy-post.sh ]]; then
-        DEVFLOW_DEPLOY_PHASE=rollback DEVFLOW_SOURCE_SHA="${pre_sha:-$DEVFLOW_SOURCE_SHA}" \
+        DEVFLOW_DEPLOY_PHASE=rollback DEVFLOW_SOURCE_SHA="$pre_sha" \
           bash .devflow/deploy-post.sh || true
       fi
     else
@@ -114,15 +118,34 @@ fail() {
   exit 1
 }
 
+# 解析既有 release 的真實 source SHA（絕不回退成失敗候選版的 DEVFLOW_SOURCE_SHA）。
+release_source_sha() {
+  local img="${1:-}" sha=""
+  if [[ -f $LIVE/source_sha ]]; then
+    sha=$(<"$LIVE/source_sha")
+  fi
+  if [[ -z "$sha" && -n "$img" ]]; then
+    sha=$(docker image inspect "$img" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+    [[ "$sha" == "<no value>" ]] && sha=""
+  fi
+  if [[ -z "$sha" && -n "$img" ]]; then
+    sha=$(docker image inspect "$img" --format '{{index .Config.Labels "io.devflow.source"}}' 2>/dev/null || true)
+    [[ "$sha" == "<no value>" ]] && sha=""
+  fi
+  printf '%s' "$sha"
+}
+
 # 上一個成功的 release：它的映像 ID（重新標成 :live）配它的 compose、.env、config.env 與 source_sha。
 rollback_release() {
-  local prev_sha=""
-  if [[ -f $LIVE/source_sha ]]; then prev_sha=$(<"$LIVE/source_sha"); fi
+  local prev_sha="${2:-}"
+  if [[ -z "$prev_sha" ]]; then
+    prev_sha=$(release_source_sha "$1")
+  fi
   docker tag "$1" "${REPO_IMAGE}:live"
   cp "$LIVE/.env" deploy/.env
   (set -a; . "$LIVE/config.env"; set +a
     DEVFLOW_IMAGE="${REPO_IMAGE}:live" DEVFLOW_RELEASE_DIR="$LIVE" \
-      DEVFLOW_SOURCE_SHA="${prev_sha:-${DEVFLOW_SOURCE_SHA:-}}" \
+      DEVFLOW_SOURCE_SHA="$prev_sha" \
       docker compose -p "$PROJECT" -f "$LIVE/compose.yml" --project-directory deploy \
       up -d --no-build --remove-orphans)
 }

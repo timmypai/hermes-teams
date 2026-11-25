@@ -7,9 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .policy import load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
+from .policy import env_values, load_repo_config, repo_max_diff_files, repo_protected_paths, repo_review_test_cmd
 from .scope import check_files_against_scope, parse_card_contract, touched_paths
-from .standard import ALL_STANDARD_DELIVERY_FILES, check_standard_delivery_dir
+from .standard import check_standard_delivery_dir, dependent_standard_paths
 from .trust import is_protected_file, protected_file_changes, sha256_text
 
 FIX_TITLE_RE = re.compile(r"^\s*(fix|revert)(\([^)]*\))?!?:", re.I)
@@ -181,10 +181,16 @@ def run_preflight(
 
     # 4b. Standard delivery template compliance (enforces canonical devflow delivery scripts across all repos)
     standard_delivery: dict[str, Any] = {"ok": True, "checked": [], "missing": [], "drifted": [], "findings": []}
-    touched_standard = [p for p in all_touched if p in ALL_STANDARD_DELIVERY_FILES]
-    if template_dir is not None and template_dir.is_dir() and touched_standard:
+    base_cfg_p = subprocess.run(
+        ["git", "-C", str(repo_dir), "show", f"{base_ref}:.devflow/config.env"],
+        text=True,
+        capture_output=True,
+    )
+    base_cfg = env_values(base_cfg_p.stdout) if base_cfg_p.returncode == 0 else {}
+    target_standard = dependent_standard_paths(all_touched, base_cfg=base_cfg, head_cfg=repo_cfg)
+    if template_dir is not None and template_dir.is_dir() and target_standard:
         standard_delivery = check_standard_delivery_dir(
-            repo_dir, template_dir, repo_cfg=repo_cfg, only_paths=touched_standard
+            repo_dir, template_dir, repo_cfg=repo_cfg, only_paths=target_standard
         )
         findings.extend(standard_delivery["findings"])
         checks["standard_delivery"] = "ok" if standard_delivery["ok"] else "fail"

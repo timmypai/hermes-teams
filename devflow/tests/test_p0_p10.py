@@ -935,6 +935,161 @@ sys.exit(0)
         self.assertFalse(rec_after["standard_delivery"]["ok"], rec_after)
         self.assertIn(".devflow/deploy.sh", rec_after["standard_delivery"]["drifted"])
 
+    def test_config_only_deploy_switches_validate_dependent_files_in_judgment_and_preflight(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        wf_auto = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "false"}
+        )
+        wf_manual = self.df.standard_lib.render_standard_file(
+            self.df.TEMPLATE, ".github/workflows/deploy.yml", repo_cfg={"DEVFLOW_DEPLOY_MANUAL_ONLY": "true"}
+        )
+        (self.repo / ".devflow").mkdir(exist_ok=True)
+        (self.repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+
+        # 1a. judgment: config-only switch manual_only false -> true with untouched push deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        f.files = [{"filename": ".devflow/config.env", "status": "modified", "patch": "+DEVFLOW_DEPLOY_MANUAL_ONLY=true"}]
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n"
+            if path == ".devflow/config.env"
+            else wf_auto
+        )
+        pr1 = {**f.pr, "number": 31, "headRefOid": "6" * 40, "url": f"https://github.com/{REPO}/pull/31", "fingerprint": "fp-c1"}
+        r1 = self.df.judgment("b", REPO, 31, pr1)
+        self.assertFalse(r1["standard_delivery"]["ok"], r1)
+        self.assertIn(".github/workflows/deploy.yml", r1["standard_delivery"]["drifted"])
+
+        # 1b. judgment: config-only switch manual_only true -> false with untouched manual-only deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=false\n"
+            if path == ".devflow/config.env"
+            else wf_manual
+        )
+        pr2 = {**f.pr, "number": 32, "headRefOid": "7" * 40, "url": f"https://github.com/{REPO}/pull/32", "fingerprint": "fp-c2"}
+        r2 = self.df.judgment("b", REPO, 32, pr2)
+        self.assertFalse(r2["standard_delivery"]["ok"], r2)
+        self.assertIn(".github/workflows/deploy.yml", r2["standard_delivery"]["drifted"])
+
+        # 1c. judgment: config-only enabling DEVFLOW_DEPLOY=true when deploy.sh/deploy.yml are missing on head MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        self.df.branch_file = lambda repo, ref, path: (
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n" if path == ".devflow/config.env" else None
+        )
+        pr3 = {**f.pr, "number": 33, "headRefOid": "8" * 40, "url": f"https://github.com/{REPO}/pull/33", "fingerprint": "fp-c3"}
+        r3 = self.df.judgment("b", REPO, 33, pr3)
+        self.assertFalse(r3["standard_delivery"]["ok"], r3)
+        self.assertEqual(set(r3["standard_delivery"]["missing"]), {".devflow/deploy.sh", ".github/workflows/deploy.yml"})
+
+        # 2. preflight: config-only switch manual_only=true with untouched push deploy.yml MUST fail
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        (self.repo / ".github" / "workflows" / "deploy.yml").write_text(wf_auto, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base auto deploy"], cwd=self.repo, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
+        ).stdout.strip()
+        (self.repo / ".devflow" / "config.env").write_text(
+            "DEVFLOW_APP=b\nDEVFLOW_DEPLOY=true\nDEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", ".devflow/config.env"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "chore: manual only without workflow update"], cwd=self.repo, check=True)
+        pf = self.df.preflight_lib.run_preflight(
+            self.repo, policy=self.df.POLICY, base_ref=base, run_tests=False, template_dir=self.df.TEMPLATE
+        )
+        self.assertFalse(pf["ok"], pf)
+        self.assertEqual(pf["checks"]["standard_delivery"], "fail")
+        self.assertIn(".github/workflows/deploy.yml", pf["standard_delivery"]["drifted"])
+
+    def test_deploy_sh_rollback_from_pre_upgrade_snapshot_never_inherits_failed_candidate_sha(self) -> None:
+        for mode in ("pre_upgrade_with_label", "pre_upgrade_no_label", "new_format_with_source_sha"):
+            with self.subTest(mode=mode):
+                work = Path(tempfile.mkdtemp(prefix=f"devflow-rb-{mode}-"))
+                self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+                (work / ".devflow").mkdir()
+                (work / "deploy").mkdir()
+                shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+                (work / ".devflow" / "config.env").write_text(
+                    "DEVFLOW_APP=rbprobe\nDEVFLOW_SERVICE=app\nDEVFLOW_PORT=18992\nDEVFLOW_APP_PORT=8080\nDEVFLOW_HEALTH_PATH=/health\n",
+                    encoding="utf-8",
+                )
+                (work / "deploy" / "compose.yml").write_text("services:\n  app:\n    image: ${DEVFLOW_IMAGE}\n", encoding="utf-8")
+                post_log = work / "post.log"
+                for name, body in (
+                    ("deploy-build.sh", "#!/usr/bin/env bash\nexit 0\n"),
+                    ("capture.sh", "#!/usr/bin/env bash\nexit 0\n"),
+                    ("verify.sh", "#!/usr/bin/env bash\nexit 1\n"),
+                    ("deploy-post.sh", f'#!/usr/bin/env bash\nprintf "%s|%s\\n" "$DEVFLOW_DEPLOY_PHASE" "$DEVFLOW_SOURCE_SHA" >> "{post_log}"\n'),
+                ):
+                    p = work / ".devflow" / name
+                    p.write_text(body, encoding="utf-8")
+                    p.chmod(0o755)
+                home = work / "home"
+                live_dir = home / ".devflow-live" / "rbprobe.d" / "old-snap"
+                live_dir.mkdir(parents=True)
+                shutil.copy2(work / "deploy" / "compose.yml", live_dir / "compose.yml")
+                shutil.copy2(work / ".devflow" / "config.env", live_dir / "config.env")
+                (live_dir / ".env").write_text("", encoding="utf-8")
+                (live_dir / "image").write_text("sha256:" + ("1" * 64) + "\n", encoding="utf-8")
+                if mode == "new_format_with_source_sha":
+                    (live_dir / "source_sha").write_text("saved-old-sha-" + ("0" * 26) + "\n", encoding="utf-8")
+                (home / ".devflow-live" / "rbprobe").symlink_to(live_dir)
+
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                calls_file = work / "calls.jsonl"
+                (bin_dir / "curl").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                (bin_dir / "curl").chmod(0o755)
+                label_sha = "label-old-sha-" + ("9" * 26) if mode == "pre_upgrade_with_label" else ""
+                (bin_dir / "docker").write_text(
+                    f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path({str(calls_file)!r}).open("a") as fh:
+    fh.write(json.dumps({{"args": args, "sha": os.environ.get("DEVFLOW_SOURCE_SHA", "")}}) + "\\n")
+if args[:2] == ["image", "inspect"]:
+    if "--format" in args:
+        fmt = args[args.index("--format") + 1]
+        if "org.opencontainers.image.revision" in fmt:
+            print({label_sha!r} if {bool(label_sha)!r} else "<no value>")
+        else:
+            print("<no value>")
+    sys.exit(0)
+sys.exit(0)
+""",
+                    encoding="utf-8",
+                )
+                (bin_dir / "docker").chmod(0o755)
+                failed_sha = "failed-cand-sha-" + ("f" * 24)
+                env = {
+                    **os.environ,
+                    "HOME": str(home),
+                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "GITHUB_SHA": failed_sha,
+                }
+                proc = subprocess.run(["bash", ".devflow/deploy.sh"], cwd=work, env=env, text=True, capture_output=True)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                records = [json.loads(line) for line in calls_file.read_text().splitlines()]
+                rb_ups = [r for r in records if r["args"][:1] == ["compose"] and "--no-build" in r["args"]]
+                self.assertTrue(rb_ups, records)
+                expected_sha = (
+                    "saved-old-sha-" + ("0" * 26)
+                    if mode == "new_format_with_source_sha"
+                    else (label_sha if mode == "pre_upgrade_with_label" else "")
+                )
+                self.assertEqual(rb_ups[0]["sha"], expected_sha)
+                self.assertNotEqual(rb_ups[0]["sha"], failed_sha)
+                self.assertEqual(post_log.read_text().strip(), f"rollback|{expected_sha}")
+
 
 if __name__ == "__main__":
     unittest.main()

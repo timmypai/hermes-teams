@@ -382,7 +382,12 @@ def _rules_error(p: subprocess.CompletedProcess) -> str:
 
 def branch_file(repo: str, branch: str, path: str) -> str | None:
     p = run(["gh", "api", f"repos/{repo}/contents/{path}?ref={branch}", "--jq", ".content"], gh="builder", check=False)
-    return base64.b64decode(p.stdout).decode(errors="replace") if p.returncode == 0 else None
+    if p.returncode == 0:
+        return base64.b64decode(p.stdout).decode(errors="replace")
+    err = ((p.stderr or "") + "\n" + (p.stdout or "")).lower()
+    if "404" in err or "not found" in err or not err.strip():
+        return None
+    raise RuntimeError(f"gh api contents {path} failed (exit {p.returncode}): {(p.stderr or p.stdout or '').strip()[:160]}")
 
 
 def protect_repo(slug: str) -> dict:
@@ -3855,10 +3860,12 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
                             eff_std_cfg[key_name] = head_cfg[key_name]
                         else:
                             eff_std_cfg.pop(key_name, None)
-        req_std = set(standard_lib.required_standard_files(eff_std_cfg))
-        touched_std = [p for p in touched_all if p in req_std]
+        touched_std = standard_lib.dependent_standard_paths(
+            touched_all, base_cfg=repo_cfg, head_cfg=eff_std_cfg
+        )
         fetched: dict[str, str | None] = {}
         if touched_std and not fetch_errors:
+            touched_all_set = set(touched_all)
             for rel in touched_std:
                 removed = (
                     any(f.get("filename") == rel and f.get("status") == "removed" for f in files)
@@ -3876,7 +3883,12 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
                     fetch_errors.append((rel, str(err)[:160]))
                     continue
                 if content is None:
-                    fetch_errors.append((rel, "content_unavailable"))
+                    if rel in touched_all_set:
+                        # File is listed in PR diff as present on head; None means API unavailable.
+                        fetch_errors.append((rel, "content_unavailable"))
+                        continue
+                    # Untouched dependent file (pulled in by config.env change) returning None means missing on head.
+                    fetched[rel] = None
                     continue
                 fetched[rel] = content
         if fetch_errors:

@@ -63,6 +63,37 @@ def required_standard_files(repo_cfg: dict[str, str] | None = None) -> tuple[str
     return ALL_STANDARD_DELIVERY_FILES if deploys else STANDARD_CORE_FILES
 
 
+def dependent_standard_paths(
+    touched_paths: list[str],
+    *,
+    base_cfg: dict[str, str] | None = None,
+    head_cfg: dict[str, str] | None = None,
+) -> list[str]:
+    """Return canonical delivery paths that must be validated for `touched_paths`.
+
+    Includes any directly touched required file PLUS dependent canonical files when
+    `.devflow/config.env` changes declarative deployment settings (`DEVFLOW_DEPLOY`
+    or `DEVFLOW_DEPLOY_MANUAL_ONLY`), even if those dependent files were untouched.
+    """
+    base = base_cfg or {}
+    head = head_cfg or {}
+    req_set = set(required_standard_files(head))
+    paths: list[str] = [p for p in touched_paths if p in req_set]
+    if ".devflow/config.env" in touched_paths:
+        base_deploy = (base.get("DEVFLOW_DEPLOY") or "true").strip().lower() != "false"
+        head_deploy = (head.get("DEVFLOW_DEPLOY") or "true").strip().lower() != "false"
+        base_manual = repo_deploy_manual_only(base)
+        head_manual = repo_deploy_manual_only(head)
+        if head_deploy and not base_deploy:
+            for p in STANDARD_DEPLOY_FILES:
+                if p not in paths:
+                    paths.append(p)
+        if head_deploy and (head_manual != base_manual):
+            if ".github/workflows/deploy.yml" not in paths:
+                paths.append(".github/workflows/deploy.yml")
+    return paths
+
+
 def render_standard_file(template_dir: Path, rel: str, *, repo_cfg: dict[str, str] | None = None) -> str | None:
     """Render the canonical template text for `rel`, applying declarative trigger options (no hardcoding)."""
     src = template_dir / rel
