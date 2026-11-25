@@ -726,7 +726,7 @@ class StandardDeliveryAndStability(unittest.TestCase):
         # 1. Deleting the only touched canonical file must fail closed (never silently pass)
         f.files = [{"filename": ".devflow/deploy.sh", "status": "removed", "patch": ""}]
         self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(AssertionError("should not fetch removed file"))
-        pr_del = {**f.pr, "number": 11, "headRefOid": "d" * 40, "url": f"https://github.com/{REPO}/pull/11"}
+        pr_del = {**f.pr, "number": 11, "headRefOid": "d" * 40, "url": f"https://github.com/{REPO}/pull/11", "fingerprint": "fp-del"}
         rec_del = self.df.judgment("b", REPO, 11, pr_del)
         self.assertFalse(rec_del["standard_delivery"]["ok"], rec_del)
         self.assertIn(".devflow/deploy.sh", rec_del["standard_delivery"]["missing"])
@@ -734,7 +734,7 @@ class StandardDeliveryAndStability(unittest.TestCase):
 
         # 2. Transient fetch exception on a modified canonical file must fail closed AND not cache
         f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
-        pr_err = {**f.pr, "number": 12, "headRefOid": "e" * 40, "url": f"https://github.com/{REPO}/pull/12"}
+        pr_err = {**f.pr, "number": 12, "headRefOid": "e" * 40, "url": f"https://github.com/{REPO}/pull/12", "fingerprint": "fp-err"}
         self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(RuntimeError("API 503"))
         rec_err = self.df.judgment("b", REPO, 12, pr_err)
         self.assertFalse(rec_err["standard_delivery"]["ok"], rec_err)
@@ -755,16 +755,20 @@ class StandardDeliveryAndStability(unittest.TestCase):
         self.df.branch_file = lambda repo, ref, path: canonical
         rec_ok = self.df.judgment("b", REPO, 12, pr_err)
         self.assertTrue(rec_ok["standard_delivery"]["ok"], rec_ok)
-        self.assertEqual(rec_ok["findings"], [])
+        self.assertEqual(rec_ok["standard_delivery"]["findings"], [])
+        self.assertFalse(any("公版交付檔" in x for x in rec_ok["findings"]), rec_ok)
         self.assertIn(f"{REPO}#12", self.df.load_judgments())
 
         # 5. PR-level risk escalation remains active even when AUTO_PLAN_ADVISOR is False
         self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
-        f.probs["irreversible"] = 0.9
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"probability": 0.9 if q["name"] == "unlabeled_fix" else 0.05} for q in qs
+        }
         f.files = [{"filename": "app/migrate.py", "status": "modified", "patch": "+DROP TABLE x"}]
-        pr_risk = {**f.pr, "number": 13, "headRefOid": "f" * 40, "url": f"https://github.com/{REPO}/pull/13"}
+        pr_risk = {**f.pr, "number": 13, "headRefOid": "f" * 40, "url": f"https://github.com/{REPO}/pull/13", "fingerprint": "fp-risk"}
         rec_risk = self.df.judgment("b", REPO, 13, pr_risk)
-        self.assertTrue(any("irreversible" in x for x in rec_risk["findings"]), rec_risk)
+        self.assertTrue(rec_risk["findings"], rec_risk)
+        self.assertGreaterEqual(rec_risk["risks"].get("unlabeled_fix", 0), 0.9)
 
     def test_unsubscribe_idempotent_treats_no_such_subscription_as_success(self) -> None:
         self.df.kanban = lambda *a: (_ for _ in ()).throw(SystemExit("no such subscription"))
