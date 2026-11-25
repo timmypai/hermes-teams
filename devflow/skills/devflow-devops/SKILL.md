@@ -69,7 +69,7 @@ workflow_dispatch ──operate.yml (self-hosted, default branch tip only)：`de
    - `4`：advisor 回 `revise`（或沒寫 verdict）→ 照第 1 步「未出貨」完成本卡。
    - `5`：共用部署通道沒就緒（輸出 `deploy_channel` 列出失敗項目與修法）。先照修法做一次：`runner-online` 沒有 runner → `devflow runner request <repo>`，2 分鐘後重跑；`fork-approval` → `devflow repo add <repo>`（冪等）後重跑。仍是 `5`，或是 `runner-request`（主機沒處理申請，容器內修不了）→ `kanban_block(kind="capability", reason=<輸出的 question 原文>)`，等使用者回覆後從這一步重跑。不要自己設計專用帳號、獨立 Docker、job 前准入或其他部署方式，也不要開 `[ADJ]`。
    - `6`：PR 改動了受保護檔案且尚未取得本次 exact-head 人類核准（輸出 `needs_human_approval=true`、`question`、`protected_changes`、`head_sha`）。直接 `kanban_block(kind="needs_input", reason=<輸出的 question 原文>)`；只有使用者明確確認核准時才由 Hermes 聊天執行 `devflow approve <slug> <pr> --head <sha>`（或於 EPIC `## 使用者決定` 寫 `- 核准保護檔變更：PR #<N> <sha>`）再重跑；若使用者拒絕則照第 1 步以「未出貨」完成並退回修改。
-   - `7`：所屬 EPIC 正等待使用者定錨計畫風險（輸出 `plan_risk_blocked=true`、`epic`、`reason`）。不要另提受保護檔核准問題，直接 `kanban_block(kind="dependency", reason="等待 <epic> 計畫風險由使用者定錨")`，待使用者回覆 EPIC 後由 tick 解鎖再重跑。
+   - `7`：所屬 EPIC 正等待使用者定錨計畫風險（輸出 `plan_risk_blocked=true`、`epic`、`hold_reason`、`reason`）。不要另提受保護檔核准問題，直接 `kanban_block(kind="dependency", reason=<輸出的 hold_reason 原文>)`，待計畫調整消除風險或使用者明確核准計畫雜湊後由 tick 自動解鎖再重跑。
    - `1`：其他錯誤（PR 在判斷後被修改、merge 被拒）→ 看訊息；PR 被修改就直接重跑。訊息是 reviewer 沒核准目前 head（沒核准、核准後退件或被撤銷、只核准過舊 head）→ 不要自己核准或合併，`kanban_complete(summary="未出貨：reviewer 未核准 PR #N 目前的 head <sha 前 7 碼>", metadata={"shipped": false})`，由 orchestrator 安排重新審查。
 4. 有 `deploy.yml` 且 `DEVFLOW_DEPLOY` 不是 false：追部署（第 2 步已 merged 而跳過第 3 步時，先 `devflow repo doctor <slug>`，`runner-online`／`runner-request` 沒過照第 3 步 `5` 處理）：
    ```bash

@@ -131,8 +131,9 @@ metadata:
 | `devflow check card --title TITLE [--body-file F]` | 建卡／改卡前確定性檢查卡型、assignee、workspace、固定完成條件、body 長度與技術資訊洩漏 |
 | `devflow preflight SLUG [TASK] [--dir DIR]` | developer 送審前一站式確定性自檢：範圍（`Allowed-Scope`/`Out-of-Scope`）、變更檔數、保護檔 hash、PR 格式與快速測試 |
 | `devflow check pr SLUG PR` | PR 判斷：保護／gate 檔變更、EPIC 目標與 diff 範圍對齊（`out_of_scope_diff`）、review 往復熔斷與 Decisions 檢查 |
-| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment 與受保護檔人類 exact-head 核准（必要時 exit 6）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
-| `devflow approve SLUG PR [--head SHA] [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確確認後，記錄 PR 目前 exact-head 的受保護檔核准 |
+| `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment、受保護檔人類 exact-head 核准（必要時 exit 6）與 EPIC 計畫風險定錨（必要時 exit 7）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
+| `devflow approve SLUG PR --head FULL_SHA [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准後，以完整 40 碼 SHA 記錄受保護檔 PR 的 exact-head 核准 |
+| `devflow approve-plan SLUG EPIC --plan-hash HASH [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准計畫風險（選 B）後，記錄該計畫雜湊的明確同意並解除 `[SHIP]` 暫停 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能

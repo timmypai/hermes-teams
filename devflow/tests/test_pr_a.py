@@ -98,19 +98,29 @@ class UnifiedTrustAndHumanApproval(unittest.TestCase):
         os.environ["HERMES_KANBAN_TASK"] = "t_ship"
         self.addCleanup(os.environ.pop, "HERMES_KANBAN_TASK", None)
         with self.assertRaises(SystemExit) as cm_w:
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 12, note="try", by="bot"))
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="try", by="bot"))
         self.assertEqual(cm_w.exception.code, 1)
         os.environ.pop("HERMES_KANBAN_TASK", None)
 
-        # Mismatched --head fails closed
-        with self.assertRaises(SystemExit) as cm_bad:
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="b" * 12, note="wrong head", by="operator"))
-        self.assertEqual(cm_bad.exception.code, 1)
+        # Omitted, empty, short prefix, or malformed --head MUST fail closed without writing approval
+        for bad_head in (None, "", "a" * 12, "not-a-sha", "g" * 40):
+            with self.subTest(bad_head=bad_head), self.assertRaises(SystemExit) as cm_bad:
+                self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head=bad_head, note="bad", by="operator"))
+            self.assertEqual(cm_bad.exception.code, 1)
+        self.assertEqual(self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS), {})
 
-        # Exact-head approval via `devflow approve` unblocks ship merge
+        # Head changed between question (a*40) and approval (PR moved to b*40) MUST fail closed
+        self.f.pr["headRefOid"] = "b" * 40
+        with self.assertRaises(SystemExit) as cm_moved:
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="stale head", by="operator"))
+        self.assertEqual(cm_moved.exception.code, 1)
+        self.assertEqual(self.df.trust_lib.load_human_approvals(self.df.HUMAN_APPROVALS), {})
+        self.f.pr["headRefOid"] = "a" * 40
+
+        # Exact 40-char head approval via `devflow approve` unblocks ship merge
         buf_app = io.StringIO()
         with redirect_stdout(buf_app):
-            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 12, note="ok", by="timmy"))
+            self.df.cmd_approve(SimpleNamespace(board="b", pr=7, head="a" * 40, note="ok", by="timmy"))
         self.assertTrue(json.loads(buf_app.getvalue())["approved"])
 
         buf_ok = io.StringIO()
@@ -139,7 +149,7 @@ class UnifiedTrustAndHumanApproval(unittest.TestCase):
         head = "a" * 40
         epic_body = (
             "## 目標\n調整設定\n## 驗收\n- AC-1 [cli] ok\n"
-            f"## 使用者決定\n- 核准保護檔變更：PR #7 {head[:12]}\n"
+            f"## 使用者決定\n- 核准保護檔變更：PR #7 {head}\n"
         )
         with closing(sqlite3.connect(db)) as c, c:
             c.executescript("""
@@ -297,27 +307,78 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertTrue(any("暫停待出貨 [SHIP]" in c for c in comments), comments)
 
         # 2. Even an already-running [SHIP] worker calling `ship merge` is blocked (exit 7) while t_ep1 awaits user decision!
+        #    Simulate a running [SHIP] worker (`t_sh_run`) hitting exit 7 and self-blocking with `hold_reason`.
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "t_sh_run", "[SHIP] running ship", "覆蓋：AC-1\nEPIC: t_ep1\n", "running", "devops", "dir",
+                str(self.root / "repo"), None, "orchestrator", None, 0, None,
+            ))
+            c.execute("INSERT INTO task_links VALUES ('t_sh_run', 't_ep1')")
+        os.environ["HERMES_KANBAN_TASK"] = "t_sh_run"
+        self.addCleanup(os.environ.pop, "HERMES_KANBAN_TASK", None)
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
         buf_blk = io.StringIO()
         with redirect_stdout(buf_blk), self.assertRaises(SystemExit) as cm:
             self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        os.environ.pop("HERMES_KANBAN_TASK", None)
         self.assertEqual(cm.exception.code, 7)
         blk_out = json.loads(buf_blk.getvalue())
         self.assertFalse(blk_out["merged"])
         self.assertTrue(blk_out["plan_risk_blocked"])
         self.assertEqual(blk_out["epic"], "t_ep1")
+        self.assertTrue(blk_out["hold_reason"].startswith(self.df.PLAN_RISK_HOLD_PREFIX))
         self.assertEqual(f.merges, [])
+        # The running SHIP follows exit-7 skill instructions and self-blocks as dependency with hold_reason.
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = 't_sh_run'")
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 2000)",
+                ("t_sh_run", json.dumps({"kind": "dependency", "reason": blk_out["hold_reason"]}, ensure_ascii=False)),
+            )
 
-        # 3. User resolves the EPIC decision (t_ep1 leaves blocked/needs_input) -> tick releases t_sh1 & merge succeeds.
+        # 3a. User selects Option A (rejection / adjust) or manually resumes EPIC without changing the risky plan:
+        #     Leaving blocked/waiting status MUST NOT release [SHIP] holds or lift the synchronous merge guard!
         with closing(sqlite3.connect(db)) as c, c:
             c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = 't_ep1'")
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"probability": 0.9 if q["name"] == "scope_creep" else 0.05} for q in qs
+        }
         self.df.tick_board("b", st)
-        self.assertEqual([t for t, _ in resumed], ["t_sh1"])
+        self.assertEqual(resumed, [])
+        with closing(sqlite3.connect(db)) as c:
+            states_rej = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
+        self.assertEqual(states_rej["t_sh1"], "blocked:dependency")
+        self.assertEqual(states_rej["t_sh_run"], "blocked:dependency")
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm_rej:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertEqual(cm_rej.exception.code, 7)
+        self.assertEqual(f.merges, [])
+
+        # 3b. Explicit acceptance (Option B via `devflow approve-plan` with exact plan_hash) invalidates tick_key,
+        #     releases BOTH originally-held t_sh1 AND self-blocked t_sh_run, and unblocks ship merge!
+        rhash = self.df.load_plan_risk_state()["b/t_ep1"]["rhash"]
+        key_before_accept = self.df.tick_key("b")
+        # Worker cannot run approve-plan
+        os.environ["HERMES_KANBAN_TASK"] = "t_sh1"
+        with self.assertRaises(SystemExit):
+            self.df.cmd_approve_plan(SimpleNamespace(board="b", epic="t_ep1", plan_hash=rhash, note="bot", by="bot"))
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+        with redirect_stdout(io.StringIO()):
+            self.df.cmd_approve_plan(SimpleNamespace(board="b", epic="t_ep1", plan_hash=rhash, note="Option B", by="timmy"))
+        self.assertNotEqual(key_before_accept, self.df.tick_key("b"))
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"probability": 0.9 if q["name"] == "scope_creep" else 0.05} for q in qs
+        }
+        self.df.tick_board("b", st)
+        self.assertEqual(sorted(t for t, _ in resumed), ["t_sh1", "t_sh_run"])
         self.assertNotIn("t_ep1", st.get("plan_risk_holds") or {})
         with closing(sqlite3.connect(db)) as c:
             states_after = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
         self.assertEqual(states_after["t_sh1"], "ready:")
+        self.assertEqual(states_after["t_sh_run"], "ready:")
 
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
         buf_ok = io.StringIO()
         with redirect_stdout(buf_ok):
             self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
@@ -343,7 +404,7 @@ class PlanRiskModeBehavior(unittest.TestCase):
             states_rearmed = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
         self.assertEqual(states_rearmed["t_ep1"], "blocked:needs_input")
         self.assertEqual(states_rearmed["t_sh1"], "blocked:dependency")
-        self.assertEqual(st.get("plan_risk_holds", {}).get("t_ep1"), ["t_sh1"])
+        self.assertEqual(sorted(st.get("plan_risk_holds", {}).get("t_ep1") or []), ["t_sh1", "t_sh_run"])
         f.pr.update(state="OPEN", mergeCommit=None)
         f.merges.clear()
         self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}

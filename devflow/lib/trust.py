@@ -31,11 +31,21 @@ CONFIG_AND_GATE_RE = re.compile(
 TRUSTED_HARNESS_RE = re.compile(CONFIG_AND_GATE_RE.pattern + "|" + DELIVERY_FILES_RE.pattern)
 
 # Exact-head human approval directive under EPIC `## 使用者決定`:
-#   - 核准保護檔變更：PR #12 abcdef123456
+#   - 核准保護檔變更：PR #12 <40-hex-sha>
 HUMAN_APPROVAL_RE = re.compile(
-    r"^[ \t]*(?:[-*][ \t]+)?核准保護檔變更[：:][ \t]*PR[ \t]*#?(\d+)[ \t]+([0-9a-fA-F]{12,40})[ \t]*$",
+    r"^[ \t]*(?:[-*][ \t]+)?核准保護檔變更[：:][ \t]*PR[ \t]*#?(\d+)[ \t]+([0-9a-fA-F]{40})[ \t]*$",
     re.M,
 )
+
+# Exact plan-risk consent directive under EPIC `## 使用者決定`:
+#   - 核准計畫風險：t_ep01 <12-hex-plan-hash>
+PLAN_RISK_APPROVAL_RE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?核准計畫風險[：:][ \t]*(t_[0-9A-Za-z]+)[ \t]+([0-9a-fA-F]{12})[ \t]*$",
+    re.M,
+)
+
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+PLAN_HASH_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def sha256_text(text: str | bytes) -> str:
@@ -104,11 +114,19 @@ def protected_file_changes(
 
 
 def epic_human_approvals(epic_body: str | None) -> set[tuple[int, str]]:
-    """Exact `(pr_number, sha_prefix_lower)` pairs explicitly authorized under EPIC `## 使用者決定`."""
+    """Exact `(pr_number, full_40_sha_lower)` pairs explicitly authorized under EPIC `## 使用者決定`."""
     m = re.search(r"^##\s*使用者決定[ \t]*\n(.*?)(?=^## |\Z)", epic_body or "", flags=re.M | re.S)
     if not m:
         return set()
     return {(int(hit.group(1)), hit.group(2).lower()) for hit in HUMAN_APPROVAL_RE.finditer(m.group(1))}
+
+
+def epic_plan_risk_approvals(epic_body: str | None) -> set[tuple[str, str]]:
+    """Exact `(epic_id, plan_hash_lower)` pairs explicitly accepted under EPIC `## 使用者決定`."""
+    m = re.search(r"^##\s*使用者決定[ \t]*\n(.*?)(?=^## |\Z)", epic_body or "", flags=re.M | re.S)
+    if not m:
+        return set()
+    return {(hit.group(1), hit.group(2).lower()) for hit in PLAN_RISK_APPROVAL_RE.finditer(m.group(1))}
 
 
 def load_human_approvals(path: Path) -> dict[str, dict[str, Any]]:
@@ -131,12 +149,15 @@ def record_human_approval(
     approved_by: str = "operator",
 ) -> dict[str, Any]:
     """Atomically record exact-head human approval for a PR touching protected files."""
+    head = (head_sha or "").strip().lower()
+    if not FULL_SHA_RE.fullmatch(head):
+        raise ValueError(f"head_sha must be a full 40-char lowercase hex SHA, got {head_sha!r}")
     key = f"{repo}#{pr_number}"
     data = load_human_approvals(path)
     rec: dict[str, Any] = {
         "repo": repo,
         "pr": int(pr_number),
-        "head_sha": head_sha.lower(),
+        "head_sha": head,
         "approved_at": int(time.time()),
         "approved_by": approved_by,
         "note": note,
@@ -159,15 +180,15 @@ def is_human_approved(
 ) -> tuple[bool, str]:
     """Verify exact-head human approval via `state/human-approvals.json` or EPIC `## 使用者決定`.
 
-    Fails closed when `head_sha` is empty or does not match the recorded approval.
+    Fails closed when `head_sha` is empty, malformed, or does not equal the recorded full 40-hex SHA.
     """
     head = (head_sha or "").strip().lower()
-    if not head:
+    if not FULL_SHA_RE.fullmatch(head):
         return False, ""
     rec = load_human_approvals(approvals_path).get(f"{repo}#{pr_number}")
     if isinstance(rec, dict) and str(rec.get("head_sha") or "").lower() == head:
         return True, "state/human-approvals.json"
-    for num, prefix in epic_human_approvals(epic_body):
-        if num == int(pr_number) and head.startswith(prefix):
+    for num, approved_sha in epic_human_approvals(epic_body):
+        if num == int(pr_number) and approved_sha == head:
             return True, "EPIC ## 使用者決定"
     return False, ""
