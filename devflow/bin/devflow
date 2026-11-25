@@ -4524,7 +4524,21 @@ def _epic_waiting_on_user(board: str, goal_ctx: dict | None, ship_task_id: str |
                             ev = None
                         reason = block_reason(board, ev) if ev else ""
                         return eid, reason
-        except sqlite3.Error:
+        except sqlite3.Error as err:
+            # Fail closed on DB read failure whenever a persisted plan-risk record exists for this
+            # board/EPIC OR we have a governing EPIC whose waiting/consent state cannot be verified.
+            pr_state = load_plan_risk_state()
+            target_eid = next(iter(epic_ids), None)
+            if not target_eid:
+                for rec in pr_state.values():
+                    if isinstance(rec, dict) and rec.get("board") == board and rec.get("epic"):
+                        target_eid = str(rec["epic"])
+                        break
+            if target_eid or ship_task_id:
+                return (
+                    target_eid or "unknown",
+                    f"無法讀取看板資料庫以驗證計畫風險與等待狀態（{err}），已 fail closed 拒絕合併",
+                )
             return None
     else:
         pr_state = load_plan_risk_state()

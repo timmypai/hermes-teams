@@ -455,6 +455,27 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.df.release_plan_risk_holds("b", "t_ep1", self.df.plan_cards("b", "t_ep1"), {"plan_risk_holds": {"t_ep1": ["t_sh1"]}})
         self.assertNotIn("t_sh1", [t for t, _ in resumed])
 
+        # 5d. SQLite read failure (`database is locked`) with a persisted plan-risk record MUST fail closed in ship merge!
+        self.df.register_plan_risk_pending("b", "t_ep1", "a" * 12, ["scope_creep"])
+        f.pr.update(state="OPEN", mergeCommit=None)
+        f.merges.clear()
+        orig_board_rows = self.df.board_rows
+
+        def db_locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        self.df.board_rows = db_locked
+        self.addCleanup(setattr, self.df, "board_rows", orig_board_rows)
+        buf_locked = io.StringIO()
+        with redirect_stdout(buf_locked), self.assertRaises(SystemExit) as cm_locked:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.df.board_rows = orig_board_rows
+        self.assertEqual(cm_locked.exception.code, 7)
+        locked_out = json.loads(buf_locked.getvalue())
+        self.assertFalse(locked_out["merged"])
+        self.assertTrue(locked_out["plan_risk_blocked"])
+        self.assertEqual(f.merges, [])
+
     def test_enabling_plan_risk_mode_invalidates_cached_plan_and_tick_key_and_gates_ship(self) -> None:
         self.df.AUTO_PLAN_ADVISOR = False
         self.df.PLAN_RISK_MODE = "off"
