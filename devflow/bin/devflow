@@ -1920,6 +1920,28 @@ def mark_plan_needs_input(board: str, epic: str, reason: str) -> tuple[int | Non
     return kanban_adapter.mark_plan_needs_input(run, HERMES_PY, BOARDS, board, epic, reason)
 
 
+def plan_risk_fingerprint(epic: str, cards: dict[str, dict], gating: list[str]) -> str:
+    """Bind a plan-risk escalation decision to the reviewed plan content (EPIC + non-archived work
+    cards' titles/bodies/parents) plus flagged gating risk categories, excluding volatile status/
+    block_kind transitions so answering the prompt does not re-trigger on the exact same plan,
+    while any material plan change re-arms escalation and shipping holds."""
+    import hashlib
+    content_rows = []
+    for tid, c in sorted(cards.items()):
+        kind = card_type(c.get("title") or "")
+        if c.get("status") == "archived" or kind in ("ADV", "ADJ"):
+            continue
+        if tid == epic or kind in ("RES", "ARCH", "DEV", "OPS", "SHIP"):
+            content_rows.append([
+                tid,
+                c.get("title") or "",
+                c.get("body") or "",
+                sorted(c.get("parents") or []),
+            ])
+    payload = {"gating": sorted(gating), "plan": content_rows}
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
 def hold_pending_ships_for_plan_risk(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
     """Park every pending [SHIP] card in `blocked (dependency)` while `epic` waits on a user plan-risk
     decision, so the dispatcher cannot run risky shipping before the user decides. Returns True on
@@ -2135,8 +2157,7 @@ def tick_board(board: str, st: dict) -> bool:
                 retry = adj_retry or retry
                 risk_escalated = False
                 if risk_mode == "needs_input" and (gating := rep.get("gating_risks") or []):
-                    import hashlib
-                    rhash = hashlib.sha1("\n".join(sorted(gating)).encode()).hexdigest()[:8]
+                    rhash = plan_risk_fingerprint(tid, cards, gating)
                     esc_map = st.setdefault("plan_risk_escalated", {})
                     if esc_map.get(tid) != rhash and not waiting(cards.get(tid, {})):
                         reason = (

@@ -324,6 +324,34 @@ class PlanRiskModeBehavior(unittest.TestCase):
         self.assertTrue(json.loads(buf_ok.getvalue())["merged"])
         self.assertEqual(len(f.merges), 1)
 
+        # 4. Materially changing the plan (adding a new work card) with renewed scope_creep MUST re-arm
+        #    both the EPIC needs_input block AND the [SHIP] hold + merge block!
+        self.df.decide = lambda content, qs: {
+            q["name"]: {"probability": 0.92 if q["name"] == "scope_creep" else 0.05} for q in qs
+        }
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("UPDATE tasks SET status = 'todo', block_kind = NULL WHERE id = 't_ep1'")
+            c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = 't_sh1'")
+            c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "t_dev2", "[DEV] extra unrequested subsystem",
+                f"## 目標\n額外功能\n## 本卡完成\n{self.df.DONE_TEXT}\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep1\n",
+                "ready", "developer", "worktree", str(self.root / "repo"), None, "orchestrator", None, 1, None,
+            ))
+            c.execute("INSERT INTO task_links VALUES (?,?)", ("t_dev2", "t_sh1"))
+        self.df.tick_board("b", st)
+        with closing(sqlite3.connect(db)) as c:
+            states_rearmed = dict(c.execute("SELECT id, status || ':' || COALESCE(block_kind, '') FROM tasks").fetchall())
+        self.assertEqual(states_rearmed["t_ep1"], "blocked:needs_input")
+        self.assertEqual(states_rearmed["t_sh1"], "blocked:dependency")
+        self.assertEqual(st.get("plan_risk_holds", {}).get("t_ep1"), ["t_sh1"])
+        f.pr.update(state="OPEN", mergeCommit=None)
+        f.merges.clear()
+        self.df.decide = lambda content, qs: {q["name"]: {"probability": 0.05} for q in qs}
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm_rearmed:
+            self.df.cmd_ship_merge(SimpleNamespace(board="b", pr=7))
+        self.assertEqual(cm_rearmed.exception.code, 6)
+        self.assertEqual(f.merges, [])
+
 
 class DocAndContractConsistency(unittest.TestCase):
     """Ensure souls/, skills/, README.md, and bin/devflow never drift back to contradictory legacy rules."""
