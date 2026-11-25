@@ -3807,24 +3807,67 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
     files = pr_files(repo, number)
     result = judge(pr, files, goal_context=goal_ctx, repo_cfg=repo_cfg) if (goal_ctx or repo_cfg) else judge(pr, files)
     # Deterministic standard delivery check when PR touches canonical delivery files and kit templates exist.
-    touched_std = [p for p in scope_lib.touched_paths(files) if p in standard_lib.ALL_STANDARD_DELIVERY_FILES]
+    req_std = set(standard_lib.required_standard_files(repo_cfg))
+    touched_std = [p for p in scope_lib.touched_paths(files) if p in req_std]
     if touched_std and TEMPLATE.is_dir() and not policy_lib.repo_allow_custom_delivery(repo_cfg):
         fetched: dict[str, str | None] = {}
-        fetch_ok = True
+        fetch_errors: list[tuple[str, str]] = []
         for rel in touched_std:
+            removed = (
+                any(f.get("filename") == rel and f.get("status") == "removed" for f in files)
+                or (
+                    any(f.get("previous_filename") == rel and f.get("filename") != rel for f in files)
+                    and not any(f.get("filename") == rel and f.get("status") != "removed" for f in files)
+                )
+            )
+            if removed:
+                fetched[rel] = None
+                continue
             try:
                 content = branch_file(repo, pr["headRefOid"], rel)
-            except (SystemExit, Exception):  # noqa: BLE001 - skip only when remote API is stubbed/unavailable
-                fetch_ok = False
-                break
+            except (SystemExit, Exception) as err:  # noqa: BLE001 - fail closed on fetch error, never cache clean
+                fetch_errors.append((rel, str(err)[:160]))
+                continue
+            if content is None:
+                fetch_errors.append((rel, "content_unavailable"))
+                continue
             fetched[rel] = content
-        if fetch_ok and any(v is not None for v in fetched.values()):
-            sd = standard_lib.check_standard_delivery_contents(
-                fetched, TEMPLATE, repo_cfg=repo_cfg, only_paths=touched_std
-            )
+        if fetch_errors:
+            failed_paths = [p for p, _ in fetch_errors]
+            sd = {
+                "ok": False,
+                "checked": touched_std,
+                "missing": [],
+                "drifted": [],
+                "custom_allowed": False,
+                "fetch_failed": True,
+                "failed_paths": failed_paths,
+                "findings": [
+                    f"無法讀取 PR head 的 devflow 公版交付檔（{', '.join(failed_paths)}），已 fail closed；請稍後重試"
+                ],
+            }
             result["standard_delivery"] = sd
-            if not sd["ok"]:
-                result["findings"] = list(result.get("findings") or []) + sd["findings"]
+            result["findings"] = list(result.get("findings") or []) + sd["findings"]
+            # Do not cache transient API/fetch failures as a judgment for this fingerprint.
+            return {
+                **result,
+                "board": board,
+                "repo": repo,
+                "pr": number,
+                "url": pr["url"],
+                "head_sha": pr["headRefOid"],
+                "fingerprint": eff_fp,
+                "judged_at": int(time.time()),
+                "advisor": None,
+                "posted": None,
+                "cached": False,
+            }
+        sd = standard_lib.check_standard_delivery_contents(
+            fetched, TEMPLATE, repo_cfg=repo_cfg, only_paths=touched_std
+        )
+        result["standard_delivery"] = sd
+        if not sd["ok"]:
+            result["findings"] = list(result.get("findings") or []) + sd["findings"]
     # Written only if no one stored another fingerprint during the Decisions call (a body, scope, or
     # policy edit judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
     return update_judgment(key, fp=rec.get("fingerprint", ""), board=board, repo=repo, pr=number, url=pr["url"],

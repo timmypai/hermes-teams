@@ -697,7 +697,7 @@ class StandardDeliveryAndStability(unittest.TestCase):
     def test_default_policy_disables_async_meta_loops_and_allows_ship_only_epic(self) -> None:
         self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
         self.assertFalse(self.df.AUTO_FLOW_ADJ)
-        # Ship-only EPIC without synthetic Given/When/Then scenarios passes plan_rules
+        # Ship-only EPIC without synthetic Given/When/Then scenarios passes plan_rules when ACs are defined & covered
         cards = {
             "t_ep01": {"id": "t_ep01", "title": "[EPIC] 出貨部署", "status": "todo", "assignee": "orchestrator",
                        "workspace_kind": "dir", "parents": ["t_sh01"], "children": [], "goal_mode": False,
@@ -708,6 +708,63 @@ class StandardDeliveryAndStability(unittest.TestCase):
         }
         findings = self.df.plan_rules("b", "t_ep01", cards)
         self.assertEqual(findings, [], findings)
+        # Ship-only EPIC still enforces meaningful acceptance coverage (uncovered AC fails plan_rules)
+        uncovered = {
+            **cards,
+            "t_sh01": {**cards["t_sh01"], "body": "## 目標\n合併並部署\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep01\n"},
+        }
+        self.assertTrue(any("AC-2" in f for f in self.df.plan_rules("b", "t_ep01", uncovered)))
+
+    def test_judgment_standard_delivery_fails_closed_on_deletion_and_transient_fetch_error_without_caching(self) -> None:
+        f = Fake(self.df)
+        for name in ("pr_meta", "decide", "run", "kanban", "resume", "pr_reviews"):
+            setattr(self.df, name, getattr(f, name))
+        self.df.pr_files = lambda repo, n: f.files
+        self.df.gh_login = lambda role: {"reviewer": "rev", "builder": "bob"}[role]
+        self.df.deploy_readiness = lambda slug: []
+
+        # 1. Deleting the only touched canonical file must fail closed (never silently pass)
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "removed", "patch": ""}]
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(AssertionError("should not fetch removed file"))
+        pr_del = {**f.pr, "number": 11, "headRefOid": "d" * 40, "url": f"https://github.com/{REPO}/pull/11"}
+        rec_del = self.df.judgment("b", REPO, 11, pr_del)
+        self.assertFalse(rec_del["standard_delivery"]["ok"], rec_del)
+        self.assertIn(".devflow/deploy.sh", rec_del["standard_delivery"]["missing"])
+        self.assertTrue(any("缺少 devflow 公版交付檔" in x for x in rec_del["findings"]), rec_del)
+
+        # 2. Transient fetch exception on a modified canonical file must fail closed AND not cache
+        f.files = [{"filename": ".devflow/deploy.sh", "status": "modified", "patch": "+echo hi"}]
+        pr_err = {**f.pr, "number": 12, "headRefOid": "e" * 40, "url": f"https://github.com/{REPO}/pull/12"}
+        self.df.branch_file = lambda repo, ref, path: (_ for _ in ()).throw(RuntimeError("API 503"))
+        rec_err = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertFalse(rec_err["standard_delivery"]["ok"], rec_err)
+        self.assertTrue(rec_err["standard_delivery"].get("fetch_failed"), rec_err)
+        self.assertFalse(rec_err.get("cached", True))
+        self.assertTrue(any("無法讀取 PR head" in x for x in rec_err["findings"]), rec_err)
+        self.assertNotIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 3. Returning None for a modified (non-removed) canonical file also fails closed without caching
+        self.df.branch_file = lambda repo, ref, path: None
+        rec_none = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertFalse(rec_none["standard_delivery"]["ok"], rec_none)
+        self.assertTrue(rec_none["standard_delivery"].get("fetch_failed"), rec_none)
+        self.assertNotIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 4. Retry succeeds once GitHub returns canonical template content and caches clean result
+        canonical = self.df.standard_lib.render_standard_file(self.df.TEMPLATE, ".devflow/deploy.sh")
+        self.df.branch_file = lambda repo, ref, path: canonical
+        rec_ok = self.df.judgment("b", REPO, 12, pr_err)
+        self.assertTrue(rec_ok["standard_delivery"]["ok"], rec_ok)
+        self.assertEqual(rec_ok["findings"], [])
+        self.assertIn(f"{REPO}#12", self.df.load_judgments())
+
+        # 5. PR-level risk escalation remains active even when AUTO_PLAN_ADVISOR is False
+        self.assertFalse(self.df.AUTO_PLAN_ADVISOR)
+        f.probs["irreversible"] = 0.9
+        f.files = [{"filename": "app/migrate.py", "status": "modified", "patch": "+DROP TABLE x"}]
+        pr_risk = {**f.pr, "number": 13, "headRefOid": "f" * 40, "url": f"https://github.com/{REPO}/pull/13"}
+        rec_risk = self.df.judgment("b", REPO, 13, pr_risk)
+        self.assertTrue(any("irreversible" in x for x in rec_risk["findings"]), rec_risk)
 
     def test_unsubscribe_idempotent_treats_no_such_subscription_as_success(self) -> None:
         self.df.kanban = lambda *a: (_ for _ in ()).throw(SystemExit("no such subscription"))
