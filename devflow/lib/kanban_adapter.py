@@ -109,14 +109,27 @@ def card_review_reset_watermark(boards_dir: Path, board: str, tid: str) -> tuple
                                 wm_ts = max(wm_ts, ts)
                         if "task_events" in tables:
                             ev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_events)")}
-                            q = "SELECT MAX(id) AS mid" + (", MAX(created_at) AS mts" if "created_at" in ev_cols else "") + " FROM task_events WHERE task_id = ?"
-                            er = conn.execute(q, (row["id"],)).fetchone()
-                            if er and er["mid"] is not None:
-                                wm_ev = max(wm_ev, int(er["mid"]))
-                            if er and "mts" in er.keys():
-                                ts = _parse_ts(er["mts"])
-                                if ts is not None:
-                                    wm_ts = max(wm_ts, ts)
+                            sel_ev = "id, kind, payload" + (", created_at" if "created_at" in ev_cols else "")
+                            for er in conn.execute(
+                                f"SELECT {sel_ev} FROM task_events WHERE task_id = ? ORDER BY id ASC",
+                                (row["id"],),
+                            ):
+                                ek = (er["kind"] or "").strip().lower()
+                                is_completion = ek in ("completed", "done")
+                                if not is_completion and ek == "status":
+                                    try:
+                                        ep = json.loads(er["payload"] or "{}")
+                                    except ValueError:
+                                        ep = {}
+                                    if isinstance(ep, dict) and str(ep.get("to") or ep.get("status") or "").lower() == "done":
+                                        is_completion = True
+                                if not is_completion:
+                                    continue
+                                wm_ev = max(wm_ev, int(er["id"]))
+                                if "created_at" in ev_cols:
+                                    ts = _parse_ts(er["created_at"])
+                                    if ts is not None:
+                                        wm_ts = max(wm_ts, ts)
     except sqlite3.Error:
         return 0, 0.0
     return wm_ev, wm_ts

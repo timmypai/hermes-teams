@@ -241,10 +241,16 @@ class ReviewRoundBreakerWatermark(unittest.TestCase):
         self.assertTrue(rep2["ok"], rep2)
         self.assertEqual(rep2["checks"]["review_loop"], "ok")
 
-        # 2 new rejections AFTER the [ADJ] trip again, then human needs_input -> unblocked resets again!
+        # 2 new rejections AFTER the [ADJ] trip again; a later routine comment/edit on the already-done [ADJ]
+        # MUST NOT advance the watermark or reset those rejections!
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_dev1', 'changes_requested', '{}', 1600)")
             c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_dev1', 'changes_requested', '{}', 1700)")
+        self.assertEqual(self.df.kanban_adapter.card_changes_requested_count(self.df.BOARDS, "b", "t_dev1"), 2)
+
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_adj1', 'comment', '{\"body\":\"note\"}', 1750)")
+            c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_adj1', 'edited', '{}', 1760)")
         self.assertEqual(self.df.kanban_adapter.card_changes_requested_count(self.df.BOARDS, "b", "t_dev1"), 2)
 
         with closing(sqlite3.connect(self.db)) as c, c:
@@ -288,6 +294,18 @@ class ReviewRoundBreakerWatermark(unittest.TestCase):
         self.assertTrue(st2["tripped"])
         self.assertEqual(st2["action"], "stop_ping_pong_escalate")
 
+        # Post-completion comment on done [ADJ] at 2026-11-20T09:00:00Z MUST NOT move GitHub watermark!
+        later_ts = wm_ts + 4 * 3600
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_adj1', 'comment', '{}', ?)",
+                (later_ts,),
+            )
+        st3 = self.df.review_loop_status("b", REPO, 7, "t_dev1")
+        self.assertEqual(st3["rounds"], 2)
+        self.assertTrue(st3["tripped"])
+        self.assertEqual(st3["reset_at"], "2026-11-20T05:00:00Z")
+
 
 class UnifiedDeployAndManualOnly(unittest.TestCase):
     def setUp(self) -> None:
@@ -303,15 +321,40 @@ class UnifiedDeployAndManualOnly(unittest.TestCase):
         }))
         self.df = load_devflow(self.root)
 
-    def test_repo_deploys_unified_across_policy_standard_and_cli(self) -> None:
-        for val, want in (("false", False), ("FALSE", False), ("0", False), ("no", False), ("off", False),
-                          ("true", True), ("1", True), ("", True)):
+    def test_repo_deploys_unified_across_policy_standard_cli_and_deploy_sh(self) -> None:
+        for val, want in (("false", False), ("FALSE", False), ("0", False), ("no", False), ("NO", False),
+                          ("off", False), ("OFF", False), ("true", True), ("1", True), ("", True)):
             cfg = {"DEVFLOW_DEPLOY": val} if val != "" else {}
             self.assertEqual(self.df.policy_lib.repo_deploys(cfg), want, val)
             req = self.df.standard_lib.required_standard_files(cfg)
             self.assertEqual(".github/workflows/deploy.yml" in req, want, val)
             (self.repo_dir / ".devflow" / "config.env").write_text(f"DEVFLOW_DEPLOY={val}\n" if val else "", encoding="utf-8")
             self.assertEqual(self.df.repo_deploys("b"), want, val)
+
+        # Exercise actual canonical deploy.sh against every supported disabled value (and quoted/padded variants).
+        for cfg_line in ("false", "FALSE", "0", "no", "NO", "off", "OFF", '" 0 "', "' off '"):
+            with self.subTest(cfg_line=cfg_line):
+                work = Path(tempfile.mkdtemp(prefix="devflow-prb-deploy-off-"))
+                self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+                (work / ".devflow").mkdir()
+                shutil.copy2(KIT / "templates" / "repo" / ".devflow" / "deploy.sh", work / ".devflow" / "deploy.sh")
+                (work / ".devflow" / "config.env").write_text(
+                    f"DEVFLOW_APP=offprobe\nDEVFLOW_DEPLOY={cfg_line}\n", encoding="utf-8"
+                )
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "docker").write_text("#!/usr/bin/env bash\necho DOCKER_CALLED >&2; exit 99\n", encoding="utf-8")
+                (bin_dir / "docker").chmod(0o755)
+                proc = subprocess.run(
+                    ["bash", ".devflow/deploy.sh"],
+                    cwd=work,
+                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("skip deploy", proc.stdout)
+                self.assertNotIn("DOCKER_CALLED", proc.stderr)
 
     def test_ship_merge_outputs_deploy_manual_only_flag(self) -> None:
         (self.repo_dir / ".devflow" / "config.env").write_text(
