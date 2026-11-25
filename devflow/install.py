@@ -23,9 +23,16 @@ os.umask(0o022)
 
 DATA = Path("/opt/data")
 ROOT = DATA / "devflow"
+_KIT_DIR = Path(__file__).resolve().parent
+if str(_KIT_DIR) not in sys.path:
+    sys.path.insert(0, str(_KIT_DIR))
+from lib import vendor as vendor_lib  # noqa: E402
+
 ROLES = json.loads((ROOT / "roles.json").read_text())
 VENDOR = ROOT / "vendor" / "mattpocock-skills"
-MP_REPO = "https://github.com/mattpocock/skills"
+MP_SPEC = ROLES.get("mattpocock_skills") or {}
+MP_REPO = str(MP_SPEC.get("repo") or "https://github.com/mattpocock/skills")
+MP_SHA = str(MP_SPEC.get("sha") or "")
 STAMP = time.strftime("%Y%m%dT%H%M%S")
 BACKUP = DATA / "devflow-backup" / STAMP
 HERMES = shutil.which("hermes") or "/opt/hermes/bin/hermes"
@@ -75,17 +82,11 @@ def retire(path: Path) -> None:
 # --- skills -----------------------------------------------------------------
 
 def vendor_mattpocock() -> dict[str, Path]:
-    if (VENDOR / ".git").exists():
-        sh(["git", "-C", str(VENDOR), "pull", "-q", "--ff-only"], check=False)
-    else:
-        VENDOR.parent.mkdir(parents=True, exist_ok=True)
-        sh(["git", "clone", "-q", "--depth", "1", MP_REPO, str(VENDOR)])
-    rev = sh(["git", "-C", str(VENDOR), "rev-parse", "--short", "HEAD"]).strip()
-    log(f"mattpocock/skills @ {rev}")
-    found: dict[str, Path] = {}
-    for skill_md in sorted((VENDOR / "skills").glob("*/*/SKILL.md")):
-        found.setdefault(skill_md.parent.name, skill_md.parent)
-    return found
+    try:
+        vendor_lib.sync_pinned_git_repo(VENDOR, MP_REPO, MP_SHA, log_fn=log)
+    except (ValueError, RuntimeError) as err:
+        sys.exit(f"FAILED vendor_mattpocock: {err}")
+    return vendor_lib.discover_mattpocock_skills(VENDOR)
 
 
 def pstack_names() -> list[str]:

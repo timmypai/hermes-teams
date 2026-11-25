@@ -137,6 +137,7 @@ metadata:
 | `devflow ship merge SLUG PR` | 核對 reviewer exact-head approve、judgment、受保護檔人類 exact-head 核准（必要時 exit 6）與 EPIC 計畫風險定錨（必要時 exit 7）後，依 `.devflow/config.env` 的 `DEVFLOW_MERGE_METHOD` 合併 |
 | `devflow approve SLUG PR --request REQ_ID [--head FULL_SHA] [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准後，以原提問的 `核准請求碼` 綁定原始確認提交並記錄 exact-head 核准（head 已變動即拒絕） |
 | `devflow approve-plan SLUG EPIC --plan-hash HASH [--note TEXT]` | 只限聊天（不是 worker）：於使用者明確核准計畫風險（選 B）後，記錄該計畫雜湊的明確同意並解除 `[SHIP]` 暫停 |
+| `devflow stats [SLUG] [--json]` | 唯讀流程遙測：彙整各看板 EPIC、首次 review 通過率、退件／熔斷、`[ADJ]` 根因、補丁卡數與待處理人工核准／計畫風險閘門 |
 | `devflow repo protect SLUG` | default branch 有 `devflow-ci` 時設為 required check，開啟 PR contract（冪等） |
 
 ## 外部技能

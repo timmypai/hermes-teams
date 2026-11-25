@@ -45,7 +45,7 @@ flowchart TD
 
 pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由 Codex 的 ub-mode 承擔）。分配只代表可用；流程中一定要用的，直接寫在 devflow skill 的步驟裡並註明 principle 名：orchestrator（attack-the-premise、sequence-verifiable-units、encode-lessons-in-structure）、researcher（explain-the-number）、architect（model-the-domain、boundary-discipline）、reviewer（minimize-reader-load）、devops（make-operations-idempotent、explain-the-number、encode-lessons-in-structure）。
 
-完整分配見 `roles.json`。pstack 透過 plugin 載入，每個 profile 以 `skills.disabled` 只留分配到的；mattpocock 技能 vendor 在 `vendor/mattpocock-skills`，以 `roles/<role>/` 符號連結經 `skills.external_dirs` 提供。
+完整分配見 `roles.json`。pstack 透過 plugin 載入，每個 profile 以 `skills.disabled` 只留分配到的；mattpocock 技能依 `roles.json` `mattpocock_skills.sha` 固定 commit SHA vendor 在 `vendor/mattpocock-skills`（`install.py` 驗證確切 HEAD 與乾淨工作樹，不隨上游漂移），以 `roles/<role>/` 符號連結經 `skills.external_dirs` 提供。
 
 **ub-mode**（[unclebob/ub-mode](https://github.com/unclebob/ub-mode) @ `3da62bf`，MIT，原文放在 `skills/ub-mode/`）：
 - 主要開發在 Codex，所以 install 把它複製到 developer 的 `$CODEX_HOME/skills/ub-mode`（Codex 原生 skill，`skills/list` 可見），並只移走具名項目（`roles.json` `obsolete_skills.codex`）：舊契約的 `seven-pstack-*`、`team-operations`，以及規則已由 ub-mode 負責的 Codex 複本 `test-driven-development`（「一律先寫測試」與 ub-mode「寫不出誠實測試就不寫」衝突）、`pstack/skills/{tdd,principle-fix-root-causes,principle-test-behavior-not-implementation}`。補充而不衝突的 `systematic-debugging`、`principle-prove-it-works` 與其他既有 Codex 技能保留。`codex/AGENTS.md` 要求每次改程式都套用 ub-mode，並覆寫與 devflow 衝突的條目：只 push 卡片分支走 PR（原文是 push 到 main line）、worktree 由 Hermes 管、Keep a Log 寫進 handoff metadata `log`。
@@ -145,8 +145,8 @@ pstack 24 條 principle 每條至少分配給一個 Bot（developer 的部分由
 | `roles.json` | 角色、技能分配、設定 |
 | `souls/` | 各 Bot SOUL（install 時寫入 `<profile>/SOUL.md` 的 devflow 區塊） |
 | `skills/` | devflow 團隊技能 |
-| `bin/devflow` | repo / board / contract / runner / preflight / check card / check plan / check acceptance / check pr / ship merge / tick CLI 入口 |
-| `lib/` | 模組化核心函式庫：`policy.py`（宣告式政策）、`kanban_adapter.py`（Hermes DB 適配器）、`scope.py`（範圍與清潔度檢查）、`preflight.py`（開發前自檢）、`breakers.py`（熔斷）、`trust.py`（憑證隔離與保護檔 hash） |
+| `bin/devflow` | repo / board / contract / runner / preflight / check card / check plan / check acceptance / check pr / ship merge / approve / approve-plan / stats / tick CLI 入口 |
+| `lib/` | 模組化核心函式庫：`policy.py`（宣告式政策）、`kanban_adapter.py`（Hermes DB 適配器）、`scope.py`（範圍與清潔度檢查）、`preflight.py`（開發前自檢）、`breakers.py`（熔斷）、`trust.py`（憑證隔離與保護檔 hash）、`standard.py`（公版交付驗證）、`vendor.py`（外部技能 SHA 釘選驗證）、`stats.py`（唯讀流程遙測） |
 | `bin/codex-developer` | developer 的 Codex 啟動器 |
 | `codex/AGENTS.md` | developer Codex 全域指示 |
 | `gitconfig` | 所有 Bot 共用的 git 設定（`GIT_CONFIG_GLOBAL`，經 `gh auth git-credential` 取憑證） |

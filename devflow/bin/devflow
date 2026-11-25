@@ -26,7 +26,7 @@ _KIT_DIR = Path(__file__).resolve().parents[1]
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
 
-from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, scope as scope_lib, standard as standard_lib, trust as trust_lib  # noqa: E402
+from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
 
 ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
 DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
@@ -5013,6 +5013,23 @@ def cmd_check_card(a) -> None:
         sys.exit(1)
 
 
+def cmd_stats(a) -> None:
+    """Read-only workflow telemetry across registered boards (or one board slug)."""
+    state = load_state()
+    target_slug = entry(a.slug)["slug"] if a.slug else None
+    report = stats_lib.collect_all_stats(
+        BOARDS,
+        state,
+        state_dir=ROOT / "state",
+        slug=target_slug,
+        max_review_rounds=MAX_REVIEW_ROUNDS,
+    )
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(stats_lib.format_stats_text(report))
+
+
 def keep_protected(e: dict) -> dict | None:
     """After a merge, a repo still at contract=no gets `repo protect` (it only acts once the default
     branch has the devflow-ci job). Was a manual [SHIP] step: teams-transcription merged three PRs
@@ -5123,6 +5140,10 @@ def main() -> None:
     p = sub.add_parser("pending", help="cards waiting on the user's answer, and which Bot Chat asks (ask_in)")
     p.add_argument("profile", nargs="?", help="only cards asked in this profile's Bot Chat")
     p.set_defaults(fn=cmd_pending)
+    p = sub.add_parser("stats", help="read-only workflow telemetry across boards (EPICs, review first-pass, ADJs, gates)")
+    p.add_argument("slug", nargs="?", help="optional repo slug or OWNER/REPO")
+    p.add_argument("--json", action="store_true", help="emit structured JSON report")
+    p.set_defaults(fn=cmd_stats)
     a = ap.parse_args()
     a.fn(a)
 
