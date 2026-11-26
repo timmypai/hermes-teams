@@ -57,6 +57,26 @@ def _extract_root_cause(result_raw: str | None) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _classify_adj_source(title: str | None, body: str | None, created_by: str | None) -> str:
+    """Classify an [ADJ] card's trigger source for root-cause telemetry."""
+    t = (title or "").strip()
+    b = (body or "")
+    by = (created_by or "").strip().lower()
+    if t.startswith("[ADJ] 計畫規則修正"):
+        return "plan_rule"
+    if t.startswith("[ADJ] 流程阻塞"):
+        if "triage" in b.lower() or "待分類" in b:
+            return "stalled_triage"
+        return "flow_block"
+    if t.startswith("[ADJ] 處理失敗卡"):
+        return "failed_card"
+    if "ADV " in b or "來源 ADV" in b or "PR 判斷" in b:
+        return "pr_adv"
+    if by == "devflow-tick":
+        return "plan_rule"
+    return "manual_or_other"
+
+
 def collect_board_stats(
     boards_dir: Path,
     slug: str,
@@ -80,6 +100,7 @@ def collect_board_stats(
     adj_total = 0
     adj_done = 0
     adj_open = 0
+    adj_by_source: Counter[str] = Counter()
     root_causes: Counter[str] = Counter()
     ship_total = 0
     ship_done = 0
@@ -98,7 +119,7 @@ def collect_board_stats(
                     db_available = True
                     t_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
                     want_cols = [
-                        c for c in ("id", "title", "status", "created_by", "result", "created_at", "started_at")
+                        c for c in ("id", "title", "body", "status", "created_by", "result", "created_at", "started_at")
                         if c in t_cols
                     ]
                     rows = [dict(r) for r in conn.execute(f"SELECT {', '.join(want_cols)} FROM tasks")]
@@ -152,6 +173,7 @@ def collect_board_stats(
                                     first_pass_count += 1
                         elif kind == "ADJ" and status != "archived":
                             adj_total += 1
+                            adj_by_source[_classify_adj_source(r.get("title"), r.get("body"), r.get("created_by"))] += 1
                             if status == "done":
                                 adj_done += 1
                             else:
@@ -259,6 +281,7 @@ def collect_board_stats(
             "total": adj_total,
             "done": adj_done,
             "open": adj_open,
+            "by_source": dict(sorted(adj_by_source.items())),
             "top_root_causes": [{"root_cause": rc, "count": cnt} for rc, cnt in root_causes.most_common(5)],
         },
         "shipping": {
@@ -315,6 +338,9 @@ def collect_all_stats(
     tot_epics_open = sum(b["epics"]["open"] for b in boards)
     tot_pr_done = sum(b["review"]["pr_cards_completed"] for b in boards)
     tot_first_pass = sum(b["review"]["first_pass_count"] for b in boards)
+    tot_adj_by_source: Counter[str] = Counter()
+    for b in boards:
+        tot_adj_by_source.update((b.get("adjustments") or {}).get("by_source") or {})
     totals = {
         "boards": len(boards),
         "epics_done": tot_epics_done,
@@ -324,6 +350,7 @@ def collect_all_stats(
         "total_changes_requested": sum(b["review"]["total_changes_requested"] for b in boards),
         "currently_tripped_cards": sum(b["review"]["currently_tripped_cards"] for b in boards),
         "total_adj": sum(b["adjustments"]["total"] for b in boards),
+        "adj_by_source": dict(sorted(tot_adj_by_source.items())),
         "post_hoc_patch_total": sum(b["shipping"]["post_hoc_patch_total"] for b in boards),
         "pending_human_approvals": sum(b["gates"]["pending_human_approvals"] for b in boards),
         "pending_plan_risk_gates": sum(b["gates"]["pending_plan_risk_gates"] for b in boards),
@@ -354,6 +381,9 @@ def format_stats_text(report: dict[str, Any]) -> str:
             f"ADJ={adj['total']} patch={shp['post_hoc_patch_total']} | "
             f"gates: pending_approval={gt['pending_human_approvals']} pending_plan_risk={gt['pending_plan_risk_gates']}"
         )
+        if adj.get("by_source"):
+            src = ", ".join(f"{k}={v}" for k, v in adj["by_source"].items())
+            lines.append(f"  adj_sources: {src}")
         if adj["top_root_causes"]:
             top = ", ".join(f"{x['root_cause']}({x['count']})" for x in adj["top_root_causes"][:3])
             lines.append(f"  top root_causes: {top}")

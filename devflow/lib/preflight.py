@@ -16,7 +16,14 @@ from .policy import (
     repo_review_test_cmd,
     repo_test_paths,
 )
-from .scope import allowed_scope_problems, check_files_against_scope, parse_card_contract, touched_paths
+from .scope import (
+    allowed_scope_problems,
+    check_files_against_scope,
+    extract_do_not_touch_paths,
+    parse_card_contract,
+    parse_epic_sections,
+    touched_paths,
+)
 from .standard import check_standard_delivery_dir, dependent_standard_paths
 from .trust import is_protected_file, protected_file_changes, sha256_text
 
@@ -112,6 +119,7 @@ def run_preflight(
     base_ref: str = "HEAD~1",
     card_body: str | None = None,
     epic_id: str | None = None,
+    epic_body: str | None = None,
     valid_scenarios: set[str] | None = None,
     pr_title: str | None = None,
     pr_body: str | None = None,
@@ -161,7 +169,9 @@ def run_preflight(
     repo_cfg = load_repo_config(repo_dir)
     contract = parse_card_contract(card_body)
     max_files = repo_max_diff_files(repo_cfg, policy)
-    test_paths = repo_test_paths(repo_cfg)
+    test_paths = repo_test_paths(repo_cfg, policy)
+    epic_oos = extract_do_not_touch_paths(parse_epic_sections(epic_body).get("不能碰")) if epic_body else []
+    merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *epic_oos]))
     all_touched = touched_paths(files)
     scope_findings: list[str] = []
     if card_body is not None:
@@ -172,7 +182,7 @@ def run_preflight(
     scope_findings.extend(check_files_against_scope(
         all_touched,
         allowed_scope=contract["allowed_scope"],
-        out_of_scope=contract["out_of_scope"],
+        out_of_scope=merged_oos,
         test_paths=test_paths,
         max_diff_files=max_files,
         file_count=len(files),

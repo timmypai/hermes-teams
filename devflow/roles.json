@@ -22,7 +22,39 @@
     "plan_risk_mode": "off",
     "auto_flow_adj": false,
     "require_human_approval_for_protected": true,
-    "require_allowed_scope": true
+    "require_allowed_scope": true,
+    "max_role_prompt_chars": 12000,
+    "default_test_paths": [
+      "tests/**",
+      "test/**",
+      "**/*.test.*",
+      "**/*.spec.*",
+      ".devflow/ui/**",
+      ".devflow/verify.sh"
+    ],
+    "modes": {
+      "deliver": {
+        "require_scenarios": true,
+        "require_ship": true,
+        "allow_dev_cards": true,
+        "res_assignees": ["researcher"],
+        "res_workspaces": ["scratch"]
+      },
+      "investigate": {
+        "require_scenarios": false,
+        "require_ship": false,
+        "allow_dev_cards": false,
+        "res_assignees": ["researcher", "devops"],
+        "res_workspaces": ["scratch", "dir"]
+      },
+      "review": {
+        "require_scenarios": false,
+        "require_ship": false,
+        "allow_dev_cards": false,
+        "res_assignees": ["researcher", "reviewer"],
+        "res_workspaces": ["scratch", "dir"]
+      }
+    }
   },
   "worker_config": {
     "agent.max_turns": "150",
@@ -81,7 +113,7 @@
     "root": ["goal-aligned-advisory", "hermes-talk-project-progress", "repo-evidence-custody",
              "seven-bot-native-workflow-boundaries", "grill-me", "grilling", "seven-pstack-*"],
     "profiles": ["team-operations", "seven-pstack-*", "devflow-contract-upgrade"],
-    "codex": ["team-operations", "seven-pstack-*", "test-driven-development", "pstack/skills/tdd",
+    "codex": ["team-operations", "seven-pstack-*", "test-driven-development", "ub-mode", "pstack/skills/tdd",
               "pstack/skills/principle-fix-root-causes", "pstack/skills/principle-test-behavior-not-implementation"]
   },
   "obsolete_cron_names": ["seven-bot-v1-project-supervision"],
@@ -90,7 +122,7 @@
       "title": "Hermes",
       "description": "預設 Bot：即時語音（GPT-Live）與文字入口、需求釐清、建立 Epic 卡交給 orchestrator、回報進度，並擔任 Advisor 檢查計畫是否對準使用者目標。不寫產品程式、不部署。",
       "auto_load": ["devflow-intake"],
-      "team": ["devflow", "devflow-intake"],
+      "team": ["devflow", "devflow-intake", "devflow-chat", "devflow-cli"],
       "mattpocock": ["grilling", "to-questionnaire"],
       "pstack": ["in-your-own-words", "sharpen", "principle-attack-the-premise", "principle-never-block-on-the-human"],
       "gh": "builder",
@@ -110,7 +142,7 @@
       "title": "orchestrator",
       "description": "專案經理：接 Epic 卡、同步 repo、把需求拆成 research/architect/developer/devops 卡並以 parent 串成流程，等待子卡完成後驗收並回報。不寫產品程式。",
       "auto_load": ["devflow", "devflow-orchestrate"],
-      "team": ["devflow", "devflow-orchestrate"],
+      "team": ["devflow", "devflow-orchestrate", "devflow-chat", "devflow-cli"],
       "mattpocock": ["to-tickets", "to-spec"],
       "pstack": ["blast-radius", "principle-sequence-verifiable-units",
                  "principle-attack-the-premise", "principle-encode-lessons-in-structure"],
@@ -123,7 +155,7 @@
       "title": "researcher",
       "description": "技術研究：查官方文件與一手來源、比較方案、做最小可行驗證（PoC），把結論與來源寫回卡片。不改產品 repo。",
       "auto_load": ["devflow", "devflow-research"],
-      "team": ["devflow", "devflow-research"],
+      "team": ["devflow", "devflow-research", "devflow-chat", "devflow-cli"],
       "mattpocock": ["research", "prototype"],
       "pstack": ["principle-explain-the-number", "principle-attack-the-premise"],
       "gh": "builder",
@@ -134,7 +166,7 @@
       "title": "architect",
       "description": "架構設計：新 repo 骨架、模組邊界、資料模型、API 介面、部署拓樸與技術決策（ADR）。在開發前定案跨模組決策，結果寫回卡片給 developer。",
       "auto_load": ["devflow", "devflow-architect"],
-      "team": ["devflow", "devflow-architect"],
+      "team": ["devflow", "devflow-architect", "devflow-chat", "devflow-cli"],
       "mattpocock": ["codebase-design", "domain-modeling"],
       "pstack": ["blast-radius", "principle-model-the-domain", "principle-boundary-discipline"],
       "gh": "builder",
@@ -145,10 +177,10 @@
       "title": "developer",
       "description": "開發：透過 Codex app-server（Codex CLI）在卡片專屬 git worktree 實作與測試，先跑 preflight 再推送分支、開 PR、確認 CI 綠燈後送 review；依 review 意見修正。不合併、不部署。",
       "auto_load": ["devflow", "devflow-develop"],
-      "team": ["devflow", "devflow-develop"],
-      "mattpocock": ["implement", "tdd", "diagnosing-bugs", "pr"],
+      "team": ["devflow", "devflow-develop", "devflow-chat", "devflow-cli"],
+      "mattpocock": ["tdd", "diagnosing-bugs"],
       "pstack": ["principle-prove-it-works", "create-verification-skill"],
-      "codex_skills": ["ub-mode"],
+      "codex_skills": [],
       "gh": "builder",
       "git_name": "hermes-developer",
       "config": {
@@ -163,7 +195,7 @@
       "title": "reviewer",
       "description": "獨立審查與 QA：在 review 欄審 PR 的正確性、範圍對齊、驗收對應、安全與回歸，執行針對性快測與獨立探測；通過就完成卡片並在 GitHub approve，否則 request changes 退回 developer。不代寫實作。",
       "auto_load": ["devflow", "devflow-review"],
-      "team": ["devflow", "devflow-review", "ub-mode"],
+      "team": ["devflow", "devflow-review", "devflow-chat", "devflow-cli"],
       "mattpocock": ["code-review", "diagnosing-bugs"],
       "pstack": ["blast-radius", "principle-prove-it-works", "principle-minimize-reader-load"],
       "gh": "reviewer",
@@ -180,8 +212,8 @@
       "title": "devops",
       "description": "CI/CD 與維運：新 repo 接入（board、clone、workflow、self-hosted runner）、合併已核准 PR、透過 GitHub Actions 部署 Docker 到主機、確認健康檢查與回滾。",
       "auto_load": ["devflow", "devflow-devops"],
-      "team": ["devflow", "devflow-devops"],
-      "mattpocock": ["diagnosing-bugs", "pr"],
+      "team": ["devflow", "devflow-devops", "devflow-chat", "devflow-cli"],
+      "mattpocock": ["diagnosing-bugs"],
       "pstack": ["blast-radius", "principle-make-operations-idempotent",
                  "principle-explain-the-number", "principle-encode-lessons-in-structure"],
       "gh": "builder",

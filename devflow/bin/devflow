@@ -26,7 +26,7 @@ _KIT_DIR = Path(__file__).resolve().parents[1]
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
 
-from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
+from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, prompt_audit, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
 
 ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
 DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
@@ -354,10 +354,12 @@ def cmd_repo_doctor(a) -> None:
             std_delivery = standard_lib.check_standard_delivery_dir(repo_dir, TEMPLATE, repo_cfg=repo_cfg)
         else:
             std_delivery = {"ok": True, "checked": [], "missing": [], "drifted": [], "custom_allowed": False, "findings": []}
+        agents_warnings = prompt_audit.scan_repo_agents_conflicts(repo_dir)
         bad |= state != "ok" or not ready or not std_delivery["ok"]
         print(json.dumps({"slug": slug, "state": state, "project": project and project["id"],
                           "actions": actions, "problems": problems, "deploy_ready": ready, "deploy": deploy,
                           "standard_delivery": std_delivery,
+                          "agents_md_warnings": agents_warnings,
                           "merge_method": merge_method, "judgment_token_role": j_role,
                           "judgment_token_isolated": j_isolated},
                          ensure_ascii=False))
@@ -1420,16 +1422,22 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if t not in feeds:
             feeds.add(t)
             stack.extend(cards.get(t, {}).get("parents", []))
+    epic_mode, bad_mode = scope_lib.parse_epic_mode(cards[epic]["body"], policy_lib.valid_modes(POLICY))
+    mode_cfg = policy_lib.mode_config(POLICY, epic_mode)
     spec = epic_acceptance_spec(board, epic, cards[epic]["body"], cards=cards)
     acs = [a["ac"] for a in spec]
     ac_types = {a["ac"]: a["type"] for a in spec}
     work_kinds = [card_type(c["title"]) for t, c in cards.items() if t != epic and c.get("status") != "archived"
                   and card_type(c["title"]) in ("RES", "ARCH", "DEV", "OPS", "SHIP")]
     ship_only = bool(work_kinds) and all(k == "SHIP" for k in work_kinds)
+    if bad_mode:
+        allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
+        found.append(f"{epic}: Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
+    skip_scenarios = ship_only or (not bool(mode_cfg.get("require_scenarios", True)))
     for a in spec:
-        probs = [p for p in spec_problems(a) if not (ship_only and "沒有任何情境" in p)]
+        probs = [p for p in spec_problems(a) if not (skip_scenarios and "沒有任何情境" in p)]
         found += [f"{epic}: {p}" for p in probs]
     found += plan_manual_rules(epic, spec)
     body_by_tid = {}
@@ -1466,12 +1474,22 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             found.append(f"{tid}: [{kind}] 由 {c.get('created_by')} 建立；工作卡只由 orchestrator 規劃建立"
                          "（devops 僅依失敗處理建修正卡），其他角色將需求交 orchestrator 拆卡")
         want = CARDS[kind]
-        # PR cards move to the reviewer while in the review column.
-        if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
-            found.append(f"{tid}: [{kind}] assignee 應為 {want['assignee']}，現在是 {c['assignee']}")
-        if (c["workspace_kind"] or "scratch") != want["workspace"]:
-            found.append(f"{tid}: [{kind}] workspace 應為 {want['workspace']}，現在是 {c['workspace_kind']}")
+        # PR cards move to the reviewer while in the review column; [RES] honors declarative mode rules.
+        if kind == "RES":
+            allowed_asg = list(mode_cfg.get("res_assignees") or [want["assignee"]])
+            allowed_ws = list(mode_cfg.get("res_workspaces") or [want["workspace"]])
+            if c["assignee"] not in allowed_asg:
+                found.append(f"{tid}: [RES] assignee 應為 {'/'.join(allowed_asg)}，現在是 {c['assignee']}")
+            if (c["workspace_kind"] or "scratch") not in allowed_ws:
+                found.append(f"{tid}: [RES] workspace 應為 {'/'.join(allowed_ws)}，現在是 {c['workspace_kind']}")
+        else:
+            if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
+                found.append(f"{tid}: [{kind}] assignee 應為 {want['assignee']}，現在是 {c['assignee']}")
+            if (c["workspace_kind"] or "scratch") != want["workspace"]:
+                found.append(f"{tid}: [{kind}] workspace 應為 {want['workspace']}，現在是 {c['workspace_kind']}")
         if kind in ("DEV", "OPS"):
+            if not bool(mode_cfg.get("allow_dev_cards", True)):
+                found.append(f"{tid}: 本 EPIC 為 Mode: {epic_mode}（不開放改程式補丁），禁止建立 [{kind}] 卡；如需改碼請另開 Mode: deliver EPIC")
             contract = c.get("completion_contract") or "local-only"
             # Hermes pins OWNER/REPO to the exact PR URL once the card publishes its PR.
             ok_yes = contract == e["repo"] or contract.startswith(f"https://github.com/{e['repo']}/pull/")
@@ -1480,7 +1498,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             if not e.get("contract") and contract != "local-only":
                 found.append(f"{tid}: repo contract=no，不應設 completion_contract（{contract}），卡片會永遠無法完成")
             ships = [x for x in c["children"] if card_type(cards.get(x, {}).get("title", "")) == "SHIP"]
-            if repo_deploys(board) and not ships:
+            if repo_deploys(board) and bool(mode_cfg.get("require_ship", True)) and not ships:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
             if (why := done_problem(c["title"], c["body"])):
                 found.append(f"{tid}: [{kind}] {why}")
@@ -1795,19 +1813,24 @@ def tick_key(board: str) -> str:
     return f"{board_mtime}:{j_mtime}:{h.hexdigest()[:12]}"
 
 
-def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str) -> str:
+def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str, board: str | None = None) -> str:
+    """Plan hash. With `board`, open [DEV]/[OPS] cards also bind their review rejection count so a new
+    `changes_requested` event (breaker progress) re-triggers the plan check."""
     import hashlib
     rows = []
     for t, c in sorted(cards.items()):
         contract = c.get("completion_contract") or ""
         if contract.startswith(f"https://github.com/{repo}/pull/"):
             contract = repo  # Hermes pins the PR URL on publish; same plan
+        kind = card_type(c["title"])
         row = [t, c["title"], c["assignee"], c["workspace_kind"], contract, sorted(c["parents"]),
-               c["body"] if t == epic or card_type(c["title"]) != "ADV" else ""]
-        if t == epic or card_type(c["title"]) == "ADJ":
+               c["body"] if t == epic or kind != "ADV" else ""]
+        if t == epic or kind == "ADJ":
             row.extend([c.get("status") or "", c.get("block_kind") or ""])
-        elif card_type(c["title"]) == "SHIP":
+        elif kind == "SHIP":
             row.append(c.get("status") in SHIP_PENDING)
+        elif board and kind in ("DEV", "OPS") and c.get("status") not in ("done", "archived"):
+            row.append(kanban_adapter.card_changes_requested_count(BOARDS, board, t))
         rows.append(row)
     risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
     rows.append(["__policy__", risk_mode, int(REQUIRE_ALLOWED_SCOPE), MAX_REVIEW_ROUNDS, MAX_EPIC_CARDS])
@@ -1891,6 +1914,43 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
         raise
 
 
+def _validate_edit_op(board: str, op: dict) -> list[str]:
+    """Fail-fast card schema guard for `devflow-ops` `edit` so malformed [DEV]/[OPS] edits are
+    rejected in place instead of spawning a follow-up [ADJ] on the next tick."""
+    new_title = op.get("title")
+    new_body = op.get("body")
+    if new_title is None and new_body is None:
+        return []
+    cur_title, cur_body = "", ""
+    db = BOARDS / board / "kanban.db"
+    if db.exists() and op.get("task"):
+        with suppress(sqlite3.Error):
+            rows = board_rows(board, "SELECT title, body FROM tasks WHERE id = ?", (op["task"],))
+            if rows:
+                cur_title = rows[0].get("title") or ""
+                cur_body = rows[0].get("body") or ""
+    eff_title = new_title if new_title is not None else cur_title
+    eff_body = new_body if new_body is not None else cur_body
+    if not eff_title:
+        return []
+    kind = card_type(eff_title)
+    if new_title is not None and kind not in CARDS:
+        return [f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]"]
+    errs: list[str] = []
+    if kind in ("DEV", "OPS") and new_body is not None:
+        if why := done_problem(eff_title, eff_body):
+            errs.append(why)
+        repo_cfg = policy_lib.load_repo_config(entry(board).get("path")) if board in load_state() else {}
+        req_scope = policy_lib.repo_require_allowed_scope(
+            repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
+        )
+        contract = scope_lib.parse_card_contract(eff_body)
+        errs.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
+    if new_body is not None and (leaks := scope_lib.body_hygiene_leaks(eff_body)):
+        errs.append(f"body 夾帶內部技術資訊（{'、'.join(leaks)}）")
+    return errs
+
+
 def apply_op(board: str, op: dict) -> str:
     kind = op.get("op")
     if kind not in BOARD_OPS:
@@ -1902,6 +1962,8 @@ def apply_op(board: str, op: dict) -> str:
     elif kind == "assign":
         kanban(board, "assign", op["task"], op["to"])
     elif kind == "edit":
+        if errs := _validate_edit_op(board, op):
+            raise ValueError("edit 違反卡片規格（已就地攔截，未寫入）：" + "；".join(errs))
         args = [x for k in ("title", "body") if op.get(k) for x in (f"--{k}", op[k])]
         kanban(board, "edit", op["task"], *args)
     elif kind == "resume":
@@ -2332,6 +2394,18 @@ def open_plan_adj(board: str, epic: str, cards: dict[str, dict], rules: list[str
     plan_adj = st.setdefault("plan_adj", {})
     if not rules:
         plan_adj.pop(epic, None)
+        for t, c in list(cards.items()):
+            if (
+                card_type(c.get("title") or "") == "ADJ"
+                and (c.get("title") or "").startswith(f"[ADJ] 計畫規則修正 {epic}")
+                and c.get("status") not in ("done", "archived")
+            ):
+                try:
+                    kanban(board, "comment", t, f"devflow tick：{epic} 計畫規則已通過，自動封存過期的計畫修正 [ADJ]。")
+                    kanban(board, "archive", t)
+                    c["status"] = "archived"
+                except (SystemExit, Exception) as err:  # noqa: BLE001 - best-effort zombie cleanup
+                    print(f"devflow: auto-archive resolved plan-adj {board}/{t} failed: {err}", file=sys.stderr)
         return None, False
     rkey = hashlib.sha1("\n".join(sorted(rules)).encode()).hexdigest()[:8]
     rec = plan_adj.get(epic)
@@ -2452,7 +2526,7 @@ def tick_board(board: str, st: dict) -> bool:
                 kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
                                               "補齊缺少的 `goal_mode`）")
                 cards = plan_cards(board, tid)
-            fp = plan_fingerprint(tid, cards, repo)
+            fp = plan_fingerprint(tid, cards, repo, board=board)
             rec = (st.get("plan_adj") or {}).get(tid)
             repair_ended = bool(
                 isinstance(rec, dict)
@@ -2496,7 +2570,7 @@ def tick_board(board: str, st: dict) -> bool:
                     "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
                     if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
                 if not adj_retry and not retry:
-                    plans[tid] = plan_fingerprint(tid, cards, repo)
+                    plans[tid] = plan_fingerprint(tid, cards, repo, board=board)
             else:
                 pr_rec = load_plan_risk_state().get(plan_risk_key(board, tid))
                 if pr_rec:
@@ -4147,15 +4221,16 @@ def judgment_fingerprint(
     cfg = repo_cfg or {}
     base_fp = pr["fingerprint"]
     extra_protected = sorted(policy_lib.repo_protected_paths(cfg))
-    test_paths = sorted(policy_lib.repo_test_paths(cfg))
+    test_paths = sorted(policy_lib.repo_test_paths(cfg, POLICY))
     max_files = policy_lib.repo_max_diff_files(cfg, POLICY)
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
     manual_only = policy_lib.repo_deploy_manual_only(cfg)
     allow_custom = policy_lib.repo_allow_custom_delivery(cfg)
+    default_tests = sorted(policy_lib.repo_test_paths({}, POLICY))
     if (
         goal_context is None
         and not extra_protected
-        and not test_paths
+        and test_paths == default_tests
         and max_files == default_max
         and not manual_only
         and not allow_custom
@@ -4267,7 +4342,7 @@ def judge(pr: dict, files: list[dict], *, goal_context: dict | None = None, repo
             scope_lib.touched_paths(files),
             allowed_scope=goal_context.get("allowed_scope"),
             out_of_scope=goal_context.get("out_of_scope"),
-            test_paths=policy_lib.repo_test_paths(repo_cfg or {}),
+            test_paths=policy_lib.repo_test_paths(repo_cfg or {}, POLICY),
             max_diff_files=policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY),
             file_count=len(files),
         ))
@@ -4436,6 +4511,13 @@ def judgment(board: str, repo: str, number: int, pr: dict | None = None) -> dict
             result["standard_delivery"] = sd
             if not sd["ok"]:
                 result["findings"] = list(result.get("findings") or []) + sd["findings"]
+    # Deterministic violations (scope / file-count / standard delivery drift) fail PR judgment
+    # directly without wasting an Opus [ADV] run or spawning a competing [ADJ] loop.
+    sd_rec = result.get("standard_delivery") or {}
+    det_findings = list(result.get("scope_findings") or []) + (
+        list(sd_rec.get("findings") or []) if (not sd_rec.get("ok", True) and not sd_rec.get("fetch_failed")) else []
+    )
+    result["deterministic_findings"] = det_findings
     # Written only if no one stored another fingerprint during the Decisions call (a body, scope, or
     # policy edit judged meanwhile is newer; overwriting it would drop its advisor and post a stale state).
     return update_judgment(key, fp=rec.get("fingerprint", ""), board=board, repo=repo, pr=number, url=pr["url"],
@@ -4507,14 +4589,19 @@ def publish(rec: dict, verdict: str | None) -> dict:
         if current.get("posted") and current["posted"][0] == rec["head_sha"]:
             update_judgment(key, fp=current.get("fingerprint", ""), posted=None)
         return {**rec, "posted": [rec["head_sha"], "error"]}
-    state = "success" if verdict == "ok" else "failure" if verdict in ("revise", "missing") else "pending"
+    state = "success" if verdict == "ok" else "failure" if verdict in ("revise", "missing", "deterministic_fail") else "pending"
     if rec.get("posted") == [rec["head_sha"], state]:
         return rec
     current = load_judgments().get(f"{rec['repo']}#{rec['pr']}") or {}
     if current.get("fingerprint") != rec["fingerprint"]:  # superseded: its own gate() publishes
         return current
+    fail_desc = (
+        "deterministic scope/standard-delivery check failed (fix locally with devflow preflight)"
+        if verdict == "deterministic_fail"
+        else f"advisor {rec.get('advisor')}: {verdict}"
+    )
     desc = {"success": f"fingerprint {rec['fingerprint'][:12]}" + (f", advisor {rec['advisor']} ok" if rec["findings"] else ""),
-            "failure": f"advisor {rec.get('advisor')}: {verdict}",
+            "failure": fail_desc,
             "pending": "findings wait for the [ADV] advisor"}[state]
     j_role, _, _ = trust_lib.judgment_gh_role(ROLES)
     run(["gh", "api", "-X", "POST", f"repos/{rec['repo']}/statuses/{rec['head_sha']}", "-f", f"state={state}",
@@ -4538,19 +4625,22 @@ def gate(board: str, repo: str, number: int, pr: dict | None = None) -> tuple[di
         raise DecisionsError("PR 或其卡片範圍／政策在判斷期間被修改；重跑")
     if rec.get("transient_error"):
         return publish(rec, None), None
-    verdict = advisor_verdict(board, rec) if rec["findings"] else "ok"
+    if rec.get("deterministic_findings"):
+        verdict = "deterministic_fail"
+    else:
+        verdict = advisor_verdict(board, rec) if rec["findings"] else "ok"
     return publish(rec, verdict), verdict
 
 
 def refuse(rec: dict, verdict: str | None, out: dict) -> None:
-    """Exit 3 (advisor open) or 4 (revise/missing). On 3, `wait` tells the worker how to wait:
+    """Exit 3 (advisor open) or 4 (revise/missing/deterministic_fail). On 3, `wait` tells the worker how to wait:
     `dependency` → kanban_link the [ADV] as its own parent, then block kind=dependency (Hermes holds
     the card in todo until the advisor is done, and dependency blocks do not count toward triage);
     `retry` → the tick has not opened the [ADV] yet: wait a minute and rerun."""
     print(json.dumps({**out, "advisor": rec.get("advisor"), "verdict": verdict, "findings": rec["findings"],
                       "wait": None if verdict else "dependency" if rec.get("advisor") else "retry"},
                      ensure_ascii=False, indent=2))
-    sys.exit(4 if verdict in ("revise", "missing") else 3)
+    sys.exit(4 if verdict in ("revise", "missing", "deterministic_fail") else 3)
 
 
 def card_pr(repo: str, task: dict, show: dict) -> int | None:
@@ -4918,12 +5008,11 @@ def cmd_ship_merge(a) -> None:
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
 
-def cmd_preflight(a) -> None:
-    """Developer pre-flight deterministic checks before pushing/opening PR or requesting review."""
+def _run_card_preflight(a) -> tuple[dict, dict, Path, str | None]:
     e = entry(a.slug)
     repo_dir = Path(a.dir).resolve()
     base_ref = a.base or f"origin/{e['default_branch']}"
-    card_body, card_title, epic_id, valid_scenarios = None, None, None, None
+    card_body, card_title, epic_id, epic_body, valid_scenarios = None, None, None, None, None
     extra_findings: list[str] = []
     review_loop: dict | None = None
     if a.task and (BOARDS / e["slug"] / "kanban.db").exists():
@@ -4937,8 +5026,9 @@ def cmd_preflight(a) -> None:
                 epic_id = m.group(1)
                 epics = board_rows(e["slug"], "SELECT body FROM tasks WHERE id = ?", (epic_id,))
                 if epics:
+                    epic_body = epics[0].get("body") or ""
                     spec = epic_acceptance_spec(
-                        e["slug"], epic_id, epics[0].get("body") or "", extra_dirs=[repo_dir]
+                        e["slug"], epic_id, epic_body, extra_dirs=[repo_dir]
                     )
                     valid_scenarios = {s["id"] for ac in spec for s in ac["scenarios"]}
                     local_sc_path = repo_dir / ".devflow" / "scenarios.json"
@@ -4967,6 +5057,7 @@ def cmd_preflight(a) -> None:
         base_ref=base_ref,
         card_body=card_body,
         epic_id=epic_id,
+        epic_body=epic_body,
         valid_scenarios=valid_scenarios,
         pr_title=a.pr_title,
         pr_body=pr_body,
@@ -4977,9 +5068,59 @@ def cmd_preflight(a) -> None:
         extra_findings=extra_findings or None,
         require_scope_for_card=require_scope_for_card,
     )
+    return e, rep, repo_dir, pr_body
+
+
+def cmd_preflight(a) -> None:
+    """Developer pre-flight deterministic checks before pushing/opening PR or requesting review."""
+    _, rep, _, _ = _run_card_preflight(a)
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     if not rep["ok"]:
         sys.exit(1)
+
+
+def cmd_pr_submit(a) -> None:
+    """Shift-left single entry for developers: run deterministic preflight, then push branch and
+    create/read back the PR (never pushes or opens a PR when preflight fails)."""
+    e, rep, repo_dir, pr_body = _run_card_preflight(a)
+    if not rep["ok"]:
+        print(json.dumps({"ok": False, "stage": "preflight", "preflight": rep}, ensure_ascii=False, indent=2))
+        sys.exit(1)
+    if a.dry_run:
+        print(json.dumps({"ok": True, "stage": "preflight", "dry_run": True, "preflight": rep},
+                         ensure_ascii=False, indent=2))
+        return
+    body = (pr_body or "").rstrip()
+    if a.task and not scope_lib.extract_kanban_task_id(body):
+        body = (body + "\n\n" if body else "") + f"Kanban: {a.task}"
+    push = run(["git", "-C", str(repo_dir), "push", "-u", "origin", "HEAD"], gh="builder", check=False)
+    if push.returncode != 0:
+        die(f"pr submit 推送分支失敗：{(push.stderr or push.stdout).strip()[-400:]}")
+    view = run(["gh", "pr", "view", "--json", "url,number,headRefOid"], cwd=repo_dir, gh="builder", check=False)
+    if view.returncode == 0 and view.stdout.strip():
+        pr_info = json.loads(view.stdout)
+        created = False
+    else:
+        if not a.pr_title:
+            die("pr submit 建立新 PR 需要 --pr-title")
+        create = run(
+            ["gh", "pr", "create", "--base", e["default_branch"], "--title", a.pr_title, "--body", body],
+            cwd=repo_dir, gh="builder", check=False,
+        )
+        if create.returncode != 0:
+            die(f"pr submit 建立 PR 失敗：{(create.stderr or create.stdout).strip()[-400:]}")
+        view = run(["gh", "pr", "view", "--json", "url,number,headRefOid"], cwd=repo_dir, gh="builder")
+        pr_info = json.loads(view.stdout)
+        created = True
+    print(json.dumps({
+        "ok": True,
+        "stage": "submitted",
+        "created": created,
+        "pr_url": pr_info.get("url"),
+        "pr_number": pr_info.get("number"),
+        "head_sha": pr_info.get("headRefOid"),
+        "preflight": rep,
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_check_card(a) -> None:
@@ -5101,6 +5242,16 @@ def main() -> None:
     p.add_argument("--no-test", action="store_true", help="skip local check.sh / test command")
     p.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes in worktree")
     p.set_defaults(fn=cmd_preflight)
+    pr_cmd = sub.add_parser("pr").add_subparsers(dest="sub", required=True)
+    p = pr_cmd.add_parser("submit", help="run preflight then push branch and create/read back PR (blocks push on failure)")
+    p.add_argument("slug"); p.add_argument("task")
+    p.add_argument("--dir", default=".", help="worktree root (default: cwd)")
+    p.add_argument("--base", help="base git ref to diff against (default: origin/<default_branch>)")
+    p.add_argument("--pr-title"); p.add_argument("--pr-body"); p.add_argument("--pr-body-file")
+    p.add_argument("--no-test", action="store_true", help="skip local check.sh / test command")
+    p.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes in worktree")
+    p.add_argument("--dry-run", action="store_true", help="stop after preflight without pushing or opening PR")
+    p.set_defaults(fn=cmd_pr_submit)
     p = sub.add_parser("approve", help="record exact-head human approval for a PR touching protected files (Hermes chat only)")
     p.add_argument("board"); p.add_argument("pr", type=int)
     p.add_argument("--request", help="12-char approval request ID from the block question (`核准請求碼：`) / `devflow pending`")
