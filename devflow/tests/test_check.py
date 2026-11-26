@@ -453,6 +453,66 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         self.assertEqual(code, 1, out)
         self.assertIn("changed_files=3 > max_files=2", out)
 
+    def test_js_comments_dynamic_import_py_syntax_error_and_diff_policy_alias(self) -> None:
+        self.write(
+            ".devflow/rules/domain-boundary.toml",
+            """\
+            id = "domain-boundary"
+            kind = "import_boundary"
+            message = "domain must not import infra"
+            include = ["domain/**/*.py", "web/**/*.ts"]
+            forbidden_modules = ["infra", "infra/"]
+
+            [[fixture]]
+            expect = "fail"
+            path = "domain/a.py"
+            text = "import infra\\n"
+
+            [[fixture]]
+            expect = "pass"
+            path = "domain/a.py"
+            text = "import domain.types\\n"
+            """,
+        )
+        self.write(
+            ".devflow/rules/pr-cap.toml",
+            """\
+            id = "pr-cap"
+            kind = "diff_policy"
+            message = "diff cap"
+            max_files = 1
+
+            [[fixture]]
+            expect = "fail"
+            changed_files = ["a.py", "b.py"]
+
+            [[fixture]]
+            expect = "pass"
+            changed_files = ["a.py"]
+            """,
+        )
+        self.write("web/ok.ts", '// import x from "infra/a";\n/* require("infra/b") */\nconst s = "/* keep */";\n')
+        self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
+        self.write("domain/broken.py", "def broken(:\n")
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("web/ok.ts", out)
+        self.assertIn("web/dyn.ts:1 [domain-boundary]", out)
+        self.assertIn("domain/broken.py:1 [domain-boundary]", out)
+        self.assertIn("SyntaxError", out)
+
+        # Clean python + JS lets repo check pass, while PR gate still enforces diff_policy alias
+        self.write("web/dyn.ts", 'export const ok = 1;\n')
+        self.write("domain/broken.py", "X = 1\n")
+        self.start("exit 0\n")
+        code_ok, out_ok = self.check()
+        self.assertEqual(code_ok, 0, out_ok)
+        self.write("app/a.py", "X = 1\n")
+        self.write("app/b.py", "X = 2\n")
+        code_pr, out_pr = self.gate("feat: check diff_policy alias")
+        self.assertEqual(code_pr, 1, out_pr)
+        self.assertIn("changed_files=2 > max_files=1", out_pr)
+
 
 if __name__ == "__main__":
     unittest.main()

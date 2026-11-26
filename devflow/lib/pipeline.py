@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from lib import policy as policy_lib
+from . import policy as policy_lib
 
 PIPELINE_RE = re.compile(r"^\s*Pipeline[：:]\s*([A-Za-z0-9_-]+)\s*$", re.M | re.I)
 START_AT_RE = re.compile(r"^\s*Start-At[：:]\s*([A-Za-z0-9_-]+)\s*$", re.M | re.I)
@@ -216,6 +216,86 @@ def is_card_beyond_stop(
     if not step or step not in steps:
         return False
     return steps.index(step) > steps.index(stop_after)
+
+
+def is_card_before_start(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    """True when `spec` is valid and `kind` belongs strictly before `spec['start_at']`."""
+    if not spec.get("valid", True):
+        return False
+    steps = list(spec.get("steps") or [])
+    start_at = str(spec.get("start_at") or "").strip().lower()
+    if start_at not in steps:
+        return False
+    step = card_step_for_kind(kind, spec, policy)
+    if not step or step not in steps:
+        return False
+    return steps.index(step) < steps.index(start_at)
+
+
+def is_step_active(step: str, spec: dict[str, Any]) -> bool:
+    """True when `spec` is valid and `step` is inside the EPIC's active slice."""
+    if not spec.get("valid", True):
+        return False
+    target = (step or "").strip().lower()
+    return target in {str(s).strip().lower() for s in (spec.get("active_steps") or [])}
+
+
+def mark_epic_paused_at(
+    epic_body: str | None,
+    step: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    epic_mode: str = "deliver",
+) -> tuple[str, dict[str, Any]]:
+    """Record idempotent `Paused-At: <step>` header on an EPIC body without duplicating headers."""
+    text = epic_body or ""
+    spec = parse_epic_pipeline(text, policy, epic_mode=epic_mode)
+    if not spec["valid"]:
+        raise ValueError("EPIC Pipeline 設定無效：" + "；".join(spec["problems"]))
+    target = (step or "").strip().lower()
+    if target not in spec["steps"]:
+        raise ValueError(f"Paused-At '{target}' 不在 {spec['pipeline']} 步驟中")
+
+    kept = [line for line in text.splitlines() if not PAUSED_AT_RE.match(line)]
+    insert_at = 0
+    for idx, line in enumerate(kept):
+        if _EXPLICIT_MODE_RE.match(line) or PIPELINE_RE.match(line) or START_AT_RE.match(line) or STOP_AFTER_RE.match(line):
+            insert_at = idx + 1
+        elif line.strip():
+            break
+    kept.insert(insert_at, f"Paused-At: {target}")
+    new_body = "\n".join(kept).rstrip() + "\n"
+    return new_body, parse_epic_pipeline(new_body, policy, epic_mode=epic_mode)
+
+
+def slice_stop_reached(
+    cards: dict[str, dict[str, Any]],
+    epic: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    """True when a partial pipeline (`stop_after != terminal`) has finished every card in `active_steps`."""
+    if not spec.get("valid"):
+        return False
+    steps = list(spec.get("steps") or [])
+    if not steps or spec.get("stop_after") == steps[-1]:
+        return False
+    active = {str(s).strip().lower() for s in (spec.get("active_steps") or [])}
+    in_slice = [
+        c for cid, c in cards.items()
+        if cid != epic
+        and c.get("status") != "archived"
+        and (card_step := card_step_for_kind(
+            (str(c.get("title") or "").lstrip("[").split("]", 1)[0] if str(c.get("title") or "").lstrip().startswith("[") else ""),
+            spec,
+            policy,
+        )) in active
+    ]
+    return bool(in_slice) and all(c.get("status") in ("done", "archived") for c in in_slice)
 
 
 def is_user_paused_card(task: dict[str, Any]) -> bool:

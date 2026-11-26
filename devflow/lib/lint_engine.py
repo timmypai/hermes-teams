@@ -11,21 +11,23 @@ Every rule file (`<id>.toml`) must carry `[[fixture]]` self-tests (`expect = "pa
 from __future__ import annotations
 
 import ast
-import fnmatch
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from lib import policy as policy_lib
+from . import policy as policy_lib
 
-VALID_KINDS = frozenset({"regex", "cross_file", "import_boundary", "diff_policy"})
+VALID_KINDS = frozenset({"regex", "cross_file", "import_boundary", "diff_policy", "diff_budget"})
+DIFF_KINDS = frozenset({"diff_policy", "diff_budget"})
 VALID_SEVERITIES = frozenset({"warn", "error"})
+DEFAULT_SKIP_DIRS = frozenset({".git", ".worktrees", "node_modules", ".venv", "vendor", "dist", "build", "__pycache__"})
 ALLOW_EXEMPT_RE = re.compile(r"devflow:\s*allow\s+([\w-]+)(?:\s+(L-\d{4}))?")
 JS_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
 JS_IMPORT_RE = re.compile(
-    r"""(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+|(?:const|let|var)?[^=\n]*=?\s*require\s*\(\s*)['"]([^'"]+)['"]""",
+    r"""(?:(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+)|(?<![\w.$])(?:import|require)\s*\(\s*)['"]([^'"]+)['"]""",
     re.M,
 )
 MAX_FILE_BYTES = 1_000_000
@@ -46,6 +48,28 @@ def _strip_rel_prefix(path: str) -> str:
     return s.lstrip("/")
 
 
+def _compile_glob_regex(pattern: str) -> re.Pattern[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def glob_matches(path: str, pattern: str) -> bool:
     p = _strip_rel_prefix(path)
     pat = _strip_rel_prefix(pattern)
@@ -53,22 +77,21 @@ def glob_matches(path: str, pattern: str) -> bool:
         return False
     if pat.endswith("/"):
         return p.startswith(pat)
-    if "**" in pat:
-        prefix, _, suffix = pat.partition("**")
-        prefix = prefix.rstrip("/")
-        suffix = suffix.lstrip("/")
-        if prefix and not (p == prefix or p.startswith(prefix + "/")):
-            return False
-        if not suffix:
-            return True
-        return fnmatch.fnmatch(p, f"*{suffix}") or PurePosixPath(p).match(pat)
-    return fnmatch.fnmatch(p, pat) or PurePosixPath(p).match(pat)
+    return bool(_compile_glob_regex(pat).match(p))
 
 
 def _line_exempt(line: str, rule_id: str) -> bool:
     for m in ALLOW_EXEMPT_RE.finditer(line or ""):
         if _norm_id(m.group(1)) == _norm_id(rule_id):
             return True
+    return False
+
+
+def _is_line_exempt(lines: list[str], lineno: int, rule_id: str) -> bool:
+    if 1 <= lineno <= len(lines) and _line_exempt(lines[lineno - 1], rule_id):
+        return True
+    if lineno > 1 and lineno - 1 <= len(lines) and _line_exempt(lines[lineno - 2], rule_id):
+        return True
     return False
 
 
@@ -201,11 +224,11 @@ def load_rule(path: Path) -> LintRule:
         if not isinstance(raw_mods, list) or not raw_mods or not all(isinstance(x, str) and x.strip() for x in raw_mods):
             raise LintConfigError(f"{path}: import_boundary rule requires non-empty `forbidden_modules`")
         forbidden_modules = tuple(x.strip() for x in raw_mods)
-    elif kind == "diff_policy":
+    elif kind in DIFF_KINDS:
         mf = data.get("max_files")
         ml = data.get("max_added_lines")
         if mf is None and ml is None:
-            raise LintConfigError(f"{path}: diff_policy rule requires `max_files` or `max_added_lines`")
+            raise LintConfigError(f"{path}: {kind} rule requires `max_files` or `max_added_lines`")
         if mf is not None:
             if not isinstance(mf, int) or mf <= 0:
                 raise LintConfigError(f"{path}: `max_files` must be a positive integer")
@@ -266,11 +289,59 @@ def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
     return clean_imp == forb or clean_imp.startswith(forb + ".") or clean_imp.startswith(forb + "/")
 
 
-def _extract_python_imports(rel_path: str, text: str) -> list[tuple[int, str]]:
+def _strip_js_comments(text: str) -> str:
+    """Strip `//...` and `/*...*/` comments while preserving line numbers & string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "/":
+                out.append("  ")
+                i += 2
+                while i < n and text[i] != "\n":
+                    out.append(" ")
+                    i += 1
+                continue
+            if nxt == "*":
+                out.append("  ")
+                i += 2
+                while i < n:
+                    if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                        out.append("  ")
+                        i += 2
+                        break
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_python_imports(rel_path: str, text: str) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
     try:
         tree = ast.parse(text, filename=rel_path)
-    except SyntaxError:
-        return []
+    except SyntaxError as err:
+        return [], (err.lineno or 1, err.msg or "syntax error")
     out: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -289,13 +360,14 @@ def _extract_python_imports(rel_path: str, text: str) -> list[tuple[int, str]]:
                     resolved = _resolve_py_relative_import(rel_path, alias.name, node.level)
                     if resolved:
                         out.append((node.lineno, resolved))
-    return out
+    return out, None
 
 
 def _extract_js_imports(text: str) -> list[tuple[int, str]]:
+    cleaned = _strip_js_comments(text)
     out: list[tuple[int, str]] = []
-    for m in JS_IMPORT_RE.finditer(text):
-        lineno = text.count("\n", 0, m.start()) + 1
+    for m in JS_IMPORT_RE.finditer(cleaned):
+        lineno = cleaned.count("\n", 0, m.start()) + 1
         out.append((lineno, m.group(1).strip()))
     return out
 
@@ -335,7 +407,7 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
     findings: list[dict[str, Any]] = []
     norm_files = {_strip_rel_prefix(k): v for k, v in files.items()}
     for rule in rules:
-        if rule.kind == "diff_policy":
+        if rule.kind in DIFF_KINDS:
             continue
         if rule.kind == "cross_file":
             if not all(_when_satisfied(c, norm_files) for c in rule.when):
@@ -345,12 +417,16 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
                     continue
                 if rule.target_mode == "forbid":
                     lines = text.splitlines()
+                    reported = False
                     for pat in rule.target_patterns:
-                        if m := pat.search(text):
+                        for m in pat.finditer(text):
                             lineno = text.count("\n", 0, m.start()) + 1
-                            if 1 <= lineno <= len(lines) and _line_exempt(lines[lineno - 1], rule.id):
+                            if _is_line_exempt(lines, lineno, rule.id):
                                 continue
                             findings.append(_finding(rule, rel_path, m.group(0), line=lineno))
+                            reported = True
+                            break
+                        if reported:
                             break
                 elif rule.target_mode == "require":
                     if not all(pat.search(text) for pat in rule.target_patterns):
@@ -365,20 +441,36 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
                 for pat in rule.patterns:
                     for m in pat.finditer(text):
                         lineno = text.count("\n", 0, m.start()) + 1
-                        if 1 <= lineno <= len(lines) and _line_exempt(lines[lineno - 1], rule.id):
+                        if _is_line_exempt(lines, lineno, rule.id):
                             continue
                         findings.append(_finding(rule, rel_path, m.group(0), line=lineno))
                         break
             elif rule.kind == "import_boundary":
                 ext = PurePosixPath(rel_path).suffix.lower()
-                imports = _extract_python_imports(rel_path, text) if ext == ".py" else (
-                    _extract_js_imports(text) if ext in JS_EXTS else []
-                )
+                if ext == ".py":
+                    imports, syn_err = _extract_python_imports(rel_path, text)
+                    if syn_err is not None:
+                        lineno, msg = syn_err
+                        if not _is_line_exempt(lines, lineno, rule.id):
+                            findings.append({
+                                "id": rule.id,
+                                "kind": rule.kind,
+                                "severity": rule.severity,
+                                "file": rel_path,
+                                "line": lineno,
+                                "match": "SyntaxError",
+                                "detail": f"{rule.message} (Python SyntaxError: {msg})",
+                            })
+                        continue
+                elif ext in JS_EXTS:
+                    imports = _extract_js_imports(text)
+                else:
+                    imports = []
                 reported_lines: set[int] = set()
                 for lineno, imp in imports:
                     if lineno in reported_lines:
                         continue
-                    if 1 <= lineno <= len(lines) and _line_exempt(lines[lineno - 1], rule.id):
+                    if _is_line_exempt(lines, lineno, rule.id):
                         continue
                     if any(_import_matches_forbidden(imp, forb) for forb in rule.forbidden_modules):
                         findings.append(_finding(rule, rel_path, imp, line=lineno))
@@ -387,7 +479,7 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
 
 
 def scan_repo(rules: list[LintRule], repo_dir: Path | str | None) -> list[dict[str, Any]]:
-    """Read-only scan of all relevant files inside `repo_dir` for `rules`."""
+    """Read-only scan of all relevant files inside `repo_dir` for `rules` (pruning worktrees/deps)."""
     if not repo_dir:
         return []
     root = Path(repo_dir)
@@ -406,14 +498,15 @@ def scan_repo(rules: list[LintRule], repo_dir: Path | str | None) -> list[dict[s
         if p.is_file() and p.stat().st_size <= MAX_FILE_BYTES:
             wanted[rel] = p.read_text(encoding="utf-8", errors="replace")
 
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(root).as_posix()
-        if rel.startswith(".git/"):
-            continue
-        if any(r.applies(rel) for r in rules) and p.stat().st_size <= MAX_FILE_BYTES:
-            if rel not in wanted:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in sorted(dirnames) if d not in DEFAULT_SKIP_DIRS]
+        cur_dir = Path(dirpath)
+        for fname in sorted(filenames):
+            p = cur_dir / fname
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if rel not in wanted and any(r.applies(rel) for r in rules) and p.stat().st_size <= MAX_FILE_BYTES:
                 try:
                     wanted[rel] = p.read_text(encoding="utf-8", errors="replace")
                 except UnicodeDecodeError:
@@ -426,12 +519,13 @@ def evaluate_diff_policy(
     *,
     changed_files: list[str],
     added_lines: int | None = None,
+    numstat: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Evaluate `diff_policy` rules against a PR's changed file list & optional added-line count."""
+    """Evaluate `diff_policy` / `diff_budget` rules against changed files and added-line counts."""
     findings: list[dict[str, Any]] = []
     norm_changed = [_strip_rel_prefix(p) for p in changed_files if p and p.strip()]
     for rule in rules:
-        if rule.kind != "diff_policy":
+        if rule.kind not in DIFF_KINDS:
             continue
         kept = [p for p in norm_changed if not any(glob_matches(p, ex) for ex in rule.exclude)]
         if rule.max_files is not None and len(kept) > rule.max_files:
@@ -444,16 +538,18 @@ def evaluate_diff_policy(
                 "match": f"files={len(kept)}>{rule.max_files}",
                 "detail": f"{rule.message} (changed_files={len(kept)}, max_files={rule.max_files})",
             })
-        if rule.max_added_lines is not None and added_lines is not None and added_lines > rule.max_added_lines:
-            findings.append({
-                "id": rule.id,
-                "kind": rule.kind,
-                "severity": rule.severity,
-                "file": "",
-                "line": 0,
-                "match": f"added_lines={added_lines}>{rule.max_added_lines}",
-                "detail": f"{rule.message} (added_lines={added_lines}, max_added_lines={rule.max_added_lines})",
-            })
+        if rule.max_added_lines is not None:
+            total_added = sum(numstat.get(p, 0) for p in kept) if numstat is not None else added_lines
+            if total_added is not None and total_added > rule.max_added_lines:
+                findings.append({
+                    "id": rule.id,
+                    "kind": rule.kind,
+                    "severity": rule.severity,
+                    "file": "",
+                    "line": 0,
+                    "match": f"added_lines={total_added}>{rule.max_added_lines}",
+                    "detail": f"{rule.message} (added_lines={total_added}, max_added_lines={rule.max_added_lines})",
+                })
     return findings
 
 
@@ -477,7 +573,7 @@ def self_test_rules(rules: list[LintRule]) -> list[str]:
             if exp not in ("pass", "fail"):
                 errs.append(f"{rule.id}: fixture[{idx}] invalid expect={exp!r}")
                 continue
-            if rule.kind == "diff_policy":
+            if rule.kind in DIFF_KINDS:
                 hits = evaluate_diff_policy(
                     [rule],
                     changed_files=[str(x) for x in (fix.get("changed_files") or [])],

@@ -130,6 +130,33 @@ class DeclarativePipelineSpec(unittest.TestCase):
         self.assertFalse(pipe_lib.is_user_paused_card({"status": "ready", "block_kind": None}))
         self.assertFalse(pipe_lib.is_user_paused_card({"status": "triage", "block_kind": None}))
 
+    def test_before_start_step_active_paused_at_and_slice_stop_reached(self) -> None:
+        body = "Mode: deliver\nStart-At: implement\nStop-After: ci\n## 目標\n只做到 ci\n"
+        spec = pipe_lib.parse_epic_pipeline(body, self.policy, epic_mode="deliver")
+        self.assertTrue(spec["valid"])
+        self.assertTrue(pipe_lib.is_card_before_start("RES", spec, self.policy))
+        self.assertTrue(pipe_lib.is_card_before_start("ARCH", spec, self.policy))
+        self.assertFalse(pipe_lib.is_card_before_start("DEV", spec, self.policy))
+        self.assertTrue(pipe_lib.is_step_active("implement", spec))
+        self.assertTrue(pipe_lib.is_step_active("ci", spec))
+        self.assertFalse(pipe_lib.is_step_active("review", spec))
+        self.assertFalse(pipe_lib.is_step_active("ship", spec))
+
+        marked1, s1 = pipe_lib.mark_epic_paused_at(body, "ci", self.policy, epic_mode="deliver")
+        self.assertEqual(s1["paused_at"], "ci")
+        marked2, s2 = pipe_lib.mark_epic_paused_at(marked1, "ci", self.policy, epic_mode="deliver")
+        self.assertEqual(marked1, marked2)
+        self.assertEqual(s2["paused_at"], "ci")
+
+        cards_running = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo"},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] d", "status": "ready"},
+            "t_ship1": {"id": "t_ship1", "title": "[SHIP] s", "status": "blocked"},
+        }
+        self.assertFalse(pipe_lib.slice_stop_reached(cards_running, "t_ep1", s1, self.policy))
+        cards_running["t_dev1"]["status"] = "done"
+        self.assertTrue(pipe_lib.slice_stop_reached(cards_running, "t_ep1", s1, self.policy))
+
 
 class BinDevflowPipelineIntegration(unittest.TestCase):
     def setUp(self) -> None:
@@ -334,6 +361,107 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         self.assertEqual(resumed, ["t_ship1"])
         after_end = df.plan_cards("b", "t_ep1")
         self.assertEqual(after_end["t_ship1"]["status"], "ready")
+
+    def test_start_at_before_start_and_runtime_stop_gates(self) -> None:
+        import os
+        import sqlite3
+        from unittest import mock
+
+        hermes = self.root / "hermes-gate"
+        board_dir = hermes / "kanban" / "boards" / "b"
+        board_dir.mkdir(parents=True)
+        old_data = os.environ.get("DEVFLOW_HERMES_DATA")
+        os.environ["DEVFLOW_HERMES_DATA"] = str(hermes)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("DEVFLOW_HERMES_DATA", old_data)
+            if old_data is not None else os.environ.pop("DEVFLOW_HERMES_DATA", None)
+        )
+        df = load_devflow(self.root)
+
+        # 1. Start-At: implement rejects runnable [RES] before Start-At
+        cards_early = self._base_cards("Mode: deliver\nStart-At: implement\nStop-After: ci\n")
+        cards_early["t_res1"] = {"id": "t_res1", "title": "[RES] old", "status": "ready", "assignee": "researcher",
+                                 "workspace_kind": "scratch", "parents": [], "children": ["t_dev1"],
+                                 "goal_mode": False, "body": "EPIC: t_ep1\n"}
+        cards_early["t_dev1"]["parents"] = ["t_res1"]
+        found = df.plan_rules("b", "t_ep1", cards_early)
+        self.assertTrue(any(f.startswith("t_res1:") and "Start-At=implement" in f for f in found), found)
+
+        # 2. _maybe_mark_slice_paused stamps Paused-At: ci idempotently once [DEV] completes
+        epic_body = (
+            "Mode: deliver\nStop-After: ci\n## 目標\n只做到 ci\n\n## 驗收\n- AC-1 [api] 200\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        dev_done = {"id": "t_dev1", "title": "[DEV] d", "status": "done", "body": "EPIC: t_ep1\n"}
+        cards_slice = {"t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "body": epic_body}, "t_dev1": dev_done}
+        edits: list[str] = []
+        comments: list[str] = []
+        df.kanban = lambda b, cmd, tid, *a: (
+            edits.append(a[a.index("--body") + 1]) if cmd == "edit"
+            else (comments.append(a[0]) if cmd == "comment" else "")
+        )
+        pipe = df.pipeline_lib.parse_epic_pipeline(epic_body, df.POLICY, epic_mode="deliver")
+        self.assertTrue(df._maybe_mark_slice_paused("b", "t_ep1", cards_slice, pipe))
+        self.assertIn("Paused-At: ci", cards_slice["t_ep1"]["body"])
+        self.assertEqual(len(edits), 1)
+        self.assertIn("devflow epic advance", comments[0])
+        pipe2 = df.pipeline_lib.parse_epic_pipeline(cards_slice["t_ep1"]["body"], df.POLICY, epic_mode="deliver")
+        self.assertFalse(df._maybe_mark_slice_paused("b", "t_ep1", cards_slice, pipe2))
+        self.assertEqual(len(edits), 1)
+
+        # 3. Setup SQLite DB for cmd_pr_submit, tick_prs, and cmd_ship_merge boundary checks
+        db = board_dir / "kanban.db"
+        repo_dir = self.root / "repo"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT, completion_contract TEXT);
+            CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT, metadata TEXT);
+        """)
+        conn.execute("INSERT INTO tasks VALUES ('t_ep1', '[EPIC] e', 'Mode: deliver\nStop-After: implement\n## 目標\nx\n', 'todo', NULL, 'orchestrator', NULL)")
+        conn.execute("INSERT INTO tasks VALUES ('t_dev1', '[DEV] d', 'EPIC: t_ep1\n', 'running', NULL, 'developer', ?)", (REPO,))
+        conn.commit()
+        conn.close()
+
+        # cmd_pr_submit blocks push/PR when Stop-After: implement
+        df._run_card_preflight = lambda a, **kw: ({}, {"ok": True, "checks": {}, "findings": []}, repo_dir, "Kanban: t_dev1")
+        with mock.patch.object(df.preflight_lib, "_git", return_value=types.SimpleNamespace(returncode=0, stdout="feat/x\n", stderr="")), \
+             mock.patch.object(df, "run", return_value=types.SimpleNamespace(returncode=0, stdout="[]", stderr="")), \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            with self.assertRaises(SystemExit) as ctx:
+                df.cmd_pr_submit(types.SimpleNamespace(
+                    slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                    pr_title="feat: x", pr_body="Kanban: t_dev1", pr_body_file=None,
+                    no_test=True, allow_dirty=True, dry_run=True,
+                ))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(json.loads(buf.getvalue())["stage"], "pipeline_stop")
+
+        # tick_prs skips gate() when EPIC sets Stop-After: ci
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE tasks SET body = 'Mode: deliver\nStop-After: ci\n## 目標\nx\n' WHERE id = 't_ep1'")
+        gate_calls: list[int] = []
+        df.gate = lambda *a: gate_calls.append(1)
+        df.kanban = lambda b, cmd, tid, *a: json.dumps({
+            "task": {"status": "review", "body": "EPIC: t_ep1\n"},
+            "runs": [{"status": "review", "metadata": {"published_pr": f"https://github.com/{REPO}/pull/7"}}],
+        })
+        df.tick_prs("b", REPO, [{"id": "t_dev1", "title": "[DEV] d", "assignee": "reviewer", "status": "review", "completion_contract": REPO}])
+        self.assertEqual(gate_calls, [])
+
+        # cmd_ship_merge blocks with pipeline_stop_blocked (exit 7) when EPIC sets Stop-After: review
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE tasks SET body = 'Mode: deliver\nStop-After: review\n## 目標\nx\n' WHERE id = 't_ep1'")
+        df.pr_meta = lambda r, n: {"state": "OPEN", "headRefOid": "a" * 40, "title": "t", "body": "Kanban: t_dev1"}
+        df.deploy_readiness = lambda s: []
+        df.review_problem = lambda *a: None
+        df.resolve_pr_judgment_inputs = lambda *a: ({"epic_id": "t_ep1", "card_id": "t_dev1"}, {}, "fp1")
+        df.gate = lambda *a: ({"fingerprint": "fp1", "findings": [], "needs_human_approval": False}, "ok")
+        buf_ship = io.StringIO()
+        with contextlib.redirect_stdout(buf_ship):
+            with self.assertRaises(SystemExit) as ctx_ship:
+                df.cmd_ship_merge(types.SimpleNamespace(board="b", pr=7))
+        self.assertEqual(ctx_ship.exception.code, 7)
+        self.assertTrue(json.loads(buf_ship.getvalue())["pipeline_stop_blocked"])
 
 
 if __name__ == "__main__":

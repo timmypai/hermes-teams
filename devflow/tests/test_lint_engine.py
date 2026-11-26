@@ -144,6 +144,106 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         errs = lint_engine.self_test_rules(rules)
         self.assertTrue(any("pass" in e for e in errs), errs)
 
+    def test_audit_fixes_prune_worktrees_root_glob_xfile_bypass_js_comments_syntax_and_diff_budget(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="devflow-lint-pr-f-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        # 1. Root-only AGENTS.md vs nested sub/AGENTS.md & .worktrees/x/AGENTS.md
+        (d / ".devflow").mkdir()
+        (d / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY_MANUAL_ONLY=false\n", encoding="utf-8")
+        (d / "AGENTS.md").write_text(
+            "# Root clean policy\n# devflow: allow deploy_policy_mismatch\nmerge 不能觸發部署\n"
+            "正文結尾：merge 不能觸發部署（未豁免）。\n",
+            encoding="utf-8",
+        )
+        (d / "sub").mkdir()
+        (d / "sub" / "AGENTS.md").write_text("merge 不能觸發部署\n", encoding="utf-8")
+        (d / ".worktrees" / "wt1").mkdir(parents=True)
+        (d / ".worktrees" / "wt1" / "AGENTS.md").write_text("merge 不能觸發部署\n", encoding="utf-8")
+
+        wf_rules = lint_engine.load_rules(KIT / "rules" / "workflow")
+        findings = lint_engine.scan_repo(wf_rules, d)
+        # Earlier exempt match on line 3 MUST NOT hide line 4; sub/ and .worktrees/ MUST NOT match root "AGENTS.md"
+        self.assertEqual([f["file"] for f in findings], ["AGENTS.md"], findings)
+        self.assertEqual(findings[0]["line"], 4, findings)
+
+        # Previous-line exemption suppresses the violation cleanly
+        (d / "AGENTS.md").write_text(
+            "# devflow: allow deploy_policy_mismatch\nmerge 不能觸發部署\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(lint_engine.scan_repo(wf_rules, d), [])
+
+        # 2. JS comments stripped, dynamic import() caught, Python SyntaxError fails closed, diff_budget alias
+        rules_dir = d / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "imp.toml").write_text(
+            'id = "imp"\nkind = "import_boundary"\nmessage = "no infra"\n'
+            'include = ["src/**/*.py", "web/**/*.ts"]\nforbidden_modules = ["infra", "infra/"]\n'
+            '[[fixture]]\nexpect = "fail"\npath = "src/a.py"\ntext = "import infra\\n"\n'
+            '[[fixture]]\nexpect = "pass"\npath = "src/a.py"\ntext = "import app\\n"\n',
+            encoding="utf-8",
+        )
+        (rules_dir / "budget.toml").write_text(
+            'id = "budget"\nkind = "diff_budget"\nmessage = "too big"\nmax_files = 1\n'
+            '[[fixture]]\nexpect = "fail"\nchanged_files = ["a.py", "b.py"]\n'
+            '[[fixture]]\nexpect = "pass"\nchanged_files = ["a.py"]\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(lint_engine.self_test_dir(rules_dir), [])
+        imp_rule = lint_engine.load_rule(rules_dir / "imp.toml")
+        hits = lint_engine.scan_files(
+            [imp_rule],
+            {
+                "web/clean.ts": '// import { a } from "infra/x";\n/* export * from "infra/y"; */\nconst u = "https://x";\n',
+                "web/dyn.ts": 'const mod = await import("infra/secret");\n',
+                "src/broken.py": "def bad(:\n",
+            },
+        )
+        by_file = {h["file"]: h for h in hits}
+        self.assertNotIn("web/clean.ts", by_file)
+        self.assertIn("web/dyn.ts", by_file)
+        self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
+
+    def test_preflight_enforces_repo_diff_policy_rules(self) -> None:
+        import json
+        import subprocess
+        from lib import policy as policy_lib  # noqa: E402
+        from lib import preflight as preflight_lib  # noqa: E402
+
+        repo = Path(tempfile.mkdtemp(prefix="devflow-preflight-diff-"))
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@example.com"],
+            ["git", "config", "user.name", "t"],
+        ):
+            subprocess.run(cmd, cwd=repo, check=True)
+        (repo / ".devflow" / "rules").mkdir(parents=True)
+        (repo / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        (repo / ".devflow" / "rules" / "small-diff.toml").write_text(
+            'id = "small-diff"\nkind = "diff_policy"\nseverity = "error"\nmessage = "PR 過大"\n'
+            "max_files = 2\nmax_added_lines = 4\nexclude = [\"tests/**\"]\n"
+            "[[fixture]]\nexpect = \"fail\"\nchanged_files = [\"a.py\", \"b.py\", \"c.py\"]\nadded_lines = 2\n"
+            "[[fixture]]\nexpect = \"pass\"\nchanged_files = [\"a.py\"]\nadded_lines = 2\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+        base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "src").mkdir()
+        (repo / "src" / "a.py").write_text("A = 1\nB = 2\nC = 3\nD = 4\nE = 5\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "over-lines"], cwd=repo, check=True)
+
+        roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
+        pol = policy_lib.load_policy(KIT, roles)
+        card = "## 目標\nx\n\n## 本卡完成\nok\n\n## 驗收\nAllowed-Scope: src/**\n"
+        rep = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=False)
+        self.assertFalse(rep["ok"], rep)
+        self.assertEqual(rep["checks"].get("diff_policy"), "fail")
+        self.assertTrue(any("added_lines=5 > 4" in f or "PR 過大" in f for f in rep["findings"]), rep["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()

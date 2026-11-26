@@ -55,7 +55,7 @@ NO_PROOF = re.compile(r"^\s*No-proof:\s*\S.{9,}$", re.M)
 PROVE_TIMEOUT = int(os.environ.get("DEVFLOW_PROVE_TIMEOUT", "1800"))
 JS_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
 JS_IMPORT_RE = re.compile(
-    r"""(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+|(?:const|let|var)?[^=\n]*=?\s*require\s*\(\s*)['"]([^'"]+)['"]""",
+    r"""(?:(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+)|(?<![\w.$])(?:import|require)\s*\(\s*)['"]([^'"]+)['"]""",
     re.M,
 )
 
@@ -94,7 +94,7 @@ class Rule:
     fixtures: tuple[dict, ...] = ()
 
     def applies(self, path: str) -> bool:
-        if self.kind == "diff_budget":
+        if self.kind in ("diff_budget", "diff_policy"):
             return False
         return (any(g.match(path) for g in self.include)
                 and not any(g.match(path) for g in self.exclude))
@@ -126,7 +126,7 @@ def load_rules() -> list[Rule]:
             if rid in seen:
                 raise ConfigError(f"{f}: duplicate rule id {rid}")
             kind = str(d.get("kind") or "regex").strip().lower()
-            if kind not in ("regex", "import_boundary", "diff_budget"):
+            if kind not in ("regex", "import_boundary", "diff_budget", "diff_policy"):
                 raise ConfigError(f"{f}: invalid kind {kind!r}")
             exclude = tuple(glob_regex(g) for g in [*d.get("exclude", []), *ALWAYS_EXCLUDE])
             if kind == "regex":
@@ -189,32 +189,86 @@ def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
     return clean_imp == forb or clean_imp.startswith(forb + ".") or clean_imp.startswith(forb + "/")
 
 
+def _strip_js_comments(text: str) -> str:
+    """Strip `//...` and `/*...*/` comments while preserving line numbers & string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "/":
+                out.append("  ")
+                i += 2
+                while i < n and text[i] != "\n":
+                    out.append(" ")
+                    i += 1
+                continue
+            if nxt == "*":
+                out.append("  ")
+                i += 2
+                while i < n:
+                    if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                        out.append("  ")
+                        i += 2
+                        break
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_python_imports(path: str, text: str) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError as err:
+        return [], (err.lineno or 1, err.msg or "syntax error")
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.append((node.lineno, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                if base_mod := _resolve_py_relative_import(path, node.module, node.level):
+                    out.append((node.lineno, base_mod))
+                    for alias in node.names:
+                        if alias.name and alias.name != "*":
+                            out.append((node.lineno, f"{base_mod}.{alias.name}"))
+            else:
+                for alias in node.names:
+                    if mod := _resolve_py_relative_import(path, alias.name, node.level):
+                        out.append((node.lineno, mod))
+    return out, None
+
+
 def _extract_imports(path: str, text: str) -> list[tuple[int, str]]:
     ext = PurePosixPath(path).suffix.lower()
     if ext == ".py":
-        try:
-            tree = ast.parse(text, filename=path)
-        except SyntaxError:
-            return []
-        out: list[tuple[int, str]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    out.append((node.lineno, alias.name))
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    if base_mod := _resolve_py_relative_import(path, node.module, node.level):
-                        out.append((node.lineno, base_mod))
-                        for alias in node.names:
-                            if alias.name and alias.name != "*":
-                                out.append((node.lineno, f"{base_mod}.{alias.name}"))
-                else:
-                    for alias in node.names:
-                        if mod := _resolve_py_relative_import(path, alias.name, node.level):
-                            out.append((node.lineno, mod))
-        return out
+        imports, _ = _extract_python_imports(path, text)
+        return imports
     if ext in JS_EXTS:
-        return [(text.count("\n", 0, m.start()) + 1, m.group(1).strip()) for m in JS_IMPORT_RE.finditer(text)]
+        cleaned = _strip_js_comments(text)
+        return [(cleaned.count("\n", 0, m.start()) + 1, m.group(1).strip()) for m in JS_IMPORT_RE.finditer(cleaned)]
     return []
 
 
@@ -239,11 +293,22 @@ def scan_text(rules: list[Rule], path: str, text: str, lessons: set[str]) -> lis
         for r in applicable:
             if r.kind == "regex" and r.hits(line):
                 _record_line_violation(r, path, n, lines, lessons, out)
+    ext = PurePosixPath(path).suffix.lower()
     for r in applicable:
         if r.kind != "import_boundary":
             continue
+        if ext == ".py":
+            imports, syn_err = _extract_python_imports(path, text)
+            if syn_err is not None:
+                lineno, msg = syn_err
+                line = lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
+                out.append(Violation(r.id, path, lineno, line,
+                                     f"Python SyntaxError prevents import_boundary check: {msg}"))
+                continue
+        else:
+            imports = _extract_imports(path, text)
         reported_lines: set[int] = set()
-        for lineno, imp in _extract_imports(path, text):
+        for lineno, imp in imports:
             if lineno in reported_lines:
                 continue
             if any(_import_matches_forbidden(imp, forb) for forb in r.forbidden_modules):
@@ -254,7 +319,7 @@ def scan_text(rules: list[Rule], path: str, text: str, lessons: set[str]) -> lis
 
 def evaluate_diff_budget(rule: Rule, changed_files: list[str], *, added_lines: int | None = None,
                          numstat: dict[str, int] | None = None) -> list[str]:
-    if rule.kind != "diff_budget":
+    if rule.kind not in ("diff_budget", "diff_policy"):
         return []
     kept = [p for p in changed_files if not any(ex.match(p) for ex in rule.exclude)]
     errs: list[str] = []
@@ -275,7 +340,7 @@ def self_test(rules: list[Rule]) -> list[str]:
             errors.append(f"rule {r.id}: needs at least one fixture with expect=fail and one with expect=pass")
         for i, fx in enumerate(r.fixtures, 1):
             exp = fx.get("expect")
-            if r.kind == "diff_budget":
+            if r.kind in ("diff_budget", "diff_policy"):
                 if exp not in ("fail", "pass") or ("changed_files" not in fx and "added_lines" not in fx):
                     errors.append(f"rule {r.id} fixture {i}: needs changed_files/added_lines, expect=fail|pass")
                     continue
@@ -475,7 +540,7 @@ def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> tuple[list[s
     passing gate log shows the evidence instead of only a count."""
     changes = pr_changes(base)
     errs, proofs = [], []
-    budget_rules = [r for r in rules if r.kind == "diff_budget"]
+    budget_rules = [r for r in rules if r.kind in ("diff_budget", "diff_policy")]
     if budget_rules:
         stats = pr_numstat(base)
         for br in budget_rules:

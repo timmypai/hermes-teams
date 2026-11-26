@@ -1540,10 +1540,10 @@ def _owning_epic_body(board: str, task_body: str | None) -> str | None:
     return None
 
 
-def completed_arch_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[dict | None, bool]:
-    """Read raw structured handoff `metadata` from a completed `[ARCH]` run.
+def completed_card_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[dict | None, bool]:
+    """Read raw structured handoff `metadata` from a completed card's latest done run.
 
-    Returns `(metadata_dict_or_none, has_run_record)`. Never swallows empty metadata.
+    Returns `(metadata_dict_or_none, has_run_record)`. Never swallows malformed/empty metadata.
     """
     runs = (parent_card or {}).get("runs") or []
     for run_item in reversed(runs):
@@ -1577,10 +1577,117 @@ def completed_arch_handoff(board: str, parent_id: str, parent_card: dict | None 
     return {}, False
 
 
+def completed_arch_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[dict | None, bool]:
+    """Backward-compatible alias of `completed_card_handoff` for `[ARCH]` callers."""
+    return completed_card_handoff(board, parent_id, parent_card)
+
+
 def completed_arch_target_files(board: str, parent_id: str, parent_card: dict | None = None) -> list[str]:
     """Read planned `target_files` / `allowed_scope` / `file_plan` from a completed `[ARCH]` run's metadata."""
-    meta, _ = completed_arch_handoff(board, parent_id, parent_card)
+    meta, _ = completed_card_handoff(board, parent_id, parent_card)
     return handoff_lib.extract_arch_target_files(meta)
+
+
+def _ancestor_arch_ids(tid: str, cards: dict[str, dict]) -> list[str]:
+    """Find upstream `[ARCH]` ancestors for `tid` (traversing through `[RES]`/`[ADJ]`, stopping at `DEV`/`OPS`/`SHIP`)."""
+    seen: set[str] = set()
+    arch_ids: list[str] = []
+    stack = list((cards.get(tid) or {}).get("parents") or [])
+    while stack:
+        pid = stack.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pc = cards.get(pid)
+        if not pc:
+            continue
+        pk = card_type(pc.get("title") or "")
+        if pk == "ARCH":
+            arch_ids.append(pid)
+        elif pk in ("EPIC", "DEV", "OPS", "SHIP"):
+            continue
+        else:
+            stack.extend(pc.get("parents") or [])
+    return arch_ids
+
+
+def _protected_scope_warnings(board: str, additions: list[str]) -> list[str]:
+    """Non-blocking warning list when newly approved scope globs touch protected/harness paths."""
+    repo_cfg: dict[str, str] = {}
+    with suppress(SystemExit, Exception):
+        repo_cfg = policy_lib.load_repo_config(entry(board).get("path"))
+    extra_protected = policy_lib.repo_protected_paths(repo_cfg)
+    harness_globs = trust_lib.protected_globs(extra_protected)
+    warns: list[str] = []
+    for raw in additions or []:
+        for tok in scope_lib.split_globs(str(raw or "")):
+            norm = handoff_lib._normalize_glob_token(tok)
+            if not norm:
+                continue
+            if trust_lib.is_protected_file(norm, extra_protected) or any(
+                handoff_lib._globs_overlap(norm, pat) for pat in harness_globs
+            ):
+                warns.append(norm)
+    return list(dict.fromkeys(warns))
+
+
+def _epic_pipe_from_body(epic_body: str | None) -> tuple[str | None, dict]:
+    ep_mode, bad_mode = scope_lib.parse_epic_mode(epic_body, policy_lib.valid_modes(POLICY))
+    ep_pipe = pipeline_lib.parse_epic_pipeline(epic_body, POLICY, epic_mode=ep_mode)
+    return bad_mode, ep_pipe
+
+
+def _task_epic_pipe(board: str, task_id: str | None, *, card_body: str | None = None) -> tuple[str | None, str | None, dict | None]:
+    """Return `(epic_id, epic_body, parsed_pipe_spec_or_none)` for `task_id`."""
+    body = card_body
+    if body is None and task_id:
+        db = BOARDS / board / "kanban.db"
+        if db.is_file():
+            with suppress(sqlite3.Error):
+                rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (task_id,))
+                if rows:
+                    body = rows[0].get("body")
+        if body is None:
+            with suppress(SystemExit, Exception):
+                body = (json.loads(kanban(board, "show", task_id, "--json")).get("task") or {}).get("body")
+    m = EPIC_REF.search(body or "")
+    if not m:
+        return None, None, None
+    epic_id = m.group(1)
+    epic_body = _owning_epic_body(board, body)
+    if epic_body is None:
+        return epic_id, None, None
+    bad_mode, ep_pipe = _epic_pipe_from_body(epic_body)
+    if bad_mode:
+        return epic_id, epic_body, None
+    return epic_id, epic_body, ep_pipe
+
+
+def _maybe_mark_slice_paused(board: str, epic: str, cards: dict[str, dict], ep_pipe: dict) -> bool:
+    """Stamp `Paused-At: <stop_after>` once all active cards for a partial slice finish."""
+    if not pipeline_lib.slice_stop_reached(cards, epic, ep_pipe, POLICY):
+        return False
+    stop_after = str(ep_pipe.get("stop_after") or "").strip().lower()
+    if not stop_after or ep_pipe.get("paused_at") == stop_after:
+        return False
+    epic_card = cards.get(epic) or {}
+    cur_body = epic_card.get("body") or ""
+    ep_mode, bad_mode = scope_lib.parse_epic_mode(cur_body, policy_lib.valid_modes(POLICY))
+    if bad_mode:
+        return False
+    new_body, new_spec = pipeline_lib.mark_epic_paused_at(cur_body, stop_after, POLICY, epic_mode=ep_mode)
+    if new_body != cur_body:
+        kanban(board, "edit", epic, "--body", new_body)
+        epic_card["body"] = new_body
+    nxt = new_spec.get("next_step") or "accept"
+    kanban(
+        board,
+        "comment",
+        epic,
+        f"devflow：階段 {stop_after} 已完成（Paused-At: {stop_after}），等待推進；"
+        f"確認要繼續可執行 `devflow epic advance {board} {epic} --stop-after {nxt}` 或 `--to-end`。",
+    )
+    return True
 
 
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
@@ -1633,6 +1740,11 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue
         if tid != epic and pipeline_lib.is_user_paused_card(c):
             continue  # explicitly parked by/for user; do not emit spurious plan/ADJ findings
+        if tid != epic and c["status"] not in ("done", "archived", "scheduled") and pipeline_lib.is_card_before_start(kind, pipe_spec, POLICY):
+            found.append(
+                f"{tid}: [{kind}] 位於 EPIC 流程起點（Start-At={pipe_spec['start_at']}）之前，"
+                "不應處於執行狀態；請確認前置或調整 `Start-At:`"
+            )
         if tid != epic and c["status"] not in ("done", "archived", "scheduled") and pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
             if not (c["status"] == "blocked" and c.get("block_kind") == "dependency"
                     and _card_has_pipeline_stop_hold(board, epic, tid, card=c)):
@@ -1642,6 +1754,20 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                 )
         if c["status"] == "done":
             continue  # history; only pending work can still go wrong
+        if tid != epic and c["status"] not in ("done", "archived"):
+            for pid in c.get("parents", []):
+                pc = cards.get(pid)
+                if not pc or pc.get("status") != "done":
+                    continue
+                pkind = card_type(pc.get("title") or "") or ""
+                if pkind in ("RES", "DEV", "OPS", "SHIP"):
+                    pmeta, has_run = completed_card_handoff(board, pid, pc)
+                    if has_run and (pmeta is None or bool(pmeta)):
+                        if herrs := handoff_lib.validate_card_handoff(pkind, pmeta, POLICY):
+                            found.append(
+                                f"{tid}: [{kind}] 的前置 [{pkind}] {pid} 交接 metadata 不完整"
+                                f"（{'；'.join(herrs)}），請補齊結構化交接欄位"
+                            )
         if tid in body_by_tid:
             found.append(body_by_tid[tid])
         if kind not in ("EPIC", "ADJ", "ADV") and len(laps := adjs_for(tid, cards)) > ADJ_PER_CARD:
@@ -1695,10 +1821,10 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             for scope_prob in scope_lib.allowed_scope_problems(card_contract["allowed_scope"], required=req_scope):
                 found.append(f"{tid}: [{kind}] {scope_prob}")
             if req_scope:
-                for pid in c.get("parents", []):
+                for pid in _ancestor_arch_ids(tid, cards):
                     pc = cards.get(pid)
-                    if pc and card_type(pc.get("title") or "") == "ARCH" and pc.get("status") == "done":
-                        arch_meta, _ = completed_arch_handoff(board, pid, pc)
+                    if pc and pc.get("status") == "done":
+                        arch_meta, _ = completed_card_handoff(board, pid, pc)
                         arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
                         if handoff_errs:
                             found.append(
@@ -2841,6 +2967,9 @@ def tick_board(board: str, st: dict) -> bool:
                 ep_pipe = pipeline_lib.parse_epic_pipeline(epic_body, POLICY, epic_mode=ep_mode)
                 retry = hold_out_of_slice_cards(board, tid, cards, ep_pipe) or retry
                 retry = release_pipeline_stop_holds(board, tid, cards, ep_pipe) or retry
+                pre_pause_fp = plan_fingerprint(tid, cards, repo, board=board)
+                if _maybe_mark_slice_paused(board, tid, cards, ep_pipe) and plans.get(tid) == pre_pause_fp:
+                    plans[tid] = plan_fingerprint(tid, cards, repo, board=board)
                 if fixed := repair_bodies(board, tid, cards):
                     kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
                                                   "補齊缺少的 `goal_mode`）")
@@ -2969,6 +3098,12 @@ def tick_board(board: str, st: dict) -> bool:
             print(f"devflow: release_plan_risk_holds failed for {board}/{eid}: {err}", file=sys.stderr)
     all_stop_epics: set[str] = set()
     for t in tasks:
+        if (
+            t.get("status") not in ("done", "archived")
+            and card_type(t.get("title") or "") == "EPIC"
+            and pipeline_lib.STOP_AFTER_RE.search(t.get("body") or "")
+        ):
+            all_stop_epics.add(t["id"])
         if t.get("status") == "blocked":
             try:
                 ev = block_event(board, t["id"])
@@ -2994,6 +3129,7 @@ def tick_board(board: str, st: dict) -> bool:
                 ep_pipe = pipeline_lib.parse_epic_pipeline(epic_body, POLICY, epic_mode=ep_mode)
                 retry = hold_out_of_slice_cards(board, eid, cards, ep_pipe) or retry
                 retry = release_pipeline_stop_holds(board, eid, cards, ep_pipe) or retry
+                _maybe_mark_slice_paused(board, eid, cards, ep_pipe)
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate pipeline stop-hold reconciliation
             retry = True
             print(f"devflow: release_pipeline_stop_holds failed for {board}/{eid}: {err}", file=sys.stderr)
@@ -3713,7 +3849,12 @@ def answer(
                 die(f"not applied: {err}")
             if new_body != cur_body:
                 kanban(board, "edit", task_id, "--body", new_body)
-            scope_note = f"；已核准新增 Allowed-Scope：{', '.join(add_scope)}（合併後：{', '.join(merged)}）"
+            prot_warns = _protected_scope_warnings(board, add_scope)
+            prot_note = (
+                f"；⚠ 含受保護路徑（{', '.join(prot_warns)}），PR 合併仍須 exact-head 人工核准"
+                if prot_warns else ""
+            )
+            scope_note = f"；已核准新增 Allowed-Scope：{', '.join(add_scope)}（合併後：{', '.join(merged)}）{prot_note}"
         return resume(board, task_id, f"使用者回覆（{where}，問題事件 {block_ev}{scope_note}）：{text}")
 
 
@@ -3738,40 +3879,52 @@ def cmd_scope_add(a) -> None:
             die(str(err))
         if new_body != cur_body:
             kanban(a.slug, "edit", a.task, "--body", new_body)
+        prot_warns = _protected_scope_warnings(a.slug, a.add)
+        prot_note = (
+            f"；⚠ 含受保護路徑（{', '.join(prot_warns)}），合併仍須 exact-head 人工核准"
+            if prot_warns else ""
+        )
         note_tail = f"；備註：{a.note}" if a.note else ""
         kanban(a.slug, "comment", a.task,
-               f"devflow scope add：已核准新增 Allowed-Scope {', '.join(a.add)}（合併後：{', '.join(merged)}）{note_tail}")
-        print(json.dumps({"ok": True, "board": a.slug, "task": a.task, "allowed_scope": merged},
-                         ensure_ascii=False))
+               f"devflow scope add：已核准新增 Allowed-Scope {', '.join(a.add)}（合併後：{', '.join(merged)}）"
+               f"{prot_note}{note_tail}")
+        print(json.dumps({
+            "ok": True,
+            "board": a.slug,
+            "task": a.task,
+            "allowed_scope": merged,
+            **({"protected_warning": prot_warns} if prot_warns else {}),
+        }, ensure_ascii=False))
 
 
 def cmd_epic_advance(a) -> None:
-    """Advance an EPIC's declarative `Start-At:` / `Stop-After:` forward cleanly."""
+    """Advance an EPIC's declarative `Start-At:` / `Stop-After:` forward cleanly under per-EPIC lock."""
     if os.environ.get("HERMES_KANBAN_TASK"):
         die("epic advance runs outside a kanban worker")
-    d = json.loads(kanban(a.board, "show", a.epic, "--json"))
-    task = d.get("task") or {}
-    if card_type(task.get("title") or "") != "EPIC":
-        die(f"{a.epic} is not an [EPIC] card")
-    cur_body = task.get("body") or ""
-    epic_mode, bad_mode = scope_lib.parse_epic_mode(cur_body, policy_lib.valid_modes(POLICY))
-    if bad_mode:
-        die(f"{a.epic}: Mode '{bad_mode}' 無效")
-    try:
-        new_body, new_spec = pipeline_lib.advance_epic_body(
-            cur_body, POLICY, stop_after=a.stop_after, to_end=a.to_end, epic_mode=epic_mode
-        )
-    except ValueError as err:
-        die(str(err))
-    kanban(a.board, "edit", a.epic, "--body", new_body)
-    kanban(a.board, "comment", a.epic,
-           f"devflow epic advance：流程推進至 Start-At={new_spec['start_at']}, Stop-After={new_spec['stop_after']}")
-    with suppress(SystemExit, Exception):
-        cards = plan_cards(a.board, a.epic)
-        if cards:
-            release_pipeline_stop_holds(a.board, a.epic, cards, new_spec)
-    print(json.dumps({"ok": True, "board": a.board, "epic": a.epic, "pipeline": new_spec},
-                     ensure_ascii=False))
+    with locked(card_lock_name(a.board, a.epic)):
+        d = json.loads(kanban(a.board, "show", a.epic, "--json"))
+        task = d.get("task") or {}
+        if card_type(task.get("title") or "") != "EPIC":
+            die(f"{a.epic} is not an [EPIC] card")
+        cur_body = task.get("body") or ""
+        epic_mode, bad_mode = scope_lib.parse_epic_mode(cur_body, policy_lib.valid_modes(POLICY))
+        if bad_mode:
+            die(f"{a.epic}: Mode '{bad_mode}' 無效")
+        try:
+            new_body, new_spec = pipeline_lib.advance_epic_body(
+                cur_body, POLICY, stop_after=a.stop_after, to_end=a.to_end, epic_mode=epic_mode
+            )
+        except ValueError as err:
+            die(str(err))
+        kanban(a.board, "edit", a.epic, "--body", new_body)
+        kanban(a.board, "comment", a.epic,
+               f"devflow epic advance：流程推進至 Start-At={new_spec['start_at']}, Stop-After={new_spec['stop_after']}")
+        with suppress(SystemExit, Exception):
+            cards = plan_cards(a.board, a.epic)
+            if cards:
+                release_pipeline_stop_holds(a.board, a.epic, cards, new_spec)
+        print(json.dumps({"ok": True, "board": a.board, "epic": a.epic, "pipeline": new_spec},
+                         ensure_ascii=False))
 
 
 def cmd_inbox(a) -> None:
@@ -5121,6 +5274,15 @@ def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
             continue
         try:
             d = json.loads(kanban(board, "show", t["id"], "--json"))
+            eid = epic_of(d)
+            if eid:
+                ep_body = next((x.get("body") for x in tasks if x.get("id") == eid), None)
+                if ep_body is None:
+                    ep_body = _owning_epic_body(board, (d.get("task") or {}).get("body"))
+                if ep_body is not None:
+                    ep_bad, ep_pipe = _epic_pipe_from_body(ep_body)
+                    if not ep_bad and ep_pipe.get("valid") and not pipeline_lib.is_step_active("review", ep_pipe):
+                        continue
             n = card_pr(repo, t, d)
             if n is None:
                 continue
@@ -5394,6 +5556,26 @@ def cmd_ship_merge(a) -> None:
         finally:
             die("未合併：PR 或其卡片範圍／政策在判斷後被修改，重跑 devflow ship merge")
     ship_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if ship_epic_body := _epic_body_for_pr(e["slug"], goal_ctx):
+        ep_bad, ep_pipe = _epic_pipe_from_body(ship_epic_body)
+        if not ep_bad and ep_pipe.get("valid") and not pipeline_lib.is_step_active("ship", ep_pipe):
+            ep_id = (goal_ctx or {}).get("epic_id")
+            if ship_task_id and ep_id and (BOARDS / e["slug"] / "kanban.db").is_file():
+                kanban_adapter.hold_task_dependency(
+                    run, HERMES_PY, BOARDS, e["slug"], ship_task_id,
+                    pipeline_stop_hold_reason(ep_id, ep_pipe["stop_after"]),
+                )
+            print(json.dumps({
+                "merged": False,
+                "pipeline_stop_blocked": True,
+                "epic": ep_id,
+                "stop_after": ep_pipe["stop_after"],
+                "reason": (
+                    f"{ep_id or 'EPIC'} 目前設定 Stop-After={ep_pipe['stop_after']}，尚未開放 [SHIP] 合併部署；"
+                    "請先由使用者確認執行 `devflow epic advance` 推進流程"
+                ),
+            }, ensure_ascii=False, indent=2))
+            sys.exit(7)
     if pending_epic := _epic_waiting_on_user(e["slug"], goal_ctx, ship_task_id):
         eid, ereason = pending_epic
         if ship_task_id:
@@ -5660,6 +5842,19 @@ def cmd_pr_submit(a) -> None:
     if not rep["ok"]:
         print(json.dumps({"ok": False, "stage": "preflight", "preflight": rep}, ensure_ascii=False, indent=2))
         sys.exit(1)
+    epic_id, _, ep_pipe = _task_epic_pipe(e["slug"], a.task)
+    if ep_pipe is not None and ep_pipe.get("valid") and not pipeline_lib.is_step_active("ci", ep_pipe):
+        print(json.dumps({
+            "ok": False,
+            "stage": "pipeline_stop",
+            "epic": epic_id,
+            "stop_after": ep_pipe["stop_after"],
+            "error": (
+                f"{epic_id or 'EPIC'} 設定 Stop-After={ep_pipe['stop_after']}，尚未開放推分支開 PR / 跑 CI；"
+                "請先完成階段回報或執行 `devflow epic advance` 推進流程"
+            ),
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
     if a.dry_run:
         print(json.dumps({"ok": True, "stage": "preflight", "dry_run": True, "preflight": rep},
                          ensure_ascii=False, indent=2))
@@ -5740,6 +5935,71 @@ def cmd_pr_submit(a) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def _decode_run_meta(raw: Any) -> dict | None:
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            return None
+        return decoded if isinstance(decoded, dict) else {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _resolve_check_card_arch_parents(board_arg: str, parent_ids: list[str]) -> list[tuple[str, dict | None]]:
+    """Walk upstream from `--parent` through non-implementing cards (`RES`/`ADJ`) to find done `[ARCH]` ancestors."""
+    seen: set[str] = set()
+    queue = list(parent_ids)
+    out: list[tuple[str, dict | None]] = []
+    db = BOARDS / board_arg / "kanban.db"
+    has_links = False
+    if db.is_file():
+        with suppress(sqlite3.Error):
+            tables = {r["name"] for r in board_rows(board_arg, "SELECT name FROM sqlite_master WHERE type='table'")}
+            has_links = "task_links" in tables
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        title, status = "", ""
+        parents: list[str] = []
+        arch_meta: dict | None = {}
+        has_run = False
+        if db.is_file():
+            with suppress(sqlite3.Error):
+                prows = board_rows(board_arg, "SELECT title, status FROM tasks WHERE id = ?", (pid,))
+                if prows:
+                    title = prows[0].get("title") or ""
+                    status = prows[0].get("status") or ""
+                    if card_type(title) == "ARCH" and status == "done":
+                        arch_meta, has_run = completed_card_handoff(board_arg, pid)
+                    elif has_links:
+                        lrows = board_rows(board_arg, "SELECT parent_id FROM task_links WHERE child_id = ?", (pid,))
+                        parents = [r["parent_id"] for r in lrows if r.get("parent_id")]
+        if not has_run and not title:
+            with suppress(SystemExit, Exception):
+                pd = json.loads(kanban(board_arg, "show", pid, "--json"))
+                pt = pd.get("task") or {}
+                title = pt.get("title") or ""
+                status = pt.get("status") or ""
+                if card_type(title) == "ARCH" and status == "done":
+                    arch_meta, has_run = completed_card_handoff(
+                        board_arg, pid, {"runs": pd.get("runs") or []}
+                    )
+                else:
+                    raw_ps = pd.get("parents") or pt.get("parents") or []
+                    parents = [p["id"] if isinstance(p, dict) else str(p) for p in raw_ps if p]
+        if not title:
+            continue
+        pk = card_type(title)
+        if pk == "ARCH":
+            if status == "done":
+                out.append((pid, arch_meta))
+        elif pk not in ("EPIC", "DEV", "OPS", "SHIP"):
+            queue.extend(parents)
+    return out
+
+
 def cmd_check_card(a) -> None:
     """Fail-fast card schema & body hygiene check before creating or editing a Kanban card."""
     body = Path(a.body_file).read_text(encoding="utf-8") if a.body_file else (a.body if a.body is not None else sys.stdin.read())
@@ -5766,28 +6026,7 @@ def cmd_check_card(a) -> None:
             parent_ids = list(getattr(a, "parent", None) or [])
             if req_scope and board_arg and parent_ids:
                 test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
-                for pid in parent_ids:
-                    is_arch = False
-                    arch_meta: dict | None = {}
-                    has_run = False
-                    db = BOARDS / board_arg / "kanban.db"
-                    if db.is_file():
-                        with suppress(sqlite3.Error):
-                            prows = board_rows(board_arg, "SELECT title, status FROM tasks WHERE id = ?", (pid,))
-                            if prows and card_type(prows[0].get("title") or "") == "ARCH" and prows[0].get("status") == "done":
-                                is_arch = True
-                                arch_meta, has_run = completed_arch_handoff(board_arg, pid)
-                    if not has_run and not is_arch:
-                        with suppress(SystemExit, Exception):
-                            pd = json.loads(kanban(board_arg, "show", pid, "--json"))
-                            pt = pd.get("task") or {}
-                            if card_type(pt.get("title") or "") == "ARCH" and pt.get("status") == "done":
-                                is_arch = True
-                                arch_meta, has_run = completed_arch_handoff(
-                                    board_arg, pid, {"runs": pd.get("runs") or []}
-                                )
-                    if not is_arch:
-                        continue
+                for pid, arch_meta in _resolve_check_card_arch_parents(board_arg, parent_ids):
                     arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
                     if handoff_errs:
                         findings.append(
@@ -5805,6 +6044,81 @@ def cmd_check_card(a) -> None:
             findings.append(why)
     print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
                      ensure_ascii=False, indent=2))
+    if findings:
+        sys.exit(1)
+
+
+def cmd_check_handoff(a) -> None:
+    """Validate structured step handoff `metadata` against `policy.handoff_schemas`."""
+    meta: Any = {}
+    findings: list[str] = []
+    explicit_meta = False
+    if getattr(a, "metadata_file", None):
+        explicit_meta = True
+        try:
+            meta = json.loads(Path(a.metadata_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            findings.append(f"無法讀取或解析 metadata 檔：{err}")
+    elif getattr(a, "metadata", None) is not None:
+        explicit_meta = True
+        try:
+            meta = json.loads(a.metadata)
+        except ValueError as err:
+            findings.append(f"無法解析 --metadata JSON：{err}")
+
+    card_title = ""
+    card_runs: list[dict] = []
+    db = BOARDS / a.board / "kanban.db"
+    if db.is_file():
+        with suppress(sqlite3.Error):
+            rows = board_rows(a.board, "SELECT title FROM tasks WHERE id = ?", (a.task,))
+            if rows:
+                card_title = rows[0].get("title") or ""
+    if not card_title or not explicit_meta:
+        with suppress(SystemExit, Exception):
+            pd = json.loads(kanban(a.board, "show", a.task, "--json"))
+            pt = pd.get("task") or {}
+            card_title = card_title or (pt.get("title") or "")
+            card_runs = list(pd.get("runs") or [])
+
+    if not card_title:
+        findings.append(f"找不到任務卡 {a.board}/{a.task}")
+    kind = card_type(card_title) if card_title else ""
+    step = handoff_lib.step_for_card_kind(kind)
+    if card_title and not step:
+        findings.append(f"{a.task} 的卡型 [{kind or '?'}] 不需要步驟交接 schema（適用：RES/ARCH/DEV/OPS/SHIP）")
+
+    if not findings and not explicit_meta:
+        loaded_meta, has_run = completed_card_handoff(a.board, a.task, {"runs": card_runs} if card_runs else None)
+        if not has_run:
+            for r in reversed(card_runs):
+                if isinstance(r, dict) and r.get("metadata") is not None:
+                    loaded_meta = _decode_run_meta(r.get("metadata"))
+                    has_run = True
+                    break
+            if not has_run and db.is_file():
+                with suppress(sqlite3.Error):
+                    rrows = board_rows(
+                        a.board, "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (a.task,)
+                    )
+                    if rrows:
+                        loaded_meta = _decode_run_meta(rrows[0].get("metadata"))
+                        has_run = True
+        if not has_run:
+            findings.append(f"{a.task} 尚無 run metadata，請提供 --metadata 或先記錄結構化交接")
+        else:
+            meta = loaded_meta
+
+    if not findings:
+        findings.extend(handoff_lib.validate_card_handoff(kind, meta, POLICY))
+    print(json.dumps({
+        "ok": not findings,
+        "board": a.board,
+        "task": a.task,
+        "kind": kind,
+        "step": step,
+        "findings": findings,
+    }, ensure_ascii=False, indent=2))
     if findings:
         sys.exit(1)
 
@@ -5890,6 +6204,11 @@ def main() -> None:
     p.add_argument("--board", help="optional repo slug to apply repo-specific .devflow/config.env policy")
     p.add_argument("--parent", action="append", default=[], help="optional parent card ID(s) to check [ARCH] target_files coverage")
     p.set_defaults(fn=cmd_check_card)
+    p = check.add_parser("handoff", help="validate structured handoff metadata for a step card (repro/design/implement/ship)")
+    p.add_argument("board"); p.add_argument("task")
+    p.add_argument("--metadata", help="inline JSON metadata object to validate")
+    p.add_argument("--metadata-file", help="path to JSON metadata file to validate")
+    p.set_defaults(fn=cmd_check_handoff)
     p = sub.add_parser("preflight", help="developer pre-flight deterministic checks before pushing PR or requesting review")
     p.add_argument("slug"); p.add_argument("task", nargs="?")
     p.add_argument("--dir", default=".", help="worktree root (default: cwd)")

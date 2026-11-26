@@ -4,12 +4,36 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from lib import policy as policy_lib
-from lib import scope as scope_lib
+from . import policy as policy_lib
+from . import scope as scope_lib
 
 _EPIC_ACCEPT_HEADING_RE = re.compile(r"^##\s*驗收[ \t]*$", re.M)
 _NEXT_HEADING_RE = re.compile(r"^##\s+\S", re.M)
 _BULLET_PREFIX_RE = re.compile(r"^\s*[-*]\s+")
+CARD_KIND_STEPS: dict[str, str] = {
+    "RES": "repro",
+    "ARCH": "design",
+    "DEV": "implement",
+    "OPS": "implement",
+    "SHIP": "ship",
+}
+
+
+def step_for_card_kind(kind: str) -> str | None:
+    """Map a card prefix (`RES`/`ARCH`/`DEV`/`OPS`/`SHIP`) to its handoff schema step name."""
+    return CARD_KIND_STEPS.get((kind or "").strip().upper())
+
+
+def validate_card_handoff(kind: str, metadata: Any, policy: dict[str, Any] | None = None) -> list[str]:
+    """Validate structured `metadata` for a completed card based on its card kind."""
+    upper = (kind or "").strip().upper()
+    if upper == "ARCH":
+        _, errs = validate_arch_handoff(metadata, policy)
+        return errs
+    step = step_for_card_kind(upper)
+    if not step:
+        return []
+    return validate_handoff(step, metadata, policy)
 
 
 def _is_empty_handoff_value(value: Any) -> bool:
@@ -141,8 +165,54 @@ def missing_arch_scope_files(
     return missing
 
 
-def _wildcard_prefix(pat: str) -> str:
-    return pat.split("*", 1)[0].rstrip("/")
+def _parse_glob_scope(raw_pat: str) -> tuple[str, bool, str, bool]:
+    """Return `(literal_dir_prefix, recursive_dirs, leaf_pattern, has_wildcards)`."""
+    raw = (raw_pat or "").strip().strip("`'\"")
+    trailing_slash = raw.endswith("/")
+    pat = _normalize_glob_token(raw)
+    has_wild = trailing_slash or any(ch in pat for ch in ("*", "?", "["))
+    if trailing_slash:
+        return pat, True, "*", True
+    if "**" in pat:
+        prefix, _, suffix = pat.partition("**")
+        prefix = prefix.rstrip("/")
+        suffix = suffix.lstrip("/")
+        leaf = suffix.rsplit("/", 1)[-1] if suffix else "*"
+        return prefix, True, (leaf or "*"), True
+    if "/" not in pat:
+        # In `scope.match_glob`, Python `fnmatch` lets `*` cross `/` (e.g. `*.yml` matches subdirs).
+        if has_wild:
+            return "", True, pat, True
+        return pat, True, pat, False
+    parts = pat.split("/")
+    lit_dirs: list[str] = []
+    for part in parts[:-1]:
+        if any(ch in part for ch in ("*", "?", "[")):
+            break
+        lit_dirs.append(part)
+    dir_prefix = "/".join(lit_dirs)
+    rem = parts[len(lit_dirs) :]
+    recursive = len(rem) > 1 or any(any(ch in seg for ch in ("*", "?", "[")) for seg in rem[:-1])
+    return dir_prefix, recursive, (rem[-1] if rem else "*"), has_wild
+
+
+def _leaf_ext(leaf: str) -> str | None:
+    if "." not in leaf or leaf in (".", ".."):
+        return None
+    ext = leaf.rsplit(".", 1)[-1].lower()
+    if not ext or any(ch in ext for ch in ("*", "?", "[")):
+        return None
+    return "." + ext
+
+
+def _dir_prefixes_can_overlap(da: str, rec_a: bool, db: str, rec_b: bool) -> bool:
+    if da == db:
+        return True
+    if rec_a and (not da or db == da or db.startswith(da + "/")):
+        return True
+    if rec_b and (not db or da == db or da.startswith(db + "/")):
+        return True
+    return False
 
 
 def _globs_overlap(a: str, b: str) -> bool:
@@ -152,15 +222,19 @@ def _globs_overlap(a: str, b: str) -> bool:
         return False
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
-    a_is_wild = "*" in pa or a.strip().endswith("/")
-    b_is_wild = "*" in pb or b.strip().endswith("/")
-    a_pre = _wildcard_prefix(pa)
-    b_pre = _wildcard_prefix(pb)
-    if a_is_wild and a_pre and (pb == a_pre or pb.startswith(a_pre + "/")):
-        return True
-    if b_is_wild and b_pre and (pa == b_pre or pa.startswith(b_pre + "/")):
-        return True
-    return False
+
+    da, rec_a, leaf_a, wild_a = _parse_glob_scope(a)
+    db, rec_b, leaf_b, wild_b = _parse_glob_scope(b)
+    if not (wild_a and wild_b):
+        return False
+    if not _dir_prefixes_can_overlap(da, rec_a, db, rec_b):
+        return False
+
+    ext_a = _leaf_ext(leaf_a)
+    ext_b = _leaf_ext(leaf_b)
+    if ext_a and ext_b and ext_a != ext_b:
+        return False
+    return True
 
 
 def merge_allowed_scope_into_body(

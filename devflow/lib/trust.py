@@ -30,6 +30,30 @@ CONFIG_AND_GATE_RE = re.compile(
 # Single source of truth for protected harness / gate files shared by preflight, check pr, and ship merge.
 TRUSTED_HARNESS_RE = re.compile(CONFIG_AND_GATE_RE.pattern + "|" + DELIVERY_FILES_RE.pattern)
 
+CANONICAL_PROTECTED_GLOBS: tuple[str, ...] = (
+    ".github/workflows/**",
+    ".devflow/config.env",
+    ".devflow/check.py",
+    ".devflow/check.sh",
+    ".devflow/test.sh",
+    ".devflow/rules/**",
+    ".devflow/deploy.sh",
+    ".devflow/deploy-build.sh",
+    ".devflow/deploy-post.sh",
+    ".devflow/capture.sh",
+    ".devflow/redact.py",
+    ".devflow/up.sh",
+    ".devflow/playwright.sh",
+    ".devflow/operate.sh",
+    ".devflow/acceptance.py",
+    ".devflow/verify-base.sh",
+)
+
+
+def protected_globs(extra_patterns: list[str] | None = None) -> list[str]:
+    """Return canonical protected harness/gate globs plus repo-specific `DEVFLOW_PROTECTED_PATHS`."""
+    return list(dict.fromkeys([*CANONICAL_PROTECTED_GLOBS, *(extra_patterns or [])]))
+
 # Exact-head human approval directive under EPIC `## 使用者決定`:
 #   - 核准保護檔變更：PR #12 <40-hex-sha>
 HUMAN_APPROVAL_RE = re.compile(
