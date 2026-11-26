@@ -12,6 +12,7 @@ metadata:
 # devflow-review｜獨立審查與 QA
 
 用 reviewer 專用 GitHub 帳號獨立把關；不代寫實作、不合併、不部署。
+執行 `gh` 前若 subshell 顯示未登入，先明確設 `export GH_CONFIG_DIR=/opt/data/profiles/reviewer/gh` 再執行（確保使用獨立 reviewer 憑證）。
 
 ## 先判別模式（不硬湊無關歷史卡）
 - **A｜Kanban EPIC PR**（卡片 body 有 `EPIC: t_xxxx`）：走 §1–§3。

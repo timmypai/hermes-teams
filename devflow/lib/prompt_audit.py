@@ -6,25 +6,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-# Generic workflow-conflict patterns in a target repo's AGENTS.md / CLAUDE.md that clash with
-# devflow's standard developer -> PR -> reviewer -> devops [SHIP] pipeline.
-REPO_WORKFLOW_CONFLICTS: tuple[tuple[str, re.Pattern[str], str], ...] = (
-    (
-        "sole_publisher_conflict",
-        re.compile(r"devops\s*(?:為|是)?\s*唯一\s*(?:source\s*/?\s*publisher|publisher)", re.I),
-        "宣告 devops 為唯一 publisher 會與 devflow developer 推送分支開 PR 衝突（易造成 DEV/SHIP 互鎖）；請移除或明確限定僅適用發版",
-    ),
-    (
-        "forbids_pr_creation",
-        re.compile(r"(?:僅本地修改.{0,30}(?:未取得|不得).{0,20}(?:\bPR\b|GitHub\s*寫入)|未獲.{0,15}授權不得.{0,15}\bPR\b)", re.I),
-        "禁止建立 PR 或僅限本地修改的靜態條文會阻擋 developer 送審；授權應由 EPIC / devflow 狀態機控制",
-    ),
-    (
-        "draft_pr_only",
-        re.compile(r"(?:準備|只開|一律開)\s*\*{0,2}Draft\s+PR\*{0,2}", re.I),
-        "要求一律開 Draft PR 會與 devflow 自動送審流程不一致；請移除並由 devflow 控制送審",
-    ),
-)
+from lib import lint_engine
+
+WORKFLOW_RULES_DIR = Path(__file__).resolve().parents[1] / "rules" / "workflow"
 
 # Phrases that must NEVER appear in developer auto-loaded prompts (direct contradictions with devflow).
 FORBIDDEN_DEVELOPER_PHRASES: tuple[tuple[str, str], ...] = (
@@ -36,29 +20,28 @@ FORBIDDEN_DEVELOPER_PHRASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def scan_repo_agents_conflicts(repo_dir: Path | str | None) -> list[dict[str, str]]:
-    """Read-only scan of `<repo>/AGENTS.md` and `<repo>/CLAUDE.md` for workflow directives that
-    conflict with devflow's role ownership or PR pipeline."""
+def scan_repo_agents_conflicts(
+    repo_dir: Path | str | None,
+    *,
+    rules_dir: Path | str | None = None,
+) -> list[dict[str, str]]:
+    """Read-only scan of `<repo>` using declarative `rules/workflow/*.toml` rules."""
     if not repo_dir:
         return []
     root = Path(repo_dir)
     if not root.is_dir():
         return []
-    warnings: list[dict[str, str]] = []
-    for rel in ("AGENTS.md", "CLAUDE.md"):
-        p = root / rel
-        if not p.is_file():
-            continue
-        text = p.read_text(encoding="utf-8", errors="replace")
-        for cid, pat, detail in REPO_WORKFLOW_CONFLICTS:
-            if m := pat.search(text):
-                warnings.append({
-                    "id": cid,
-                    "file": rel,
-                    "match": m.group(0)[:80],
-                    "detail": detail,
-                })
-    return warnings
+    rdir = Path(rules_dir) if rules_dir is not None else WORKFLOW_RULES_DIR
+    rules = lint_engine.load_rules(rdir)
+    return [
+        {
+            "id": f["id"],
+            "file": f["file"],
+            "match": f["match"],
+            "detail": f["detail"],
+        }
+        for f in lint_engine.scan_repo(rules, root)
+    ]
 
 
 def role_auto_load_chars(kit_root: Path, roles_data: dict[str, Any] | None = None) -> dict[str, int]:
@@ -87,7 +70,7 @@ def role_auto_load_chars(kit_root: Path, roles_data: dict[str, Any] | None = Non
 
 
 def audit_kit_prompts(kit_root: Path) -> dict[str, Any]:
-    """Audit all kit souls, skills, and codex instructions against declarative prompt budgets & SSOT rules."""
+    """Audit all kit souls, skills, declarative workflow lint rules, and codex instructions."""
     roles_data = json.loads((kit_root / "roles.json").read_text(encoding="utf-8"))
     policy = roles_data.get("policy") or {}
     budget = int(policy.get("max_role_prompt_chars") or 12000)
@@ -97,6 +80,14 @@ def audit_kit_prompts(kit_root: Path) -> dict[str, Any]:
     for role, chars in sorted(sizes.items()):
         if chars > budget:
             findings.append(f"role {role!r} auto_load prompt {chars} 字元超過上限 {budget}")
+
+    # Verify declarative workflow TOML rules exist and pass their built-in fixtures
+    rules_dir = kit_root / "rules" / "workflow"
+    if not rules_dir.is_dir() or not list(rules_dir.glob("*.toml")):
+        findings.append("缺少宣告式規則：rules/workflow/*.toml")
+    else:
+        for err in lint_engine.self_test_dir(rules_dir):
+            findings.append(f"rules/workflow 自測失敗：{err}")
 
     # Verify devflow-chat and devflow-cli exist and are NOT auto-loaded into background workers
     for sk in ("devflow-chat", "devflow-cli"):
@@ -131,7 +122,7 @@ def audit_kit_prompts(kit_root: Path) -> dict[str, Any]:
             findings.append(f"{p.relative_to(kit_root)} 含「禁止寫檔案路徑」與必填 Allowed-Scope 矛盾")
 
     # Verify devflow-chat is the SSOT for approve/approve-plan detailed protocol
-    chat_md = (kit_root / "skills" / "devflow-chat" / "SKILL.md")
+    chat_md = kit_root / "skills" / "devflow-chat" / "SKILL.md"
     if chat_md.is_file():
         chat_txt = chat_md.read_text(encoding="utf-8")
         for req in ("devflow approve ", "--request", "嚴禁改查", "絕不執行 `devflow approve`",
@@ -146,9 +137,15 @@ def audit_kit_prompts(kit_root: Path) -> dict[str, Any]:
         if "嚴禁在 PR 層 `[ADV]` 另建 `[ADJ]`" not in intake_txt:
             findings.append("skills/devflow-intake/SKILL.md 缺少「嚴禁在 PR 層 [ADV] 另建 [ADJ]」（應交 reviewer 單線退件）")
 
-    # Verify no hardcoded project names or historical 8-hex card IDs in live docs/souls/skills
+    # Verify no hardcoded project names or historical 8-hex card IDs in live docs/souls/skills/rules
     card_id_re = re.compile(r"\bt_[0-9a-f]{8}\b")
-    for p in [kit_root / "README.md", *sorted((kit_root / "souls").glob("*.md")), *sorted((kit_root / "skills").glob("*/SKILL.md"))]:
+    scan_targets = [
+        kit_root / "README.md",
+        *sorted((kit_root / "souls").glob("*.md")),
+        *sorted((kit_root / "skills").glob("*/SKILL.md")),
+        *sorted(rules_dir.glob("*.toml")),
+    ]
+    for p in scan_targets:
         if not p.is_file():
             continue
         txt = p.read_text(encoding="utf-8")

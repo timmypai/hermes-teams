@@ -1,0 +1,18 @@
+id = "forbids_pr_creation"
+kind = "regex"
+severity = "warn"
+message = "禁止建立 PR 或僅限本地修改的靜態條文會阻擋 developer 送審；授權應由 EPIC / devflow 狀態機控制"
+include = ["AGENTS.md", "CLAUDE.md"]
+patterns = [
+  "(?:僅本地修改.{0,30}(?:未取得|不得).{0,20}(?:\\bPR\\b|GitHub\\s*寫入)|未獲.{0,15}授權不得.{0,15}\\bPR\\b)",
+]
+
+[[fixture]]
+expect = "fail"
+path = "AGENTS.md"
+text = "當前工作僅本地修改，並未取得建立 issue／PR 或其他 GitHub 寫入的新授權。\n"
+
+[[fixture]]
+expect = "pass"
+path = "AGENTS.md"
+text = "未獲本次寫入授權不得自行開遠端 issue／Project 或更改設定。\n"

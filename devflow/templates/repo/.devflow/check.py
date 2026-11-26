@@ -12,8 +12,11 @@ Run from the repo root (`.devflow/check.sh`). Exit 0 = pass, 1 = findings, 2 = b
                              `No-proof: <reason>` in the PR body skips the proof (reviewer judges it).
 
 Rules: .devflow/rules/<id>.toml
+  kind = "regex" (default) | "import_boundary" | "diff_budget"
   id, message, include = [globs], exclude = [globs], patterns = [regex, ...]
-  [[fixture]] path, text, expect = "fail" | "pass"   (at least one of each; proves the rule fires)
+  import_boundary: forbidden_modules = [prefix, ...]
+  diff_budget: max_files = N, max_added_lines = N (checked during `--pr`)
+  [[fixture]] path, text, expect = "fail" | "pass"   (diff_budget: changed_files, added_lines)
 Exemption: `devflow: allow <rule-id> L-NNNN` on the offending line or the line above;
   L-NNNN must be an existing lesson. Baseline (.devflow/rules/baseline.json) hides legacy
   violations by (rule, path, line text) so only new ones fail.
@@ -21,6 +24,7 @@ Lessons: .devflow/lessons/L-NNNN.toml (see validate_lesson).
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -31,7 +35,7 @@ import tempfile
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 
 RULES_DIR = Path(".devflow/rules")
@@ -49,6 +53,11 @@ LESSON_LINE = re.compile(r"^\s*Lesson:\s*(L-\d{4})\s*$", re.M)
 NO_LESSON = re.compile(r"^\s*No-lesson:\s*\S.{9,}$", re.M)
 NO_PROOF = re.compile(r"^\s*No-proof:\s*\S.{9,}$", re.M)
 PROVE_TIMEOUT = int(os.environ.get("DEVFLOW_PROVE_TIMEOUT", "1800"))
+JS_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
+JS_IMPORT_RE = re.compile(
+    r"""(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+|(?:const|let|var)?[^=\n]*=?\s*require\s*\(\s*)['"]([^'"]+)['"]""",
+    re.M,
+)
 
 
 class ConfigError(Exception):
@@ -75,12 +84,18 @@ def glob_regex(glob: str) -> re.Pattern:
 class Rule:
     id: str
     message: str
-    include: tuple[re.Pattern, ...]
-    exclude: tuple[re.Pattern, ...]
-    patterns: tuple[re.Pattern, ...]
-    fixtures: tuple[dict, ...]
+    kind: str = "regex"
+    include: tuple[re.Pattern, ...] = ()
+    exclude: tuple[re.Pattern, ...] = ()
+    patterns: tuple[re.Pattern, ...] = ()
+    forbidden_modules: tuple[str, ...] = ()
+    max_files: int | None = None
+    max_added_lines: int | None = None
+    fixtures: tuple[dict, ...] = ()
 
     def applies(self, path: str) -> bool:
+        if self.kind == "diff_budget":
+            return False
         return (any(g.match(path) for g in self.include)
                 and not any(g.match(path) for g in self.exclude))
 
@@ -110,18 +125,105 @@ def load_rules() -> list[Rule]:
                 raise ConfigError(f"{f}: id {rid!r} must equal file name")
             if rid in seen:
                 raise ConfigError(f"{f}: duplicate rule id {rid}")
-            if not d.get("patterns") or not d.get("include"):
-                raise ConfigError(f"{f}: needs include and patterns")
-            rules.append(Rule(
-                id=rid, message=d["message"],
-                include=tuple(glob_regex(g) for g in d["include"]),
-                exclude=tuple(glob_regex(g) for g in [*d.get("exclude", []), *ALWAYS_EXCLUDE]),
-                patterns=tuple(re.compile(p) for p in d["patterns"]),
-                fixtures=tuple(d.get("fixture", []))))
+            kind = str(d.get("kind") or "regex").strip().lower()
+            if kind not in ("regex", "import_boundary", "diff_budget"):
+                raise ConfigError(f"{f}: invalid kind {kind!r}")
+            exclude = tuple(glob_regex(g) for g in [*d.get("exclude", []), *ALWAYS_EXCLUDE])
+            if kind == "regex":
+                if not d.get("patterns") or not d.get("include"):
+                    raise ConfigError(f"{f}: needs include and patterns")
+                rules.append(Rule(
+                    id=rid, message=d["message"], kind=kind,
+                    include=tuple(glob_regex(g) for g in d["include"]),
+                    exclude=exclude,
+                    patterns=tuple(re.compile(p) for p in d["patterns"]),
+                    fixtures=tuple(d.get("fixture", []))))
+            elif kind == "import_boundary":
+                mods = d.get("forbidden_modules")
+                if not mods or not d.get("include") or not isinstance(mods, list):
+                    raise ConfigError(f"{f}: needs include and forbidden_modules")
+                rules.append(Rule(
+                    id=rid, message=d["message"], kind=kind,
+                    include=tuple(glob_regex(g) for g in d["include"]),
+                    exclude=exclude,
+                    forbidden_modules=tuple(str(m).strip() for m in mods if str(m).strip()),
+                    fixtures=tuple(d.get("fixture", []))))
+            else:
+                mf, ml = d.get("max_files"), d.get("max_added_lines")
+                if mf is None and ml is None:
+                    raise ConfigError(f"{f}: diff_budget needs max_files or max_added_lines")
+                if mf is not None and (not isinstance(mf, int) or mf <= 0):
+                    raise ConfigError(f"{f}: max_files must be positive integer")
+                if ml is not None and (not isinstance(ml, int) or ml <= 0):
+                    raise ConfigError(f"{f}: max_added_lines must be positive integer")
+                rules.append(Rule(
+                    id=rid, message=d["message"], kind=kind,
+                    exclude=exclude, max_files=mf, max_added_lines=ml,
+                    fixtures=tuple(d.get("fixture", []))))
             seen.add(rid)
         except (KeyError, tomllib.TOMLDecodeError, re.error) as e:
             raise ConfigError(f"{f}: {e}") from e
     return rules
+
+
+def _resolve_py_relative_import(rel_path: str, module: str | None, level: int) -> str:
+    if level <= 0:
+        return module or ""
+    parts = list(PurePosixPath(rel_path).parent.parts)
+    if parts == ["."]:
+        parts = []
+    climb = level - 1
+    base = parts[:-climb] if climb and climb <= len(parts) else ([] if climb else parts)
+    return ".".join([*base, module]) if module else ".".join(base)
+
+
+def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
+    clean_imp, forb = (imp or "").strip(), (forbidden or "").strip()
+    if not clean_imp or not forb:
+        return False
+    if forb.endswith("/"):
+        return clean_imp == forb.rstrip("/") or clean_imp.startswith(forb)
+    if "/" in clean_imp and "/" not in forb:
+        dotted = clean_imp.replace("/", ".")
+        return dotted == forb or dotted.startswith(forb + ".")
+    return clean_imp == forb or clean_imp.startswith(forb + ".") or clean_imp.startswith(forb + "/")
+
+
+def _extract_imports(path: str, text: str) -> list[tuple[int, str]]:
+    ext = PurePosixPath(path).suffix.lower()
+    if ext == ".py":
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError:
+            return []
+        out: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    out.append((node.lineno, alias.name))
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    if mod := _resolve_py_relative_import(path, node.module, node.level):
+                        out.append((node.lineno, mod))
+                else:
+                    for alias in node.names:
+                        if mod := _resolve_py_relative_import(path, alias.name, node.level):
+                            out.append((node.lineno, mod))
+        return out
+    if ext in JS_EXTS:
+        return [(text.count("\n", 0, m.start()) + 1, m.group(1).strip()) for m in JS_IMPORT_RE.finditer(text)]
+    return []
+
+
+def _record_line_violation(r: Rule, path: str, n: int, lines: list[str], lessons: set[str], out: list[Violation]) -> None:
+    line = lines[n - 1] if 1 <= n <= len(lines) else ""
+    allowed = [m for src in (line, lines[n - 2] if n > 1 else "")
+               for m in ALLOW.finditer(src) if m.group(1) == r.id]
+    if not allowed:
+        out.append(Violation(r.id, path, n, line, r.message))
+    elif not any(m.group(2) in lessons for m in allowed):
+        out.append(Violation(r.id, path, n, line,
+                             f"exemption cites missing lesson {allowed[0].group(2)}"))
 
 
 def scan_text(rules: list[Rule], path: str, text: str, lessons: set[str]) -> list[Violation]:
@@ -132,16 +234,30 @@ def scan_text(rules: list[Rule], path: str, text: str, lessons: set[str]) -> lis
     lines = text.splitlines()
     for n, line in enumerate(lines, 1):
         for r in applicable:
-            if not r.hits(line):
-                continue
-            allowed = [m for src in (line, lines[n - 2] if n > 1 else "")
-                       for m in ALLOW.finditer(src) if m.group(1) == r.id]
-            if not allowed:
-                out.append(Violation(r.id, path, n, line, r.message))
-            elif not any(m.group(2) in lessons for m in allowed):
-                out.append(Violation(r.id, path, n, line,
-                                     f"exemption cites missing lesson {allowed[0].group(2)}"))
+            if r.kind == "regex" and r.hits(line):
+                _record_line_violation(r, path, n, lines, lessons, out)
+    for r in applicable:
+        if r.kind != "import_boundary":
+            continue
+        for lineno, imp in _extract_imports(path, text):
+            if any(_import_matches_forbidden(imp, forb) for forb in r.forbidden_modules):
+                _record_line_violation(r, path, lineno, lines, lessons, out)
     return out
+
+
+def evaluate_diff_budget(rule: Rule, changed_files: list[str], *, added_lines: int | None = None,
+                         numstat: dict[str, int] | None = None) -> list[str]:
+    if rule.kind != "diff_budget":
+        return []
+    kept = [p for p in changed_files if not any(ex.match(p) for ex in rule.exclude)]
+    errs: list[str] = []
+    if rule.max_files is not None and len(kept) > rule.max_files:
+        errs.append(f"{rule.id}: {rule.message} (changed_files={len(kept)} > max_files={rule.max_files})")
+    if rule.max_added_lines is not None:
+        total_added = sum(numstat.get(p, 0) for p in kept) if numstat is not None else added_lines
+        if total_added is not None and total_added > rule.max_added_lines:
+            errs.append(f"{rule.id}: {rule.message} (added_lines={total_added} > max_added_lines={rule.max_added_lines})")
+    return errs
 
 
 def self_test(rules: list[Rule]) -> list[str]:
@@ -151,13 +267,25 @@ def self_test(rules: list[Rule]) -> list[str]:
         if not expects["fail"] or not expects["pass"]:
             errors.append(f"rule {r.id}: needs at least one fixture with expect=fail and one with expect=pass")
         for i, fx in enumerate(r.fixtures, 1):
-            if fx.get("expect") not in ("fail", "pass") or "path" not in fx or "text" not in fx:
+            exp = fx.get("expect")
+            if r.kind == "diff_budget":
+                if exp not in ("fail", "pass") or ("changed_files" not in fx and "added_lines" not in fx):
+                    errors.append(f"rule {r.id} fixture {i}: needs changed_files/added_lines, expect=fail|pass")
+                    continue
+                fired = bool(evaluate_diff_budget(
+                    r, [str(x) for x in fx.get("changed_files", [])], added_lines=fx.get("added_lines")
+                ))
+                if fired != (exp == "fail"):
+                    verb = "did not trigger on" if exp == "fail" else "triggered on"
+                    errors.append(f"rule {r.id} fixture {i}: {verb} diff_budget fixture")
+                continue
+            if exp not in ("fail", "pass") or "path" not in fx or "text" not in fx:
                 errors.append(f"rule {r.id} fixture {i}: needs path, text, expect=fail|pass")
                 continue
             cited = {m.group(2) for m in ALLOW.finditer(fx["text"])}
             fired = bool(scan_text([r], fx["path"], fx["text"], cited))
-            if fired != (fx["expect"] == "fail"):
-                verb = "did not fire on" if fx["expect"] == "fail" else "fired on"
+            if fired != (exp == "fail"):
+                verb = "did not fire on" if exp == "fail" else "fired on"
                 errors.append(f"rule {r.id} fixture {i}: {verb} {fx['path']}: {fx['text']!r}")
     return errors
 
@@ -247,6 +375,19 @@ def pr_changes(base: str) -> dict[str, str]:
     return {out[i + 1]: out[i][0] for i in range(0, len(out) - 1, 2)}
 
 
+def pr_numstat(base: str) -> dict[str, int]:
+    """{path: added_lines} between BASE and HEAD (`-` binary files omitted)."""
+    out = git("diff", "--no-renames", "--numstat", "-z", base, "HEAD").split("\0")
+    stats: dict[str, int] = {}
+    for entry in out:
+        if not entry or "\t" not in entry:
+            continue
+        parts = entry.split("\t", 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            stats[parts[2]] = int(parts[0])
+    return stats
+
+
 def prove_rule(rule: Rule, base: str, changes: dict[str, str]) -> tuple[str, str]:
     """The rule must fire on the pre-fix (BASE) version of a file this PR changes. Returns (error, proof)."""
     for path, status in changes.items():
@@ -327,6 +468,11 @@ def pr_gate(base: str, title: str, body: str, rules: list[Rule]) -> tuple[list[s
     passing gate log shows the evidence instead of only a count."""
     changes = pr_changes(base)
     errs, proofs = [], []
+    budget_rules = [r for r in rules if r.kind == "diff_budget"]
+    if budget_rules:
+        stats = pr_numstat(base)
+        for br in budget_rules:
+            errs.extend(evaluate_diff_budget(br, list(changes), numstat=stats))
     cited = LESSON_LINE.findall(body)
     if FIX_TITLE.match(title) and not cited and not NO_LESSON.search(body):
         errs.append("fix/revert PR: add `Lesson: L-NNNN` (a lesson added or updated in this PR) or "

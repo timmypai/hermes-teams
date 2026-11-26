@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -155,6 +157,79 @@ class CommentOps(unittest.TestCase):
         self.df.apply_comment_ops("b", "t_adj", [{"author": "orchestrator", "created_at": 1, "body": body}], applied)
         self.assertEqual(calls, ["link"])
         self.assertEqual(comments[0].count("\n- 未執行 "), 2)
+
+
+class LockRaceProtection(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="devflow-lock-race-"))
+        self.addCleanup(shutil.rmtree, self.root)
+        repo_dir = self.root / "repo"
+        repo_dir.mkdir(parents=True)
+        (self.root / "state").mkdir(parents=True)
+        (self.root / "state" / "repos.json").write_text(
+            json.dumps({"b": {"slug": "b", "repo": "o/r", "path": str(repo_dir), "default_branch": "main",
+                              "port": 18100, "contract": True}}),
+            encoding="utf-8",
+        )
+        shutil.copy(KIT / "roles.json", self.root / "roles.json")
+        self.df = load_devflow(self.root)
+        patcher = mock.patch.object(self.df.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_resume_reentrant_lock_and_cross_process_stalled_triage_skip(self):
+        board = Board("developer", None)
+        self.df.kanban = board
+        # Same-process nested answer/resume lock never deadlocks
+        with self.df.locked(self.df.card_lock_name("b", "t_1")):
+            self.assertTrue(self.df.is_card_locked("b", "t_1"))
+            self.df.resume("b", "t_1")
+        self.assertFalse(self.df.is_card_locked("b", "t_1"))
+        self.assertEqual(board.claims, [("ready", "developer")])
+
+        # Cross-process flock on card lock causes stalled_triage to skip without creating [ADJ]
+        lock_file = self.root / "state" / f"{self.df.card_lock_name('b', 't_1')}.lock"
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import fcntl, sys, time; fh = open(sys.argv[1], 'w'); "
+                "fcntl.flock(fh, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(10)",
+                str(lock_file),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "locked")
+            self.assertTrue(self.df.is_card_locked("b", "t_1"))
+            tasks = {
+                "t_1": {"id": "t_1", "title": "[DEV] x", "status": "triage", "block_kind": None},
+                "t_ship": {"id": "t_ship", "title": "[SHIP] s", "status": "todo", "block_kind": None},
+            }
+            created: list[str] = []
+            self.df.open_triage_adj = lambda *a: created.append("adj") or "t_adj1"
+            self.df.triage_event = lambda *a: 1
+            retry = self.df.stalled_triage("b", tasks, {"t_1": ["t_ship"]}, {})
+            self.assertTrue(retry)
+            self.assertEqual(created, [])
+
+            # Phase 5 tick_board check skips waiting EPIC when any child card is locked
+            self.df.kanban = lambda b, cmd, *a: json.dumps([
+                {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "assignee": "orchestrator"},
+            ]) if cmd == "list" else json.dumps({"task": {"id": "t_ep1", "status": "todo", "assignee": "orchestrator"}, "parents": ["t_1"], "comments": []})
+            self.df.plan_cards = lambda b, tid: {"t_ep1": {"id": "t_ep1", "status": "todo"}, "t_1": {"id": "t_1"}}
+            check_calls: list[str] = []
+            self.df.check_plan = lambda *a, **kw: check_calls.append("called") or {}
+            tick_retry = self.df.tick_board("b", {})
+            self.assertTrue(tick_retry)
+            self.assertEqual(check_calls, [])
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+        self.assertFalse(self.df.is_card_locked("b", "t_1"))
 
 
 if __name__ == "__main__":

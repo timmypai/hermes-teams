@@ -106,6 +106,19 @@ class RepoAgentsConflictScan(unittest.TestCase):
         ids = {w["id"] for w in self._scan("當前工作僅本地修改，並未取得建立 issue／PR 或其他 GitHub 寫入的新授權。\n")}
         self.assertIn("forbids_pr_creation", ids)
 
+    def test_detects_cross_file_deploy_policy_mismatch(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="devflow-agents-xfile-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / ".devflow").mkdir()
+        (d / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY_MANUAL_ONLY=false\n", encoding="utf-8")
+        (d / "AGENTS.md").write_text("# Policy\n\nmerge 不能觸發部署；merge 不部署。\n", encoding="utf-8")
+        ids = {w["id"] for w in prompt_audit.scan_repo_agents_conflicts(d)}
+        self.assertIn("deploy_policy_mismatch", ids)
+
+        (d / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY_MANUAL_ONLY=true\n", encoding="utf-8")
+        ids_manual = {w["id"] for w in prompt_audit.scan_repo_agents_conflicts(d)}
+        self.assertNotIn("deploy_policy_mismatch", ids_manual)
+
 
 if __name__ == "__main__":
     unittest.main()

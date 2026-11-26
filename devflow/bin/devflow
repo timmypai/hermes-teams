@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from contextlib import closing, contextmanager, suppress
 from pathlib import Path
@@ -26,7 +27,7 @@ _KIT_DIR = Path(__file__).resolve().parents[1]
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
 
-from lib import breakers, kanban_adapter, policy as policy_lib, preflight as preflight_lib, prompt_audit, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
+from lib import breakers, handoff as handoff_lib, kanban_adapter, lint_engine, pipeline as pipeline_lib, policy as policy_lib, preflight as preflight_lib, prompt_audit, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
 
 ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
 DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
@@ -81,13 +82,76 @@ def gh_json(args: list[str], gh: str = "builder", check: bool = True):
     return json.loads(out) if out else None
 
 
+_LOCK_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_LOCK_TLS = threading.local()
+
+
+def _held_locks() -> set[str]:
+    held = getattr(_LOCK_TLS, "held", None)
+    if held is None:
+        held = set()
+        _LOCK_TLS.held = held
+    return held
+
+
+def _get_thread_lock(name: str) -> threading.RLock:
+    with _LOCK_GUARD:
+        lk = _THREAD_LOCKS.get(name)
+        if lk is None:
+            lk = threading.RLock()
+            _THREAD_LOCKS[name] = lk
+        return lk
+
+
 @contextmanager
 def locked(name: str):
+    held = _held_locks()
+    if name in held:
+        yield
+        return
+    tlk = _get_thread_lock(name)
     path = ROOT / "state" / f"{name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        yield
+    with tlk:
+        with open(path, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            held.add(name)
+            try:
+                yield
+            finally:
+                held.discard(name)
+
+
+def card_lock_name(board: str, task_id: str) -> str:
+    return f"answer-{board}-{task_id}"
+
+
+def is_card_locked(board: str, task_id: str) -> bool:
+    """True when `answer` / `resume` / `scope add` currently holds the per-card lock."""
+    name = card_lock_name(board, task_id)
+    if name in _held_locks():
+        return True
+    tlk = _get_thread_lock(name)
+    if not tlk.acquire(blocking=False):
+        return True
+    try:
+        path = ROOT / "state" / f"{name}.lock"
+        if not path.exists():
+            return False
+        try:
+            with open(path, "a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                else:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                    return False
+        except OSError:
+            return False
+    finally:
+        tlk.release()
 
 
 def load_state() -> dict:
@@ -1408,12 +1472,56 @@ def approved_ship_patches(epic_body: str | None) -> set[tuple[str, str]]:
     return {(hit.group(1), hit.group(2)) for hit in PATCH_APPROVAL_RE.finditer(m.group(1))}
 
 
+def _owning_epic_body(board: str, task_body: str | None) -> str | None:
+    m = EPIC_REF.search(task_body or "")
+    if not m:
+        return None
+    epic_id = m.group(1)
+    db = BOARDS / board / "kanban.db"
+    if db.is_file():
+        with suppress(sqlite3.Error):
+            rows = board_rows(board, "SELECT body FROM tasks WHERE id = ?", (epic_id,))
+            if rows:
+                return rows[0].get("body")
+    with suppress(SystemExit, Exception):
+        return (json.loads(kanban(board, "show", epic_id, "--json"))["task"] or {}).get("body")
+    return None
+
+
+def completed_arch_target_files(board: str, parent_id: str, parent_card: dict | None = None) -> list[str]:
+    """Read planned `target_files` / `allowed_scope` / `file_plan` from a completed `[ARCH]` run's metadata."""
+    runs = (parent_card or {}).get("runs") or []
+    for run_item in reversed(runs):
+        meta = run_item.get("metadata") if isinstance(run_item, dict) else None
+        if isinstance(meta, str):
+            with suppress(ValueError):
+                meta = json.loads(meta)
+        if files := handoff_lib.extract_arch_target_files(meta):
+            return files
+    db = BOARDS / board / "kanban.db"
+    if db.is_file():
+        with suppress(sqlite3.Error, ValueError):
+            rows = board_rows(
+                board,
+                "SELECT metadata FROM task_runs WHERE task_id = ? AND status = 'done' ORDER BY id DESC LIMIT 1",
+                (parent_id,),
+            )
+            if rows and rows[0].get("metadata"):
+                meta = rows[0]["metadata"]
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                if files := handoff_lib.extract_arch_target_files(meta):
+                    return files
+    return []
+
+
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     e = entry(board)
     repo_cfg = policy_lib.load_repo_config(e.get("path"))
     req_scope = policy_lib.repo_require_allowed_scope(
         repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
     )
+    test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
     found: list[str] = []
     feeds = set()  # cards on a parent path into the EPIC
     stack = list(cards[epic]["parents"])
@@ -1424,6 +1532,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             stack.extend(cards.get(t, {}).get("parents", []))
     epic_mode, bad_mode = scope_lib.parse_epic_mode(cards[epic]["body"], policy_lib.valid_modes(POLICY))
     mode_cfg = policy_lib.mode_config(POLICY, epic_mode)
+    pipe_spec = pipeline_lib.parse_epic_pipeline(cards[epic]["body"], POLICY, epic_mode=epic_mode)
     spec = epic_acceptance_spec(board, epic, cards[epic]["body"], cards=cards)
     acs = [a["ac"] for a in spec]
     ac_types = {a["ac"]: a["type"] for a in spec}
@@ -1433,9 +1542,12 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     if bad_mode:
         allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
         found.append(f"{epic}: Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
+    for pprob in pipe_spec["problems"]:
+        found.append(f"{epic}: {pprob}")
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
-    skip_scenarios = ship_only or (not bool(mode_cfg.get("require_scenarios", True)))
+    skip_scenarios = ship_only or (not pipeline_lib.requires_scenarios_for_epic(pipe_spec, mode_cfg))
+    need_ship = repo_deploys(board) and pipeline_lib.requires_ship_for_epic(pipe_spec, mode_cfg)
     for a in spec:
         probs = [p for p in spec_problems(a) if not (skip_scenarios and "沒有任何情境" in p)]
         found += [f"{epic}: {p}" for p in probs]
@@ -1451,6 +1563,8 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if kind not in CARDS:
             found.append(f"{tid}: 標題沒有已知卡片類型 [{'/'.join(CARDS)}]")
             continue
+        if tid != epic and pipeline_lib.is_user_paused_card(c):
+            continue  # explicitly parked by/for user; do not emit spurious plan/ADJ findings
         if c["status"] == "done":
             continue  # history; only pending work can still go wrong
         if tid in body_by_tid:
@@ -1498,13 +1612,26 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             if not e.get("contract") and contract != "local-only":
                 found.append(f"{tid}: repo contract=no，不應設 completion_contract（{contract}），卡片會永遠無法完成")
             ships = [x for x in c["children"] if card_type(cards.get(x, {}).get("title", "")) == "SHIP"]
-            if repo_deploys(board) and bool(mode_cfg.get("require_ship", True)) and not ships:
+            if need_ship and not ships:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
             if (why := done_problem(c["title"], c["body"])):
                 found.append(f"{tid}: [{kind}] {why}")
             card_contract = scope_lib.parse_card_contract(c["body"])
             for scope_prob in scope_lib.allowed_scope_problems(card_contract["allowed_scope"], required=req_scope):
                 found.append(f"{tid}: [{kind}] {scope_prob}")
+            if req_scope and card_contract["allowed_scope"]:
+                for pid in c.get("parents", []):
+                    pc = cards.get(pid)
+                    if pc and card_type(pc.get("title") or "") == "ARCH" and pc.get("status") == "done":
+                        arch_files = completed_arch_target_files(board, pid, pc)
+                        if missing_arch := handoff_lib.missing_arch_scope_files(
+                            arch_files, card_contract["allowed_scope"], test_paths=test_paths
+                        ):
+                            found.append(
+                                f"{tid}: [{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
+                                + ", ".join(missing_arch[:8])
+                                + (f" 等共 {len(missing_arch)} 檔" if len(missing_arch) > 8 else "")
+                            )
             covered = list(dict.fromkeys(
                 ac for m in COVER_LINE.finditer(c["body"] or "") for ac in re.findall(r"\bAC-\d+\b", m.group(0))
                 if ac in ac_types))
@@ -1799,6 +1926,12 @@ def tick_key(board: str) -> str:
                 h.update(b"\x00lib:" + lp.name.encode() + b"\x00")
                 h.update(lp.read_bytes())
     h.update((ROOT / "roles.json").read_bytes())
+    rules_dir = ROOT / "rules" / "workflow"
+    if rules_dir.is_dir():
+        for rp_file in sorted(rules_dir.glob("*.toml")):
+            with suppress(OSError):
+                h.update(b"\x00rule:" + rp_file.name.encode() + b"\x00")
+                h.update(rp_file.read_bytes())
     cfg_path = ROOT / "config.json"
     if cfg_path.is_file():
         with suppress(OSError):
@@ -1829,6 +1962,8 @@ def plan_fingerprint(epic: str, cards: dict[str, dict], repo: str, board: str | 
             row.extend([c.get("status") or "", c.get("block_kind") or ""])
         elif kind == "SHIP":
             row.append(c.get("status") in SHIP_PENDING)
+        elif kind == "ARCH":
+            row.append(c.get("status") == "done")
         elif board and kind in ("DEV", "OPS") and c.get("status") not in ("done", "archived"):
             row.append(kanban_adapter.card_changes_requested_count(BOARDS, board, t))
         rows.append(row)
@@ -1858,6 +1993,11 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
     with the reviewer-only `sdlc-review` skill: an implementer (rework after an [ADJ]) then dies with
     `kanban_skills_unavailable` on every run. For that case the card is unblocked unassigned (the
     review lane skips unassigned cards) and `reopen-review` moves it to the implementer's lane."""
+    with locked(card_lock_name(board, task_id)):
+        return _resume_unlocked(board, task_id, note)
+
+
+def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
     d = json.loads(kanban(board, "show", task_id, "--json"))
     if d["task"]["status"] == "triage":
         if not d["task"]["assignee"]:
@@ -2522,6 +2662,9 @@ def tick_board(board: str, st: dict) -> bool:
     for tid in waiting_epics:
         try:
             cards = plan_cards(board, tid)
+            if any(is_card_locked(board, cid) for cid in cards):
+                retry = True
+                continue
             if fixed := repair_bodies(board, tid, cards):
                 kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
                                               "補齊缺少的 `goal_mode`）")
@@ -3195,7 +3338,15 @@ def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list]
     seen = st.setdefault("triage", {})
     retry = False
     for tid, t in tasks.items():
-        if t["status"] != "triage" or waiting(t) or card_type(t["title"]) in ("EPIC", "ADJ"):
+        if (
+            t["status"] != "triage"
+            or waiting(t)
+            or pipeline_lib.is_user_paused_card(t)
+            or card_type(t["title"]) in ("EPIC", "ADJ")
+        ):
+            continue
+        if is_card_locked(board, tid):
+            retry = True
             continue
         blocked_children = [c for c in children.get(tid, []) if tasks.get(c, {}).get("status") in OPEN]
         if not blocked_children:
@@ -3302,13 +3453,22 @@ def cmd_pending(a) -> None:
     print(json.dumps(pending(a.profile), ensure_ascii=False, indent=1))
 
 
-def answer(board: str, task_id: str, block_ev: int, text: str, where: str) -> str:
+def answer(
+    board: str,
+    task_id: str,
+    block_ev: int,
+    text: str,
+    where: str,
+    *,
+    add_scope: list[str] | None = None,
+) -> str:
     """Hand the user's answer to the question raised by block event `block_ev`, once. The same question
     sits in two chats (the assignee's Bot Chat and the App chat): under a per-card lock, a card no
     longer waiting on exactly that block (answered elsewhere, re-blocked with a new question, closed)
     is refused with what happened since, instead of `resume`, which would re-run a ready card with a
-    second, conflicting note."""
-    with locked(f"answer-{board}-{task_id}"):
+    second, conflicting note. When `add_scope` is supplied, validates and merges the approved globs
+    into `Allowed-Scope:` atomically BEFORE resuming."""
+    with locked(card_lock_name(board, task_id)):
         rows = board_rows(board, "SELECT id, status, block_kind FROM tasks WHERE id = ?", (task_id,))
         now = block_event(board, task_id) if rows and waiting(rows[0]) else None
         if now != block_ev:
@@ -3318,13 +3478,74 @@ def answer(board: str, task_id: str, block_ev: int, text: str, where: str) -> st
             die(f"not applied: {task_id} no longer waits on question event {block_ev} "
                 f"(status {state}; events since: {', '.join(since) or 'none'}"
                 f"{f'; it now waits on question event {now}' if now else ''})")
-        return resume(board, task_id, f"使用者回覆（{where}，問題事件 {block_ev}）：{text}")
+        scope_note = ""
+        if add_scope:
+            d = json.loads(kanban(board, "show", task_id, "--json"))
+            cur_body = (d.get("task") or {}).get("body") or ""
+            epic_body = _owning_epic_body(board, cur_body)
+            try:
+                new_body, merged = handoff_lib.merge_allowed_scope_into_body(
+                    cur_body, add_scope, epic_body=epic_body
+                )
+            except ValueError as err:
+                die(f"not applied: {err}")
+            if new_body != cur_body:
+                kanban(board, "edit", task_id, "--body", new_body)
+            scope_note = f"；已核准新增 Allowed-Scope：{', '.join(add_scope)}（合併後：{', '.join(merged)}）"
+        return resume(board, task_id, f"使用者回覆（{where}，問題事件 {block_ev}{scope_note}）：{text}")
 
 
 def cmd_answer(a) -> None:
     if os.environ.get("HERMES_KANBAN_TASK"):
         die("answer runs from a chat, not inside a kanban worker")
-    print(answer(a.slug, a.task, a.event, a.text, a.where))
+    add_scope = list(getattr(a, "add_scope", None) or [])
+    print(answer(a.slug, a.task, a.event, a.text, a.where, add_scope=add_scope or None))
+
+
+def cmd_scope_add(a) -> None:
+    """Validate and atomically merge approved globs into a card's `Allowed-Scope:`."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("scope add runs outside a kanban worker (or use devflow answer --add-scope)")
+    with locked(card_lock_name(a.slug, a.task)):
+        d = json.loads(kanban(a.slug, "show", a.task, "--json"))
+        cur_body = (d.get("task") or {}).get("body") or ""
+        epic_body = _owning_epic_body(a.slug, cur_body)
+        try:
+            new_body, merged = handoff_lib.merge_allowed_scope_into_body(cur_body, a.add, epic_body=epic_body)
+        except ValueError as err:
+            die(str(err))
+        if new_body != cur_body:
+            kanban(a.slug, "edit", a.task, "--body", new_body)
+        note_tail = f"；備註：{a.note}" if a.note else ""
+        kanban(a.slug, "comment", a.task,
+               f"devflow scope add：已核准新增 Allowed-Scope {', '.join(a.add)}（合併後：{', '.join(merged)}）{note_tail}")
+        print(json.dumps({"ok": True, "board": a.slug, "task": a.task, "allowed_scope": merged},
+                         ensure_ascii=False))
+
+
+def cmd_epic_advance(a) -> None:
+    """Advance an EPIC's declarative `Start-At:` / `Stop-After:` forward cleanly."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        die("epic advance runs outside a kanban worker")
+    d = json.loads(kanban(a.board, "show", a.epic, "--json"))
+    task = d.get("task") or {}
+    if card_type(task.get("title") or "") != "EPIC":
+        die(f"{a.epic} is not an [EPIC] card")
+    cur_body = task.get("body") or ""
+    epic_mode, bad_mode = scope_lib.parse_epic_mode(cur_body, policy_lib.valid_modes(POLICY))
+    if bad_mode:
+        die(f"{a.epic}: Mode '{bad_mode}' 無效")
+    try:
+        new_body, new_spec = pipeline_lib.advance_epic_body(
+            cur_body, POLICY, stop_after=a.stop_after, to_end=a.to_end, epic_mode=epic_mode
+        )
+    except ValueError as err:
+        die(str(err))
+    kanban(a.board, "edit", a.epic, "--body", new_body)
+    kanban(a.board, "comment", a.epic,
+           f"devflow epic advance：流程推進至 Start-At={new_spec['start_at']}, Stop-After={new_spec['stop_after']}")
+    print(json.dumps({"ok": True, "board": a.board, "epic": a.epic, "pipeline": new_spec},
+                     ensure_ascii=False))
 
 
 def cmd_inbox(a) -> None:
@@ -5316,6 +5537,23 @@ def cmd_check_card(a) -> None:
             if why := done_problem(a.title, body):
                 findings.append(why)
             findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
+            parent_ids = list(getattr(a, "parent", None) or [])
+            if req_scope and contract["allowed_scope"] and board_arg and parent_ids:
+                test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
+                for pid in parent_ids:
+                    arch_files = completed_arch_target_files(board_arg, pid)
+                    if not arch_files:
+                        with suppress(SystemExit, Exception):
+                            pd = json.loads(kanban(board_arg, "show", pid, "--json"))
+                            if card_type((pd.get("task") or {}).get("title") or "") == "ARCH":
+                                arch_files = completed_arch_target_files(board_arg, pid, {"runs": pd.get("runs") or []})
+                    if missing_arch := handoff_lib.missing_arch_scope_files(
+                        arch_files, contract["allowed_scope"], test_paths=test_paths
+                    ):
+                        findings.append(
+                            f"[{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
+                            + ", ".join(missing_arch[:8])
+                        )
         if why := body_problem(kind, a.title, body):
             findings.append(why)
     print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
@@ -5403,6 +5641,7 @@ def main() -> None:
     p.add_argument("--title", required=True); p.add_argument("--body"); p.add_argument("--body-file")
     p.add_argument("--assignee"); p.add_argument("--workspace")
     p.add_argument("--board", help="optional repo slug to apply repo-specific .devflow/config.env policy")
+    p.add_argument("--parent", action="append", default=[], help="optional parent card ID(s) to check [ARCH] target_files coverage")
     p.set_defaults(fn=cmd_check_card)
     p = sub.add_parser("preflight", help="developer pre-flight deterministic checks before pushing PR or requesting review")
     p.add_argument("slug"); p.add_argument("task", nargs="?")
@@ -5448,8 +5687,21 @@ def main() -> None:
     p.add_argument("slug"); p.add_argument("task")
     p.add_argument("--event", type=int, required=True, help="block_event from `devflow pending`")
     p.add_argument("--where", required=True, help="where the user answered, e.g. 'devops 頁面' or 'App 對話'")
+    p.add_argument("--add-scope", action="append", default=[], help="approved Allowed-Scope glob(s) merged atomically before resume (repeatable)")
     p.add_argument("text", help="the user's answer")
     p.set_defaults(fn=cmd_answer)
+    scope_cmd = sub.add_parser("scope").add_subparsers(dest="sub", required=True)
+    p = scope_cmd.add_parser("add", help="atomically validate and append approved globs to a card's Allowed-Scope")
+    p.add_argument("slug"); p.add_argument("task")
+    p.add_argument("--add", nargs="+", required=True, help="repo-relative path globs to append")
+    p.add_argument("--note", default="", help="audit note posted to card comments")
+    p.set_defaults(fn=cmd_scope_add)
+    epic_cmd = sub.add_parser("epic").add_subparsers(dest="sub", required=True)
+    p = epic_cmd.add_parser("advance", help="advance an EPIC's Stop-After / Start-At pipeline step forward")
+    p.add_argument("board"); p.add_argument("epic")
+    p.add_argument("--stop-after", help="target step to advance through (e.g. ship, accept)")
+    p.add_argument("--to-end", action="store_true", help="advance Stop-After to the pipeline's terminal step")
+    p.set_defaults(fn=cmd_epic_advance)
     p = sub.add_parser("tick", help="board automation: plan checks, [ADV], orchestrator board_ops")
     p.add_argument("board", nargs="?"); p.add_argument("--hook", action="store_true",
                                                        help="Hermes on_kanban_dispatch_tick payload on stdin")

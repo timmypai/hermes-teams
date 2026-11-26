@@ -54,6 +54,56 @@
         "res_assignees": ["researcher", "reviewer"],
         "res_workspaces": ["scratch", "dir"]
       }
+    },
+    "pipelines": {
+      "deliver": {
+        "steps": ["repro", "design", "implement", "ci", "review", "ship", "accept"],
+        "default_start": "repro",
+        "default_stop": "accept",
+        "step_cards": {
+          "repro": "RES",
+          "design": "ARCH",
+          "implement": "DEV",
+          "ship": "SHIP",
+          "accept": "EPIC"
+        }
+      },
+      "investigate": {
+        "steps": ["repro", "accept"],
+        "default_start": "repro",
+        "default_stop": "accept",
+        "step_cards": {
+          "repro": "RES",
+          "accept": "EPIC"
+        }
+      },
+      "review": {
+        "steps": ["review", "accept"],
+        "default_start": "review",
+        "default_stop": "accept",
+        "step_cards": {
+          "review": "RES",
+          "accept": "EPIC"
+        }
+      }
+    },
+    "handoff_schemas": {
+      "repro": {
+        "required": ["root_cause", "evidence"],
+        "optional": ["affected_paths", "non_goals", "open_questions"]
+      },
+      "design": {
+        "required": ["decisions", "target_files"],
+        "optional": ["interfaces", "non_goals", "risks", "allowed_scope", "file_plan", "pr_slices", "adr_markdown"]
+      },
+      "implement": {
+        "required": ["pr_url", "head_sha", "tests"],
+        "optional": ["published_pr", "changed_files", "followups"]
+      },
+      "ship": {
+        "required": ["merged_sha"],
+        "optional": ["deployed_sha", "acceptance_report", "followups"]
+      }
     }
   },
   "worker_config": {

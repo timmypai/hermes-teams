@@ -18,7 +18,8 @@ metadata:
 - ③ 只遵守程式碼風格、測試與既有模組邊界；**嚴禁為 ③ 新增 AC、開卡、或改寫 devflow 的角色分工與送審流程**，差異記進 summary `followups` 一行即可。
 
 ## 2. 三種任務模式（EPIC 的 `Mode:`，預設 `deliver`）
-- **`deliver`**：新功能、修 bug、CI/CD 變更。完整走 AC + 情境 + `[DEV]`/`[OPS]` + `[SHIP]` + 整合驗收。
+- **`deliver`**：新功能、修 bug、CI/CD 變更。完整走 AC + 情境 + `[DEV]`/`[OPS]` + `[SHIP]` + 整合驗收。需分段暫停時在 EPIC 加 `Start-At:` / `Stop-After:`（步驟 `repro -> design -> implement -> ci -> review -> ship -> accept`，推進用 `devflow epic advance`）。
+- **已授權 EPIC 不重問**：一旦 EPIC 已授權交付，直接依模式與 `Allowed-Scope` 向前推進，不反覆重問使用者是否改為僅本地修補。
 - **`investigate`**：線上故障查真因、唯讀取證。不強求 Given/When/Then 情境與 `[SHIP]`；`[RES]` 可指派 `researcher` 或 `devops`（`scratch`／`dir`）；**禁止開 `[DEV]`/`[OPS]` 補丁卡**；入口不可達就 `capability` 結案。
 - **`review`**：獨立審查既有 PR。不需假造情境，直接審 exact-head PR，通過才進條件式 `[SHIP]`；禁止開 `[DEV]`/`[OPS]`。
 

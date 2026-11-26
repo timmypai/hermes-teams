@@ -22,7 +22,7 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
 ```
 
 ## A. 規劃
-1. `devflow repo sync <slug>`，讀 README、`.devflow/`、`.github/workflows/`，確認 EPIC 的 `Mode:`（沒寫就是 `deliver`）。
+1. `devflow repo sync <slug>`，讀 README、`.devflow/`、`.github/workflows/`，確認 EPIC 的 `Mode:`（沒寫就是 `deliver`）與選填 `Pipeline:`／`Start-At:`／`Stop-After:`（例如只想寫碼到 CI 為止可設 `Stop-After: ci`，合法略過 `[SHIP]`；之後用 `devflow epic advance` 接續）。一旦 EPIC 已授權進入該階段，直接規劃並推進，不重問使用者是否只做本機修補。
 2. **依模式規劃**
    - **`investigate`（線上查真因）**：不寫 Given/When/Then 情境、不建 `[SHIP]`、**禁止開 `[DEV]`／`[OPS]`**。先確認取證入口是否可達（repo 有無唯讀診斷腳本或 workflow）；有就建 `[RES]` 指派具該入口權限的 `devops`（`dir`）或 `researcher`（`scratch`）；完全沒有入口就直接 `kanban_block(kind="capability")` 說明缺哪個入口，不空轉。
    - **`review`（獨立審查既有 PR）**：不假造情境；安排審查與條件式 `[SHIP]`；禁止開 `[DEV]`／`[OPS]`。
@@ -30,7 +30,7 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
      - 每條 AC 要有編號與類型；非 `[manual]` AC 要有 `<EPIC>/AC-n.Sm` 的 Given/When/Then 情境（只讀不寫的標 `[smoke]`）。**除非 repo 的 `.devflow/scenarios.json` 已經有本 EPIC 的情境，否則規劃當下就把情境寫進 EPIC**。改寫只能更精確地說使用者要的結果，嚴禁加稽核、白名單、前後快照、自訂審查等使用者沒要的門檻；「不要動其他服務」就是一條可觀察結果，不是一套隔離系統。
      - 終點反推一次盤點：`devflow repo doctor <slug>`（`contract-files`／`port` 有缺口就排前置 `[OPS]` 與 `[SHIP]`；留意 `agents_md_warnings`）與 `gh secret list -R <OWNER/REPO>`（需要 UI 操作腳本就在初始 `[DEV]` 一併規劃，不留給 `[SHIP]` 事後補）。
 3. **切卡**：`[RES]` 只在有實際未知時建；`[ARCH]` 只在有跨模組或難回頭決策時建；每張 `[DEV]`／`[OPS]` 一個 PR、後面接一張 `[SHIP]`（`deliver` 且要部署）；依賴前一個 PR 程式碼的卡，parent 指向前一張 `[SHIP]`；互不相干的卡並行。每條 AC 至少一張卡負責。
-4. **`[DEV]`／`[OPS]` 建卡規格**（建卡前可跑 `devflow check card --board <slug> --title "..." --assignee ... --workspace ... --body "..."`）：必設 `goal_mode=true`、`workspace_kind="worktree"`、`contract=yes` 時設 `completion_contract="OWNER/REPO"`，body ≤ 600 字：
+4. **`[DEV]`／`[OPS]` 建卡規格**（建卡前可跑 `devflow check card --board <slug> --title "..." --assignee ... --workspace ... [--parent <ARCH_ID>] --body "..."`）：必設 `goal_mode=true`、`workspace_kind="worktree"`、`contract=yes` 時設 `completion_contract="OWNER/REPO"`，body ≤ 600 字；若上游有已完成 `[ARCH]`，`Allowed-Scope:` 必須完整涵蓋 `[ARCH]` metadata 的 `target_files`：
    ```
    ## 目標
    <1-2 句白話：達成什麼使用者看得到的結果>
