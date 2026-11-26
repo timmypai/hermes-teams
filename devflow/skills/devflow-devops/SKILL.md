@@ -9,9 +9,9 @@ metadata:
     related_skills: [devflow, diagnosing-bugs]
 ---
 
-# devflow-devops｜接入、出貨、正式操作
+# devflow-devops｜接入、出貨、正式操作、線上診斷
 
-不在 Hermes 容器內跑 Docker 或 ssh 主機；部署與正式畫面操作一律透過 GitHub Actions self-hosted runner。
+部署與正式畫面操作一律透過 GitHub Actions self-hosted runner；Oracle 容器即時唯讀診斷只走專用 `/opt/data/devflow/diagnose/oracle-debug` 入口。
 
 ## 1. Repo 接入（`[OPS]` 卡）
 1. `devflow repo add OWNER/REPO`（若尚未接入）；在 worktree 跑 `devflow contract <slug> .`（有畫面加 `--ui`，還原公版加 `--sync-standard`）。
@@ -39,3 +39,6 @@ metadata:
 - **程式碼、測試或部署程式問題**：建一張 `[DEV] 修正 PR #N：<白話原因>`（**必設 `assignee="developer"`、`workspace_kind="worktree"`、`workspace_path`=原卡 worktree、`goal_mode=true`、`completion_contract` 依 `devflow repo list`**；body 必含固定 `## 本卡完成`、`覆蓋：AC-n`、沿用原卡的 `Allowed-Scope:` 與 `EPIC: t_xxx`）→ 接一張新 `[SHIP]` → `kanban_link(新 SHIP, EPIC)` → 本卡 `kanban_complete(summary="未出貨：<原因>", created_cards=[...])`。不要把新卡 link 回已開始執行的原 `[SHIP]`（事後補丁卡上限 2 張）。
 - **runner offline、主機元件缺件**：先 `devflow repo doctor`／`devflow runner request`；容器內修不了就 `capability` block，不連開補診斷 PR。
 - **`default branch tip only` 失敗**：不是程式問題，追最新 commit 的 deploy run（沒有就 `gh workflow run deploy.yml --ref <default>`），不要 rerun 舊 run。
+
+## 5. Oracle 容器線上除錯
+用 terminal 執行 `/opt/data/devflow/diagnose/oracle-debug list` 讀取即時容器清單，依序用 `status <容器>` 確認映像、部署 commit 與健康狀態，再用 `top`、`stats`、`logs` 或 `exec <容器> -- <命令> [參數]` 定位問題（不改動服務狀態或正式資料，修補仍走 CI/CD）。報告附容器名稱、實際版本、命令退出碼與遮罩後證據；正式容器要求短時效授權時向操作者請領 grant。
