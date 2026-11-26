@@ -395,7 +395,7 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             added_lines = 3
             """,
         )
-        self.base = self.commit("add diff budget rule")
+        self.start("exit 0\n")
         # Pass check self-test on clean repo
         self.assertEqual(self.check()[0], 0)
 
