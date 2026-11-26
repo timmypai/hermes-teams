@@ -194,14 +194,28 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         hits = lint_engine.scan_files(
             [imp_rule],
             {
-                "web/clean.ts": '// import { a } from "infra/x";\n/* export * from "infra/y"; */\nconst u = "https://x";\n',
+                "web/clean.ts": (
+                    '// import { a } from "infra/x";\n'
+                    '/* export * from "infra/y"; */\n'
+                    'const documentation = "import(\'infra/private\')";\n'
+                    "const singleq = 'require(\"infra/private\")';\n"
+                    'const escaped = "a \\"import(\'infra/private\')\\" b";\n'
+                    "const tpl = `hello ${documentation}\nimport('infra/private')\nrequire('infra/x')`;\n"
+                    'const member = loader.import("infra/not_module");\n'
+                    "const re = /import\\('infra\\/fake'\\)/;\n"
+                    'const u = "https://x";\n'
+                ),
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
+                "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
+                "web/req.ts": "const r = require('infra/sync_client');\n",
                 "src/broken.py": "def bad(:\n",
             },
         )
         by_file = {h["file"]: h for h in hits}
         self.assertNotIn("web/clean.ts", by_file)
         self.assertIn("web/dyn.ts", by_file)
+        self.assertIn("web/tpl_real.ts", by_file)
+        self.assertIn("web/req.ts", by_file)
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
 
     def test_preflight_enforces_repo_diff_policy_rules(self) -> None:

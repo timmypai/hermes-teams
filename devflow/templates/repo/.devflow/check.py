@@ -54,10 +54,6 @@ NO_LESSON = re.compile(r"^\s*No-lesson:\s*\S.{9,}$", re.M)
 NO_PROOF = re.compile(r"^\s*No-proof:\s*\S.{9,}$", re.M)
 PROVE_TIMEOUT = int(os.environ.get("DEVFLOW_PROVE_TIMEOUT", "1800"))
 JS_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
-JS_IMPORT_RE = re.compile(
-    r"""(?:(?:^|[;\n])\s*(?:import\s+(?:[^'"]+\s+from\s+)?|export\s+[^'"]*\s+from\s+)|(?<![\w.$])(?:import|require)\s*\(\s*)['"]([^'"]+)['"]""",
-    re.M,
-)
 
 
 class ConfigError(Exception):
@@ -189,52 +185,255 @@ def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
     return clean_imp == forb or clean_imp.startswith(forb + ".") or clean_imp.startswith(forb + "/")
 
 
-def _strip_js_comments(text: str) -> str:
-    """Strip `//...` and `/*...*/` comments while preserving line numbers & string literals."""
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    quote: str | None = None
+def _scan_template_tail(text: str, start: int, lineno: int, *, first: bool) -> tuple[str, int, int, bool]:
+    buf: list[str] = []
+    i, n = start, len(text)
     while i < n:
         ch = text[i]
-        if quote is not None:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "\n":
+                lineno += 1
+            elif first:
+                buf.append(nxt)
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            return "", i + 2, lineno, True
+        if ch == "`":
+            return ("".join(buf) if first else ""), i + 1, lineno, False
+        if ch == "\n":
+            lineno += 1
+        if first:
+            buf.append(ch)
+        i += 1
+    return ("".join(buf) if first else ""), i, lineno, False
+
+
+_REGEX_PREV_KW = frozenset({"return", "throw", "case", "else", "do", "yield", "await", "typeof", "void", "delete", "in", "of"})
+
+
+def _js_allows_regex(tokens: list[tuple[str, str, int]]) -> bool:
+    for kind, val, _ in reversed(tokens):
+        if kind == "NL":
+            continue
+        if kind == "OP":
+            return True
+        if kind == "PUNCT":
+            return val in ("(", ",", ";", "=", "{", "}")
+        if kind == "IDENT":
+            return val in _REGEX_PREV_KW
+        return False
+    return True
+
+
+def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
+    tokens: list[tuple[str, str, int]] = []
+    tpl_braces: list[int] = []
+    i, n, lineno = 0, len(text), 1
+    while i < n:
+        ch = text[i]
+        if ch in (" ", "\t", "\r"):
             i += 1
             continue
-        if ch in ("'", '"', "`"):
-            quote = ch
-            out.append(ch)
+        if ch == "\n":
+            if not tokens or tokens[-1][0] != "NL":
+                tokens.append(("NL", "\n", lineno))
+            lineno += 1
             i += 1
             continue
         if ch == "/" and i + 1 < n:
-            nxt = text[i + 1]
-            if nxt == "/":
-                out.append("  ")
+            if text[i + 1] == "/":
                 i += 2
                 while i < n and text[i] != "\n":
-                    out.append(" ")
                     i += 1
                 continue
-            if nxt == "*":
-                out.append("  ")
+            if text[i + 1] == "*":
                 i += 2
                 while i < n:
                     if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
-                        out.append("  ")
                         i += 2
                         break
-                    out.append("\n" if text[i] == "\n" else " ")
+                    if text[i] == "\n":
+                        lineno += 1
                     i += 1
                 continue
-        out.append(ch)
+        if ch == "/" and _js_allows_regex(tokens):
+            start_line = lineno
+            i += 1
+            in_cls = False
+            while i < n:
+                rc = text[i]
+                if rc == "\\" and i + 1 < n:
+                    if text[i + 1] == "\n":
+                        break
+                    i += 2
+                    continue
+                if rc == "\n":
+                    break
+                if rc == "[":
+                    in_cls = True
+                elif rc == "]":
+                    in_cls = False
+                elif rc == "/" and not in_cls:
+                    i += 1
+                    while i < n and text[i].isalpha():
+                        i += 1
+                    break
+                i += 1
+            tokens.append(("OP", "/re/", start_line))
+            continue
+        if ch in ("'", '"'):
+            q, start_line, buf = ch, lineno, []
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\\" and i + 1 < n:
+                    if text[i + 1] == "\n":
+                        lineno += 1
+                    else:
+                        buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == q:
+                    i += 1
+                    break
+                if c == "\n":
+                    lineno += 1
+                    i += 1
+                    break
+                buf.append(c)
+                i += 1
+            tokens.append(("STR", "".join(buf), start_line))
+            continue
+        if ch == "`":
+            start_line = lineno
+            val, i, lineno, interp = _scan_template_tail(text, i + 1, lineno, first=True)
+            if interp:
+                tokens.append(("TPL", "", start_line))
+                tpl_braces.append(0)
+            else:
+                tokens.append(("STR", val, start_line))
+            continue
+        if ch == "{":
+            if tpl_braces:
+                tpl_braces[-1] += 1
+            tokens.append(("PUNCT", "{", lineno))
+            i += 1
+            continue
+        if ch == "}":
+            if tpl_braces:
+                if tpl_braces[-1] == 0:
+                    tpl_braces.pop()
+                    tokens.append(("PUNCT", "}", lineno))
+                    _, i, lineno, interp = _scan_template_tail(text, i + 1, lineno, first=False)
+                    if interp:
+                        tpl_braces.append(0)
+                    continue
+                tpl_braces[-1] -= 1
+            tokens.append(("PUNCT", "}", lineno))
+            i += 1
+            continue
+        if ch.isalpha() or ch in ("_", "$"):
+            start, start_line = i, lineno
+            i += 1
+            while i < n and (text[i].isalnum() or text[i] in ("_", "$")):
+                i += 1
+            tokens.append(("IDENT", text[start:i], start_line))
+            continue
+        tokens.append(("PUNCT" if ch in (";", "(", ")", ".", "=", ",") else "OP", ch, lineno))
         i += 1
-    return "".join(out)
+    return tokens
+
+
+def _extract_js_imports(text: str) -> list[tuple[int, str]]:
+    toks = _tokenize_js(text)
+    out: list[tuple[int, str]] = []
+    n, paren_depth, brace_depth = len(toks), 0, 0
+    stmt_start = True
+    prev_kind, prev_val = "", ""
+
+    def _next_sig(idx: int) -> int:
+        while idx < n and toks[idx][0] == "NL":
+            idx += 1
+        return idx
+
+    i = 0
+    while i < n:
+        kind, val, line = toks[i]
+        if kind == "NL":
+            if paren_depth == 0 and brace_depth == 0 and prev_val != ".":
+                stmt_start = True
+            i += 1
+            continue
+        if kind == "PUNCT" and val in ("(", ")"):
+            paren_depth = max(0, paren_depth + (1 if val == "(" else -1))
+        elif kind == "PUNCT" and val in ("{", "}"):
+            brace_depth = max(0, brace_depth + (1 if val == "{" else -1))
+
+        is_member = prev_kind == "PUNCT" and prev_val == "."
+        if kind == "IDENT" and not is_member:
+            if val in ("import", "require"):
+                j = _next_sig(i + 1)
+                if j < n and toks[j][0] == "PUNCT" and toks[j][1] == "(":
+                    k = _next_sig(j + 1)
+                    if k < n and toks[k][0] == "STR":
+                        out.append((line, toks[k][1].strip()))
+                elif val == "import" and stmt_start and j < n:
+                    if toks[j][0] == "STR":
+                        out.append((line, toks[j][1].strip()))
+                    elif toks[j][0] != "PUNCT" or toks[j][1] != ".":
+                        depth, m = 0, j
+                        while m < n:
+                            mk, mv, _ = toks[m]
+                            if mk == "PUNCT" and mv == "{":
+                                depth += 1
+                            elif mk == "PUNCT" and mv == "}":
+                                depth = max(0, depth - 1)
+                            elif depth == 0 and mk == "PUNCT" and mv in (";", "="):
+                                break
+                            elif depth == 0 and mk == "IDENT" and mv == "from":
+                                s_idx = _next_sig(m + 1)
+                                if s_idx < n and toks[s_idx][0] == "STR":
+                                    out.append((toks[s_idx][2], toks[s_idx][1].strip()))
+                                break
+                            elif depth == 0 and mk == "NL" and m > j and toks[m - 1][0] in ("STR", "IDENT") and toks[m - 1][1] not in ("import", "type", "from"):
+                                nxt = _next_sig(m + 1)
+                                if nxt < n and toks[nxt][0] == "IDENT" and toks[nxt][1] == "from":
+                                    m = nxt
+                                    continue
+                                if toks[m - 1][1] == "}":
+                                    m += 1
+                                    continue
+                                break
+                            m += 1
+            elif val == "export" and stmt_start:
+                j = _next_sig(i + 1)
+                if j < n and (
+                    (toks[j][0] == "OP" and toks[j][1] == "*")
+                    or (toks[j][0] == "PUNCT" and toks[j][1] == "{")
+                    or (toks[j][0] == "IDENT" and toks[j][1] == "type")
+                ):
+                    depth, m = 0, j
+                    while m < n:
+                        mk, mv, _ = toks[m]
+                        if mk == "PUNCT" and mv == "{":
+                            depth += 1
+                        elif mk == "PUNCT" and mv == "}":
+                            depth = max(0, depth - 1)
+                        elif depth == 0 and mk == "PUNCT" and mv in (";", "="):
+                            break
+                        elif depth == 0 and mk == "IDENT" and mv == "from":
+                            s_idx = _next_sig(m + 1)
+                            if s_idx < n and toks[s_idx][0] == "STR":
+                                out.append((toks[s_idx][2], toks[s_idx][1].strip()))
+                            break
+                        m += 1
+
+        stmt_start = bool(kind == "PUNCT" and val in (";", "{", "}") and paren_depth == 0)
+        prev_kind, prev_val = kind, val
+        i += 1
+    return out
 
 
 def _extract_python_imports(path: str, text: str) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
@@ -267,8 +466,7 @@ def _extract_imports(path: str, text: str) -> list[tuple[int, str]]:
         imports, _ = _extract_python_imports(path, text)
         return imports
     if ext in JS_EXTS:
-        cleaned = _strip_js_comments(text)
-        return [(cleaned.count("\n", 0, m.start()) + 1, m.group(1).strip()) for m in JS_IMPORT_RE.finditer(cleaned)]
+        return _extract_js_imports(text)
     return []
 
 

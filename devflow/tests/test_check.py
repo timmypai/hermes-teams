@@ -491,18 +491,30 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             changed_files = ["a.py"]
             """,
         )
-        self.write("web/ok.ts", '// import x from "infra/a";\n/* require("infra/b") */\nconst s = "/* keep */";\n')
+        self.write(
+            "web/ok.ts",
+            '// import x from "infra/a";\n'
+            '/* require("infra/b") */\n'
+            'const s = "/* keep */";\n'
+            'const documentation = "import(\'infra/private\')";\n'
+            "const singleq = 'require(\"infra/private\")';\n"
+            "const tpl = `hello ${s}\nimport('infra/private')\nrequire('infra/x')`;\n"
+            'const member = obj.import("infra/not_real");\n',
+        )
         self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
+        self.write("web/tpl_real.ts", "export const x = `${await import('infra/tpl_client')}`;\n")
         self.write("domain/broken.py", "def broken(:\n")
         code, out = self.check()
         self.assertEqual(code, 1, out)
         self.assertNotIn("web/ok.ts", out)
         self.assertIn("web/dyn.ts:1 [domain-boundary]", out)
+        self.assertIn("web/tpl_real.ts:1 [domain-boundary]", out)
         self.assertIn("domain/broken.py:1 [domain-boundary]", out)
         self.assertIn("SyntaxError", out)
 
         # Clean python + JS lets repo check pass, while PR gate still enforces diff_policy alias
         self.write("web/dyn.ts", 'export const ok = 1;\n')
+        self.write("web/tpl_real.ts", 'export const ok = 2;\n')
         self.write("domain/broken.py", "X = 1\n")
         self.start("exit 0\n")
         code_ok, out_ok = self.check()

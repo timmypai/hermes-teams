@@ -1540,10 +1540,11 @@ def _owning_epic_body(board: str, task_body: str | None) -> str | None:
     return None
 
 
-def completed_card_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[dict | None, bool]:
+def completed_card_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[Any, bool]:
     """Read raw structured handoff `metadata` from a completed card's latest done run.
 
-    Returns `(metadata_dict_or_none, has_run_record)`. Never swallows malformed/empty metadata.
+    Returns `(decoded_metadata_value, has_run_record)`. Preserves empty dicts, lists, `None`,
+    and non-object JSON values verbatim so schema validators fail closed rather than masking them.
     """
     runs = (parent_card or {}).get("runs") or []
     for run_item in reversed(runs):
@@ -1551,13 +1552,7 @@ def completed_card_handoff(board: str, parent_id: str, parent_card: dict | None 
             continue
         if run_item.get("status") not in (None, "done"):
             continue
-        meta = run_item.get("metadata")
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except ValueError:
-                return None, True
-        return (meta if isinstance(meta, dict) else {}), True
+        return _decode_run_meta(run_item.get("metadata")), True
     db = BOARDS / board / "kanban.db"
     if db.is_file():
         with suppress(sqlite3.Error):
@@ -1567,13 +1562,7 @@ def completed_card_handoff(board: str, parent_id: str, parent_card: dict | None 
                 (parent_id,),
             )
             if rows:
-                meta = rows[0].get("metadata")
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except ValueError:
-                        return None, True
-                return (meta if isinstance(meta, dict) else {}), True
+                return _decode_run_meta(rows[0].get("metadata")), True
     return {}, False
 
 
@@ -1762,7 +1751,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                 pkind = card_type(pc.get("title") or "") or ""
                 if pkind in ("RES", "DEV", "OPS", "SHIP"):
                     pmeta, has_run = completed_card_handoff(board, pid, pc)
-                    if has_run and (pmeta is None or bool(pmeta)):
+                    if has_run:
                         if herrs := handoff_lib.validate_card_handoff(pkind, pmeta, POLICY):
                             found.append(
                                 f"{tid}: [{kind}] 的前置 [{pkind}] {pid} 交接 metadata 不完整"
@@ -5935,14 +5924,17 @@ def cmd_pr_submit(a) -> None:
     }, ensure_ascii=False, indent=2))
 
 
-def _decode_run_meta(raw: Any) -> dict | None:
+def _decode_run_meta(raw: Any) -> Any:
+    """Decode JSON metadata string preserving non-dict types (list, null, str, int) so validators fail closed."""
     if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return raw
         try:
-            decoded = json.loads(raw)
+            return json.loads(s)
         except ValueError:
-            return None
-        return decoded if isinstance(decoded, dict) else {}
-    return raw if isinstance(raw, dict) else {}
+            return raw
+    return raw
 
 
 def _resolve_check_card_arch_parents(board_arg: str, parent_ids: list[str]) -> list[tuple[str, dict | None]]:

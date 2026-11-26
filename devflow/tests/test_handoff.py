@@ -395,11 +395,46 @@ class BinDevflowHandoffIntegration(unittest.TestCase):
         cards["t_ep1"]["parents"] = ["t_ship2"]
         self.assertEqual(self.df.plan_rules("b", "t_ep1", cards), [])
 
-        # Malformed or partial structured metadata on done [RES] parent fails plan_rules
-        cards["t_dev1"]["status"] = "todo"
-        cards["t_res1"]["runs"] = [{"status": "done", "metadata": {"root_cause": "only partial"}}]
-        bad_found = self.df.plan_rules("b", "t_ep1", cards)
-        self.assertTrue(any("t_res1" in f and "交接 metadata" in f for f in bad_found), bad_found)
+        # Empty, null, list, and non-object JSON string completed handoffs fail closed across RES/DEV/SHIP in plan_rules
+        for bad_meta in ({}, [], None, "[]", "null", "{bad", '"ok"', ""):
+            cards["t_dev1"]["status"] = "todo"
+            cards["t_ship1"]["status"] = "todo"
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_res1" in f and "交接 metadata" in f for f in bad_found), (bad_meta, bad_found))
+            # Also verify empty/non-dict completed metadata on DEV feeding open SHIP, and SHIP feeding open DEV2
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": {"root_cause": "race", "evidence": ["log1"]}}]
+            cards["t_dev1"]["body"] = self._dev_body("app/a.py, app/b.py")
+            cards["t_dev1"]["status"] = "done"
+            cards["t_dev1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            dev_bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_dev1" in f and "交接 metadata" in f for f in dev_bad_found), (bad_meta, dev_bad_found))
+
+            cards["t_dev1"]["runs"] = [{"status": "done", "metadata": {"pr_url": "https://g/1", "head_sha": "a" * 40, "tests": "ok"}}]
+            cards["t_ship1"]["status"] = "done"
+            cards["t_ship1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            ship_bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_ship1" in f and "交接 metadata" in f for f in ship_bad_found), (bad_meta, ship_bad_found))
+        cards["t_ship1"]["runs"] = []
+
+        # Verify SQLite task_runs reader preserves [], {}, null, '[]' identically
+        db = self.board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
+            CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, status TEXT, metadata TEXT);
+        """)
+        for raw_json in ("{}", "[]", "null", '"str"', "{bad"):
+            conn.execute("DELETE FROM task_runs")
+            conn.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES ('t_res1', 'done', ?)", (raw_json,))
+            conn.commit()
+            cards_sql = json.loads(json.dumps(cards))
+            cards_sql["t_res1"]["runs"] = []
+            cards_sql["t_dev1"]["status"] = "todo"
+            cards_sql["t_dev1"]["runs"] = []
+            sql_found = self.df.plan_rules("b", "t_ep1", cards_sql)
+            self.assertTrue(any("t_res1" in f and "交接 metadata" in f for f in sql_found), (raw_json, sql_found))
+        conn.close()
 
         # CLI `cmd_check_handoff` enforces schema strictly via --metadata or card runs
         buf = io.StringIO()
@@ -410,6 +445,7 @@ class BinDevflowHandoffIntegration(unittest.TestCase):
             ))
         self.assertTrue(json.loads(buf.getvalue())["ok"])
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": {"root_cause": "partial"}}]
             self.df.cmd_check_handoff(types.SimpleNamespace(
                 board="b", task="t_res1", metadata=None, metadata_file=None,
             ))

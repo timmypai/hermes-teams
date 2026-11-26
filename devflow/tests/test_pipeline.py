@@ -387,6 +387,31 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         found = df.plan_rules("b", "t_ep1", cards_early)
         self.assertTrue(any(f.startswith("t_res1:") and "Start-At=implement" in f for f in found), found)
 
+        # Advance from Stop-After: ci -> Stop-After: review preserves live [DEV]/[OPS] card in review lane
+        adv_epic_body = (
+            "Mode: deliver\nStop-After: ci\n## 目標\n進到 review\n\n## 驗收\n- AC-1 [api] 200\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        adv_cards = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] API fix", "status": "todo", "assignee": "orchestrator",
+                      "workspace_kind": "dir", "parents": ["t_dev1"], "children": [], "goal_mode": False,
+                      "body": adv_epic_body},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] 修 /ok", "status": "review", "block_kind": None,
+                       "assignee": "reviewer", "workspace_kind": "worktree", "parents": [], "children": ["t_ep1"],
+                       "goal_mode": True, "completion_contract": REPO,
+                       "body": f"## 目標\n修\n\n## 本卡完成\n{df.DONE_TEXT}\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n"},
+        }
+        self.assertEqual(df.plan_rules("b", "t_ep1", adv_cards), [])
+        adv_body_rev, adv_spec_rev = pipe_lib.advance_epic_body(adv_epic_body, df.POLICY, stop_after="review", epic_mode="deliver")
+        self.assertEqual(adv_spec_rev["start_at"], "review")
+        adv_cards["t_ep1"]["body"] = adv_body_rev
+        self.assertEqual(df.plan_rules("b", "t_ep1", adv_cards), [])
+        # Advancing past review to ship while DEV is still open catches DEV as before Start-At=ship
+        adv_body_ship, _ = pipe_lib.advance_epic_body(adv_body_rev, df.POLICY, stop_after="ship", epic_mode="deliver")
+        adv_cards["t_ep1"]["body"] = adv_body_ship
+        ship_found = df.plan_rules("b", "t_ep1", adv_cards)
+        self.assertTrue(any(f.startswith("t_dev1:") and "Start-At=ship" in f for f in ship_found), ship_found)
+
         # 2. _maybe_mark_slice_paused stamps Paused-At: ci idempotently once [DEV] completes
         epic_body = (
             "Mode: deliver\nStop-After: ci\n## 目標\n只做到 ci\n\n## 驗收\n- AC-1 [api] 200\n"

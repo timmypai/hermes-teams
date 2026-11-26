@@ -218,22 +218,46 @@ def is_card_beyond_stop(
     return steps.index(step) > steps.index(stop_after)
 
 
+def card_step_span(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> tuple[int, int] | None:
+    """Return inclusive `(start_idx, end_idx)` in `spec['steps']` owned by `kind`.
+
+    A card type owns from its mapped step through any immediately following steps that have no
+    separate card entry in `step_cards` (for example, `DEV`/`OPS` at `implement` remain active
+    through `ci` and `review` before `SHIP` takes over at `ship`).
+    """
+    if not spec.get("valid", True):
+        return None
+    steps = list(spec.get("steps") or [])
+    start_step = card_step_for_kind(kind, spec, policy)
+    if not start_step or start_step not in steps:
+        return None
+    lo = steps.index(start_step)
+    pipe_cfg = policy_lib.pipelines_config(policy).get(spec.get("pipeline") or "") or {}
+    assigned_steps = {str(k).strip().lower() for k, v in (pipe_cfg.get("step_cards") or {}).items() if v}
+    hi = lo
+    while hi + 1 < len(steps) and steps[hi + 1] not in assigned_steps:
+        hi += 1
+    return lo, hi
+
+
 def is_card_before_start(
     kind: str,
     spec: dict[str, Any],
     policy: dict[str, Any] | None = None,
 ) -> bool:
-    """True when `spec` is valid and `kind` belongs strictly before `spec['start_at']`."""
-    if not spec.get("valid", True):
+    """True when `spec` is valid and `kind`'s entire lifecycle span lies strictly before `spec['start_at']`."""
+    span = card_step_span(kind, spec, policy)
+    if span is None:
         return False
     steps = list(spec.get("steps") or [])
     start_at = str(spec.get("start_at") or "").strip().lower()
     if start_at not in steps:
         return False
-    step = card_step_for_kind(kind, spec, policy)
-    if not step or step not in steps:
-        return False
-    return steps.index(step) < steps.index(start_at)
+    return span[1] < steps.index(start_at)
 
 
 def is_step_active(step: str, spec: dict[str, Any]) -> bool:
@@ -278,23 +302,24 @@ def slice_stop_reached(
     spec: dict[str, Any],
     policy: dict[str, Any] | None = None,
 ) -> bool:
-    """True when a partial pipeline (`stop_after != terminal`) has finished every card in `active_steps`."""
+    """True when a partial pipeline (`stop_after != terminal`) has finished every card overlapping `active_steps`."""
     if not spec.get("valid"):
         return False
     steps = list(spec.get("steps") or [])
-    if not steps or spec.get("stop_after") == steps[-1]:
+    start_at = str(spec.get("start_at") or "").strip().lower()
+    stop_after = str(spec.get("stop_after") or "").strip().lower()
+    if not steps or start_at not in steps or stop_after not in steps or stop_after == steps[-1]:
         return False
-    active = {str(s).strip().lower() for s in (spec.get("active_steps") or [])}
-    in_slice = [
-        c for cid, c in cards.items()
-        if cid != epic
-        and c.get("status") != "archived"
-        and (card_step := card_step_for_kind(
-            (str(c.get("title") or "").lstrip("[").split("]", 1)[0] if str(c.get("title") or "").lstrip().startswith("[") else ""),
-            spec,
-            policy,
-        )) in active
-    ]
+    s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
+    in_slice: list[dict[str, Any]] = []
+    for cid, c in cards.items():
+        if cid == epic or c.get("status") == "archived":
+            continue
+        title = str(c.get("title") or "").lstrip()
+        kind = title[1:].split("]", 1)[0] if title.startswith("[") and "]" in title else ""
+        span = card_step_span(kind, spec, policy)
+        if span is not None and not (span[1] < s_idx or span[0] > e_idx):
+            in_slice.append(c)
     return bool(in_slice) and all(c.get("status") in ("done", "archived") for c in in_slice)
 
 
