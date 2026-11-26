@@ -370,6 +370,12 @@ class PrSubmit(unittest.TestCase):
 
         def run(cmd, **kw):
             self.calls.append(list(cmd))
+            if cmd[:3] == ["gh", "pr", "list"]:
+                if self.pr is None:
+                    return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+                st_filter = (_flag(cmd, "--state") or "open").lower()
+                prs = [self.pr] if st_filter == "all" or self.pr.get("state", "").lower() == st_filter else []
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(prs))
             if cmd[:3] == ["gh", "pr", "view"]:
                 if self.pr is None:
                     return SimpleNamespace(returncode=1, stdout="", stderr="no pull requests found")
@@ -498,6 +504,72 @@ class PrSubmit(unittest.TestCase):
             }
             code, out = self.submit()
             self.assertEqual((code, out["ok"], out["stage"], out["pr_state"]), (1, False, "pr_state", st))
+            self.assertEqual(self._mutating_calls(), [])
+
+    def test_unknown_task_or_missing_board_db_fails_closed_before_push(self) -> None:
+        self.make({"docs/not-allowed.md": "outside scope\n"})
+        code, out = self.submit(task="t_typo")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
+        self.assertEqual(out["preflight"]["checks"].get("card_lookup"), "fail")
+        self.assertEqual(self._mutating_calls(), [])
+
+        self.calls.clear()
+        code, out = self.submit(task="")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
+        self.assertEqual(out["preflight"]["checks"].get("card_lookup"), "fail")
+        self.assertEqual(self._mutating_calls(), [])
+
+        self.calls.clear()
+        db = self.root / "data" / "kanban" / "boards" / "b" / "kanban.db"
+        with closing(sqlite3.connect(db)) as c, c:
+            c.execute("DELETE FROM tasks WHERE id = 't_ep1'")
+        code, out = self.submit(task="t_dev1")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
+        self.assertEqual(out["preflight"]["checks"].get("card_lookup"), "fail")
+        self.assertEqual(self._mutating_calls(), [])
+
+        self.calls.clear()
+        db.unlink()
+        code, out = self.submit(task="t_dev1")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
+        self.assertEqual(out["preflight"]["checks"].get("card_lookup"), "fail")
+        self.assertEqual(self._mutating_calls(), [])
+
+    def test_standalone_taskless_preflight_still_works(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.df.cmd_preflight(SimpleNamespace(
+                slug="b", task=None, dir=str(self.repo), base="HEAD~1",
+                pr_title="feat: ok", pr_body="ok", pr_body_file=None, no_test=True, allow_dirty=False,
+            ))
+        rep = json.loads(buf.getvalue())
+        self.assertTrue(rep["ok"], rep)
+
+        buf2 = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stdout(buf2):
+            self.df.cmd_preflight(SimpleNamespace(
+                slug="b", task="t_typo", dir=str(self.repo), base="HEAD~1",
+                pr_title="feat: ok", pr_body="ok", pr_body_file=None, no_test=True, allow_dirty=False,
+            ))
+        self.assertEqual(cm.exception.code, 1)
+        rep2 = json.loads(buf2.getvalue())
+        self.assertEqual(rep2["checks"].get("card_lookup"), "fail")
+
+    def test_pr_lookup_failure_or_malformed_response_refuses_before_push(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        for bad_res in (
+            SimpleNamespace(returncode=1, stdout="", stderr="HTTP 503 Service Unavailable"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="not-json", stderr=""),
+            SimpleNamespace(returncode=0, stdout='{"not": "a list"}', stderr=""),
+        ):
+            self.calls.clear()
+            self.df.run = lambda cmd, _res=bad_res, **kw: (
+                self.calls.append(list(cmd)) or (_res if cmd[:3] == ["gh", "pr", "list"] else SimpleNamespace(returncode=0, stdout="", stderr=""))
+            )
+            code, out = self.submit()
+            self.assertEqual((code, out["ok"], out["stage"]), (1, False, "pr_lookup"), out)
             self.assertEqual(self._mutating_calls(), [])
 
 

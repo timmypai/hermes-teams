@@ -5013,47 +5013,72 @@ def _run_card_preflight(
     *,
     override_pr_title: str | None = None,
     override_pr_body: str | None = None,
+    require_task: bool = False,
 ) -> tuple[dict, dict, Path, str | None]:
     e = entry(a.slug)
     repo_dir = Path(a.dir).resolve()
     base_ref = a.base or f"origin/{e['default_branch']}"
     card_body, card_title, epic_id, epic_body, valid_scenarios = None, None, None, None, None
-    extra_findings: list[str] = []
+    scenario_errors: list[str] = []
+    card_lookup_errors: list[str] = []
     review_loop: dict | None = None
-    if a.task and (BOARDS / e["slug"] / "kanban.db").exists():
-        cols = {r["name"] for r in board_rows(e["slug"], "PRAGMA table_info(tasks)")}
-        sel = "id, body" + (", title" if "title" in cols else "")
-        rows = board_rows(e["slug"], f"SELECT {sel} FROM tasks WHERE id = ?", (a.task,))
-        if rows:
-            card_body = rows[0].get("body") or ""
-            card_title = rows[0].get("title") or ""
-            if m := EPIC_REF.search(card_body):
-                epic_id = m.group(1)
-                epics = board_rows(e["slug"], "SELECT body FROM tasks WHERE id = ?", (epic_id,))
-                if epics:
-                    epic_body = epics[0].get("body") or ""
-                    spec = epic_acceptance_spec(
-                        e["slug"], epic_id, epic_body, extra_dirs=[repo_dir]
+    task_id = str(a.task).strip() if a.task else ""
+    if require_task and not task_id:
+        card_lookup_errors.append("pr submit 必須提供有效的任務卡 ID")
+    elif task_id:
+        db_path = BOARDS / e["slug"] / "kanban.db"
+        if not db_path.is_file():
+            card_lookup_errors.append(f"找不到看板資料庫（{e['slug']}），無法驗證任務卡 {task_id} 的範圍契約")
+        else:
+            try:
+                cols = {r["name"] for r in board_rows(e["slug"], "PRAGMA table_info(tasks)")}
+                sel = "id, body" + (", title" if "title" in cols else "")
+                rows = board_rows(e["slug"], f"SELECT {sel} FROM tasks WHERE id = ?", (task_id,))
+                if not rows:
+                    card_lookup_errors.append(f"看板 {e['slug']} 找不到任務卡 {task_id}，無法驗證範圍契約")
+                else:
+                    card_body = rows[0].get("body") or ""
+                    card_title = rows[0].get("title") or ""
+                    repo_cfg = policy_lib.load_repo_config(repo_dir)
+                    req_scope = policy_lib.repo_require_allowed_scope(
+                        repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
                     )
-                    valid_scenarios = {s["id"] for ac in spec for s in ac["scenarios"]}
-                    local_sc_path = repo_dir / ".devflow" / "scenarios.json"
-                    if local_sc_path.is_file():
-                        try:
-                            raw_sc = json.loads(local_sc_path.read_text(encoding="utf-8"))
-                            if not isinstance(raw_sc, dict):
-                                raise ValueError("root must be a JSON object")
-                            local_by_ac = _parse_repo_scenarios(raw_sc, epic_id)
-                        except (OSError, ValueError) as err:
-                            extra_findings.append(f"本機 worktree 的 .devflow/scenarios.json 無法解析：{err}")
+                    if req_scope and ((not card_title) or (card_type(card_title) in ("DEV", "OPS"))) and not card_body.strip():
+                        card_lookup_errors.append(f"任務卡 {task_id} 內文為空，缺少 Allowed-Scope 範圍契約")
+                    if m := EPIC_REF.search(card_body):
+                        epic_id = m.group(1)
+                        epics = board_rows(e["slug"], "SELECT body FROM tasks WHERE id = ?", (epic_id,))
+                        if not epics:
+                            card_lookup_errors.append(
+                                f"看板 {e['slug']} 找不到任務卡 {task_id} 所屬的 EPIC {epic_id}，無法驗證不能碰範圍與驗收情境"
+                            )
                         else:
-                            non_manual_acs = {ac["ac"] for ac in spec if ac["type"] != "manual"}
-                            for ac_id, scs in local_by_ac.items():
-                                if ac_id in non_manual_acs:
-                                    valid_scenarios.update(s["id"] for s in scs)
-        cr_count = kanban_adapter.card_changes_requested_count(BOARDS, e["slug"], a.task)
-        review_loop = breakers.review_round_breaker(
-            github_rejections=0, kanban_rejections=cr_count, approved_latest=False, max_rounds=MAX_REVIEW_ROUNDS
-        )
+                            epic_body = epics[0].get("body") or ""
+                            spec = epic_acceptance_spec(
+                                e["slug"], epic_id, epic_body, extra_dirs=[repo_dir]
+                            )
+                            valid_scenarios = {s["id"] for ac in spec for s in ac["scenarios"]}
+                            local_sc_path = repo_dir / ".devflow" / "scenarios.json"
+                            if local_sc_path.is_file():
+                                try:
+                                    raw_sc = json.loads(local_sc_path.read_text(encoding="utf-8"))
+                                    if not isinstance(raw_sc, dict):
+                                        raise ValueError("root must be a JSON object")
+                                    local_by_ac = _parse_repo_scenarios(raw_sc, epic_id)
+                                except (OSError, ValueError) as err:
+                                    scenario_errors.append(f"本機 worktree 的 .devflow/scenarios.json 無法解析：{err}")
+                                else:
+                                    non_manual_acs = {ac["ac"] for ac in spec if ac["type"] != "manual"}
+                                    for ac_id, scs in local_by_ac.items():
+                                        if ac_id in non_manual_acs:
+                                            valid_scenarios.update(s["id"] for s in scs)
+                if not card_lookup_errors:
+                    cr_count = kanban_adapter.card_changes_requested_count(BOARDS, e["slug"], task_id)
+                    review_loop = breakers.review_round_breaker(
+                        github_rejections=0, kanban_rejections=cr_count, approved_latest=False, max_rounds=MAX_REVIEW_ROUNDS
+                    )
+            except sqlite3.Error as err:
+                card_lookup_errors.append(f"讀取看板資料庫失敗（{e['slug']} / {task_id}）：{err}")
     raw_pr_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
     pr_title = a.pr_title if override_pr_title is None else override_pr_title
     pr_body = raw_pr_body if override_pr_body is None else override_pr_body
@@ -5072,9 +5097,15 @@ def _run_card_preflight(
         allow_dirty=a.allow_dirty,
         template_dir=TEMPLATE if TEMPLATE.is_dir() else None,
         review_loop=review_loop,
-        extra_findings=extra_findings or None,
+        extra_findings=scenario_errors or None,
         require_scope_for_card=require_scope_for_card,
     )
+    if card_lookup_errors:
+        rep["checks"]["card_lookup"] = "fail"
+        rep["findings"] = card_lookup_errors + list(rep.get("findings") or [])
+        rep["ok"] = False
+    elif require_task or task_id:
+        rep["checks"]["card_lookup"] = "ok"
     return e, rep, repo_dir, pr_body
 
 
@@ -5086,6 +5117,11 @@ def cmd_preflight(a) -> None:
         sys.exit(1)
 
 
+def _pr_lookup_fail(error: str) -> None:
+    print(json.dumps({"ok": False, "stage": "pr_lookup", "error": error}, ensure_ascii=False, indent=2))
+    sys.exit(1)
+
+
 def cmd_pr_submit(a) -> None:
     """Shift-left single entry for developers: resolve existing PR metadata/owner/state, run
     deterministic preflight against effective PR title/body, then push and create/edit PR."""
@@ -5094,16 +5130,37 @@ def cmd_pr_submit(a) -> None:
     supplied_title = a.pr_title
     supplied_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
 
-    existing_view = run(
-        ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
+    br = preflight_lib._git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = (br.stdout or "").strip() if br.returncode == 0 else ""
+    if br.returncode != 0 or not branch or branch == "HEAD":
+        err = ((br.stderr or br.stdout).strip() if hasattr(br, "stderr") else "") or "detached HEAD"
+        _pr_lookup_fail(f"pr submit 無法取得目前分支名稱（{err[-200:]}）")
+
+    existing_list = run(
+        [
+            "gh", "pr", "list", "-R", e["repo"], "--head", branch, "--state", "all",
+            "--json", "url,number,headRefOid,state,title,body",
+        ],
         cwd=repo_dir, gh="builder", check=False,
     )
+    if existing_list.returncode != 0 or not (existing_list.stdout or "").strip():
+        msg = ((existing_list.stderr or existing_list.stdout or "").strip()[-400:]) or "空白回應"
+        _pr_lookup_fail(f"pr submit 查詢現有 PR 失敗：{msg}")
+    try:
+        prs = json.loads(existing_list.stdout)
+    except ValueError as err:
+        _pr_lookup_fail(f"pr submit 無法解析現有 PR 清單：{err}")
+    if not isinstance(prs, list) or not all(isinstance(p, dict) for p in prs):
+        _pr_lookup_fail("pr submit 現有 PR 清單格式錯誤（非 JSON 陣列）")
+
     existing: dict | None = None
-    if existing_view.returncode == 0 and existing_view.stdout.strip():
-        try:
-            existing = json.loads(existing_view.stdout)
-        except ValueError as err:
-            die(f"pr submit 無法解析現有 PR metadata：{err}")
+    if prs:
+        open_prs = [p for p in prs if str(p.get("state") or "").upper() == "OPEN"]
+        if len(open_prs) > 1:
+            _pr_lookup_fail(f"分支 {branch} 存在多個 OPEN PR，請先整理後再重送")
+        existing = open_prs[0] if open_prs else prs[0]
+        if not isinstance(existing.get("number"), int) or not str(existing.get("state") or "").strip():
+            _pr_lookup_fail("pr submit 查詢回傳缺少 number/state 的無效 PR metadata")
 
     if existing is not None:
         state = str(existing.get("state") or "").upper()
@@ -5151,7 +5208,7 @@ def cmd_pr_submit(a) -> None:
         eff_body = base_body_raw
 
     _, rep, _, _ = _run_card_preflight(
-        a, override_pr_title=eff_title, override_pr_body=eff_body,
+        a, override_pr_title=eff_title, override_pr_body=eff_body, require_task=True,
     )
     if not rep["ok"]:
         print(json.dumps({"ok": False, "stage": "preflight", "preflight": rep}, ensure_ascii=False, indent=2))
@@ -5177,20 +5234,23 @@ def cmd_pr_submit(a) -> None:
         )
         if updated_metadata:
             edit = run(
-                ["gh", "pr", "edit", str(existing["number"]), "--title", eff_title, "--body", eff_body],
+                ["gh", "pr", "edit", str(existing["number"]), "-R", e["repo"], "--title", eff_title, "--body", eff_body],
                 cwd=repo_dir, gh="builder", check=False,
             )
             if edit.returncode != 0:
                 die(f"pr submit 更新 PR metadata 失敗：{(edit.stderr or edit.stdout).strip()[-400:]}")
         view = run(
-            ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
+            ["gh", "pr", "view", str(existing["number"]), "-R", e["repo"], "--json", "url,number,headRefOid,state,title,body"],
             cwd=repo_dir, gh="builder", check=False,
         )
-        if view.returncode != 0 or not view.stdout.strip():
+        if view.returncode != 0 or not (view.stdout or "").strip():
             die(f"pr submit 讀回 PR 失敗：{(view.stderr or view.stdout).strip()[-400:]}")
-        pr_info = json.loads(view.stdout)
-        if str(pr_info.get("state") or "").upper() != "OPEN":
-            die(f"pr submit 讀回 PR #{pr_info.get('number')} 狀態非 OPEN：{pr_info.get('state')}")
+        try:
+            pr_info = json.loads(view.stdout)
+        except ValueError as err:
+            die(f"pr submit 讀回 PR metadata 失敗：{err}")
+        if not isinstance(pr_info, dict) or str(pr_info.get("state") or "").upper() != "OPEN":
+            die(f"pr submit 讀回 PR #{existing.get('number')} 狀態非 OPEN：{pr_info.get('state') if isinstance(pr_info, dict) else pr_info}")
         if updated_metadata and (
             (pr_info.get("title") or "").strip() != eff_title.strip()
             or (pr_info.get("body") or "").replace("\r\n", "\n").rstrip() != eff_body.replace("\r\n", "\n").rstrip()
@@ -5203,11 +5263,21 @@ def cmd_pr_submit(a) -> None:
         )
         if create.returncode != 0:
             die(f"pr submit 建立 PR 失敗：{(create.stderr or create.stdout).strip()[-400:]}")
-        view = run(
-            ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
-            cwd=repo_dir, gh="builder",
+        created_view = run(
+            ["gh", "pr", "list", "-R", e["repo"], "--head", branch, "--state", "open", "--json", "url,number,headRefOid,state,title,body"],
+            cwd=repo_dir, gh="builder", check=False,
         )
-        pr_info = json.loads(view.stdout)
+        if created_view.returncode != 0 or not (created_view.stdout or "").strip():
+            die(f"pr submit 建立後讀回 PR 失敗：{(created_view.stderr or created_view.stdout).strip()[-400:]}")
+        try:
+            created_prs = json.loads(created_view.stdout)
+        except ValueError as err:
+            die(f"pr submit 建立後無法解析 PR metadata：{err}")
+        if not isinstance(created_prs, list) or len(created_prs) != 1 or not isinstance(created_prs[0], dict):
+            die(f"pr submit 建立後讀回異常：{created_prs!r}")
+        pr_info = created_prs[0]
+        if str(pr_info.get("state") or "").upper() != "OPEN":
+            die(f"pr submit 建立後讀回 PR 狀態非 OPEN：{pr_info.get('state')}")
         created = True
         updated_metadata = False
 
