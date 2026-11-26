@@ -222,6 +222,119 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after=None, to_end=True))
 
+    def test_omitted_mode_with_investigate_pipeline_fails_closed(self) -> None:
+        cards = self._base_cards("Pipeline: investigate\n")
+        found = self.df.plan_rules("b", "t_ep1", cards)
+        self.assertTrue(any("不一致" in f and "Pipeline" in f for f in found), found)
+        self.assertTrue(any("[SHIP]" in f for f in found), found)
+
+    def test_stop_after_blocks_out_of_slice_cards_until_epic_advance(self) -> None:
+        import os
+        import sqlite3
+        from unittest import mock
+
+        hermes = self.root / "hermes"
+        board_dir = hermes / "kanban" / "boards" / "b"
+        board_dir.mkdir(parents=True)
+        old_data = os.environ.get("DEVFLOW_HERMES_DATA")
+        os.environ["DEVFLOW_HERMES_DATA"] = str(hermes)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("DEVFLOW_HERMES_DATA", old_data)
+            if old_data is not None else os.environ.pop("DEVFLOW_HERMES_DATA", None)
+        )
+        df = load_devflow(self.root)
+        patcher = mock.patch.object(df.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        epic_body = (
+            "Mode: deliver\nStop-After: design\n## 目標\n先定案再施工\n\n## 驗收\n- AC-1 [api] 回傳 200\n"
+            "  - S1 [smoke]\n    - Given ready\n    - When GET /ok\n    - Then 200\n"
+        )
+        arch_body = "## 目標\n設計邊界\nEPIC: t_ep1\n"
+        dev_body = f"## 目標\n實作\n\n## 本卡完成\n{df.DONE_TEXT}\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n"
+        ship_body = "## 目標\n出貨\nEPIC: t_ep1\n"
+
+        db = board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT,
+                assignee TEXT, workspace_kind TEXT, workspace_path TEXT,
+                completion_contract TEXT, created_by TEXT, result TEXT, goal_mode INTEGER
+            );
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER);
+        """)
+        rows = [
+            ("t_ep1", "[EPIC] API", epic_body, "todo", None, "orchestrator", "dir", "", None, "default", None, 0),
+            ("t_arch1", "[ARCH] 設計", arch_body, "ready", None, "architect", "dir", "", None, "orchestrator", None, 0),
+            ("t_dev1", "[DEV] 實作", dev_body, "ready", None, "developer", "worktree", "", REPO, "orchestrator", None, 1),
+            ("t_ship1", "[SHIP] 出貨", ship_body, "todo", None, "devops", "dir", "", None, "orchestrator", None, 0),
+        ]
+        conn.executemany("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.executemany("INSERT INTO task_links VALUES (?,?)", [("t_arch1", "t_dev1"), ("t_dev1", "t_ship1"), ("t_ship1", "t_ep1")])
+        conn.commit()
+        conn.close()
+
+        cards = df.plan_cards("b", "t_ep1")
+        # Out-of-slice runnable DEV and SHIP are rejected in plan_rules before being parked
+        found = df.plan_rules("b", "t_ep1", cards)
+        self.assertTrue(any(f.startswith("t_dev1:") and "Stop-After=design" in f for f in found), found)
+        self.assertTrue(any(f.startswith("t_ship1:") and "Stop-After=design" in f for f in found), found)
+
+        # Parking out-of-slice cards holds both DEV and SHIP in blocked(dependency)
+        pipe_spec = df.pipeline_lib.parse_epic_pipeline(cards["t_ep1"]["body"], df.POLICY, epic_mode="deliver")
+        self.assertFalse(df.hold_out_of_slice_cards("b", "t_ep1", cards, pipe_spec))
+        cards = df.plan_cards("b", "t_ep1")
+        self.assertEqual(cards["t_dev1"]["status"], "blocked")
+        self.assertEqual(cards["t_dev1"]["block_kind"], "dependency")
+        self.assertEqual(cards["t_ship1"]["status"], "blocked")
+        self.assertEqual(cards["t_ship1"]["block_kind"], "dependency")
+        # Once parked at boundary (and ARCH still open, before DEV/SHIP run), plan_rules passes
+        self.assertEqual(df.plan_rules("b", "t_ep1", cards), [])
+
+        resumed: list[str] = []
+
+        def fake_kanban(board, cmd, tid, *args):
+            with sqlite3.connect(db) as c:
+                c.row_factory = sqlite3.Row
+                if cmd == "show":
+                    r = dict(c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    return json.dumps({"task": r, "events": [], "parents": [], "children": []})
+                if cmd == "edit":
+                    c.execute("UPDATE tasks SET body = ? WHERE id = ?", (args[args.index("--body") + 1], tid))
+                    return ""
+                if cmd == "comment":
+                    return ""
+                if cmd == "assign":
+                    to = None if args[0] == "none" else args[0]
+                    c.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (to, tid))
+                    return ""
+                if cmd == "unblock":
+                    c.execute("UPDATE tasks SET status = 'ready', block_kind = NULL WHERE id = ?", (tid,))
+                    c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'unblocked', '{}', 2)", (tid,))
+                    resumed.append(tid)
+                    return ""
+            raise AssertionError((cmd, tid, args))
+
+        df.kanban = fake_kanban
+        # Advance to Stop-After: ci -> releases t_dev1 ONLY; t_ship1 remains parked!
+        with contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after="ci", to_end=False))
+        self.assertEqual(resumed, ["t_dev1"])
+        after_ci = df.plan_cards("b", "t_ep1")
+        self.assertEqual(after_ci["t_dev1"]["status"], "ready")
+        self.assertEqual(after_ci["t_ship1"]["status"], "blocked")
+
+        # Advance to end -> releases t_ship1 too
+        resumed.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after=None, to_end=True))
+        self.assertEqual(resumed, ["t_ship1"])
+        after_end = df.plan_cards("b", "t_ep1")
+        self.assertEqual(after_end["t_ship1"]["status"], "ready")
+
 
 if __name__ == "__main__":
     unittest.main()

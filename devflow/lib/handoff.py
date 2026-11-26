@@ -50,6 +50,28 @@ def validate_handoff(step: str, metadata: Any, policy: dict[str, Any] | None = N
     return errs
 
 
+def validate_arch_handoff(
+    metadata: Any,
+    policy: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Validate completed `[ARCH]` handoff `metadata` and return `(planned_files, errors)`.
+
+    Enforces structured `design` schema (`decisions` + `target_files`, or legacy `file_plan`/
+    `allowed_scope` with extracted concrete paths) so empty/missing handoff metadata cannot
+    silently bypass downstream `Allowed-Scope` inheritance.
+    """
+    files = extract_arch_target_files(metadata)
+    errs = validate_handoff("design", metadata, policy)
+    if files:
+        errs = [e for e in errs if "缺少必填欄位 `target_files`" not in e]
+        broad = [p for p in files if scope_lib.is_overly_broad_scope(p)]
+        if broad and not any("過寬" in e for e in errs):
+            errs.append(f"[design] 規劃檔案過寬（{', '.join(broad)}），不得使用全專案萬用模式")
+    elif isinstance(metadata, dict) and not any("target_files" in e for e in errs):
+        errs.append("[design] handoff metadata 未包含任何有效 `target_files` / `file_plan` 路徑")
+    return files, errs
+
+
 def _normalize_glob_token(token: str) -> str:
     s = (token or "").strip().strip("`'\"")
     while s.startswith("./"):

@@ -278,9 +278,12 @@ def _extract_python_imports(rel_path: str, text: str) -> list[tuple[int, str]]:
                 out.append((node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
             if node.module:
-                resolved = _resolve_py_relative_import(rel_path, node.module, node.level)
-                if resolved:
-                    out.append((node.lineno, resolved))
+                base_mod = _resolve_py_relative_import(rel_path, node.module, node.level)
+                if base_mod:
+                    out.append((node.lineno, base_mod))
+                    for alias in node.names:
+                        if alias.name and alias.name != "*":
+                            out.append((node.lineno, f"{base_mod}.{alias.name}"))
             else:
                 for alias in node.names:
                     resolved = _resolve_py_relative_import(rel_path, alias.name, node.level)
@@ -371,11 +374,15 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
                 imports = _extract_python_imports(rel_path, text) if ext == ".py" else (
                     _extract_js_imports(text) if ext in JS_EXTS else []
                 )
+                reported_lines: set[int] = set()
                 for lineno, imp in imports:
+                    if lineno in reported_lines:
+                        continue
                     if 1 <= lineno <= len(lines) and _line_exempt(lines[lineno - 1], rule.id):
                         continue
                     if any(_import_matches_forbidden(imp, forb) for forb in rule.forbidden_modules):
                         findings.append(_finding(rule, rel_path, imp, line=lineno))
+                        reported_lines.add(lineno)
     return findings
 
 

@@ -357,18 +357,52 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             """,
         )
         self.write("domain/bad.py", "import infra.client\n")
+        self.write("domain/fromparent.py", "import domain\n")
+        self.write("domain/sub/alias.py", "from .. import infra\n")
+        self.write("domain/sub/pkgalias.py", "from ..sub_pkg import other\n")
+        self.write("pkg/domain/direct_from.py", "from pkg import infra\n")
+        # Rewrite rule to test both pkg.infra and infra prefixes on package-relative & direct from-import
+        self.write(
+            ".devflow/rules/domain-boundary.toml",
+            """\
+            id = "domain-boundary"
+            kind = "import_boundary"
+            message = "domain must not import infra"
+            include = ["domain/**/*.py", "pkg/domain/**/*.py", "web/domain/**/*.ts"]
+            forbidden_modules = ["infra", "pkg.infra", "domain.infra", "infra/"]
+
+            [[fixture]]
+            expect = "fail"
+            path = "domain/svc.py"
+            text = "from infra.db import query\\n"
+
+            [[fixture]]
+            expect = "pass"
+            path = "domain/svc.py"
+            text = "from domain.types import Item\\n"
+            """,
+        )
+        self.write("domain/from_alias.py", "from domain import infra, helper\n")
         self.write("web/domain/bad.ts", 'import { x } from "infra/http";\n')
         code, out = self.check()
         self.assertEqual(code, 1, out)
         self.assertIn("domain/bad.py:1 [domain-boundary]", out)
+        self.assertIn("domain/sub/alias.py:1 [domain-boundary]", out)
+        self.assertIn("domain/from_alias.py:1 [domain-boundary]", out)
+        self.assertIn("pkg/domain/direct_from.py:1 [domain-boundary]", out)
         self.assertIn("web/domain/bad.ts:1 [domain-boundary]", out)
+        self.assertNotIn("fromparent.py", out)
+        self.assertNotIn("pkgalias.py", out)
 
-        # Exemption with existing L-0001 suppresses both violations cleanly
+        # Exemption with existing L-0001 suppresses violations cleanly
         self.write(
             ".devflow/lessons/L-0001.toml",
             LESSON_RULE.replace("no-sleep-fix", "domain-boundary"),
         )
         self.write("domain/bad.py", "import infra.client  # devflow: allow domain-boundary L-0001\n")
+        self.write("domain/sub/alias.py", "from .. import infra  # devflow: allow domain-boundary L-0001\n")
+        self.write("domain/from_alias.py", "from domain import infra, helper  # devflow: allow domain-boundary L-0001\n")
+        self.write("pkg/domain/direct_from.py", "from pkg import infra  # devflow: allow domain-boundary L-0001\n")
         self.write("web/domain/bad.ts", '// devflow: allow domain-boundary L-0001\nimport { x } from "infra/http";\n')
         code, out = self.check()
         self.assertEqual(code, 0, out)

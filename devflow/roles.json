@@ -63,7 +63,7 @@
         "step_cards": {
           "repro": "RES",
           "design": "ARCH",
-          "implement": "DEV",
+          "implement": ["DEV", "OPS"],
           "ship": "SHIP",
           "accept": "EPIC"
         }

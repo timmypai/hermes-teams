@@ -203,8 +203,11 @@ def _extract_imports(path: str, text: str) -> list[tuple[int, str]]:
                     out.append((node.lineno, alias.name))
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
-                    if mod := _resolve_py_relative_import(path, node.module, node.level):
-                        out.append((node.lineno, mod))
+                    if base_mod := _resolve_py_relative_import(path, node.module, node.level):
+                        out.append((node.lineno, base_mod))
+                        for alias in node.names:
+                            if alias.name and alias.name != "*":
+                                out.append((node.lineno, f"{base_mod}.{alias.name}"))
                 else:
                     for alias in node.names:
                         if mod := _resolve_py_relative_import(path, alias.name, node.level):
@@ -239,9 +242,13 @@ def scan_text(rules: list[Rule], path: str, text: str, lessons: set[str]) -> lis
     for r in applicable:
         if r.kind != "import_boundary":
             continue
+        reported_lines: set[int] = set()
         for lineno, imp in _extract_imports(path, text):
+            if lineno in reported_lines:
+                continue
             if any(_import_matches_forbidden(imp, forb) for forb in r.forbidden_modules):
                 _record_line_violation(r, path, lineno, lines, lessons, out)
+                reported_lines.add(lineno)
     return out
 
 

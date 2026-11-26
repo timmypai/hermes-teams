@@ -56,7 +56,7 @@ DEFAULT_PIPELINES: dict[str, dict[str, Any]] = {
         "steps": ["repro", "design", "implement", "ci", "review", "ship", "accept"],
         "default_start": "repro",
         "default_stop": "accept",
-        "step_cards": {"repro": "RES", "design": "ARCH", "implement": "DEV", "ship": "SHIP", "accept": "EPIC"},
+        "step_cards": {"repro": "RES", "design": "ARCH", "implement": ["DEV", "OPS"], "ship": "SHIP", "accept": "EPIC"},
     },
     "investigate": {
         "steps": ["repro", "accept"],

@@ -208,6 +208,55 @@ class BinDevflowHandoffIntegration(unittest.TestCase):
                 body_file=None, assignee="developer", workspace="worktree", parent=["t_arch1"],
             ))
 
+    def test_empty_or_invalid_arch_handoff_never_silently_bypasses_scope_check(self) -> None:
+        epic_body = (
+            "Mode: deliver\n## 目標\ng\n## 驗收\n- AC-1 [lib] x\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        base_cards = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "assignee": "orchestrator",
+                      "workspace_kind": "dir", "parents": ["t_ship1"], "children": [], "goal_mode": False,
+                      "body": epic_body},
+            "t_arch1": {"id": "t_arch1", "title": "[ARCH] 設計", "status": "done", "assignee": "architect",
+                        "workspace_kind": "dir", "parents": [], "children": ["t_dev1"], "goal_mode": False,
+                        "body": "EPIC: t_ep1\n", "runs": []},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] 實作", "status": "todo", "assignee": "developer",
+                       "workspace_kind": "worktree", "parents": ["t_arch1"], "children": ["t_ship1"],
+                       "goal_mode": True, "completion_contract": REPO,
+                       "body": self._dev_body("app/store.py")},
+            "t_ship1": {"id": "t_ship1", "title": "[SHIP] 出貨", "status": "todo", "assignee": "devops",
+                        "workspace_kind": "dir", "parents": ["t_dev1"], "children": ["t_ep1"],
+                        "goal_mode": False, "body": "EPIC: t_ep1\n"},
+        }
+        for bad_runs in (
+            [],
+            [{"status": "done", "metadata": {}}],
+            [{"status": "done", "metadata": {"decisions": ["split"]}}],
+            [{"status": "done", "metadata": {"decisions": ["split"], "target_files": ["**/*"]}}],
+        ):
+            cards = json.loads(json.dumps(base_cards))
+            cards["t_arch1"]["runs"] = bad_runs
+            found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_arch1" in f and "結構化交接" in f for f in found), (bad_runs, found))
+
+            self.df.kanban = lambda b, cmd, tid, *a: json.dumps({"task": cards[tid], "runs": cards[tid]["runs"]})
+            with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+                self.df.cmd_check_card(types.SimpleNamespace(
+                    board="b", title="[DEV] 實作", body=self._dev_body("app/store.py"),
+                    body_file=None, assignee="developer", workspace="worktree", parent=["t_arch1"],
+                ))
+
+        # Supported legacy file_plan + decisions passes handoff check and enforces Allowed-Scope
+        legacy_cards = json.loads(json.dumps(base_cards))
+        legacy_cards["t_arch1"]["runs"] = [
+            {"status": "done", "metadata": {"decisions": ["keep"], "file_plan": ["app/store.py", "app/cli.py"]}}
+        ]
+        found_leg = self.df.plan_rules("b", "t_ep1", legacy_cards)
+        self.assertFalse(any("結構化交接" in f for f in found_leg), found_leg)
+        self.assertTrue(any("app/cli.py" in f for f in found_leg), found_leg)
+        legacy_cards["t_dev1"]["body"] = self._dev_body("app/store.py, app/cli.py")
+        self.assertEqual(self.df.plan_rules("b", "t_ep1", legacy_cards), [])
+
     def test_answer_add_scope_and_cmd_scope_add_atomic_and_fail_closed(self) -> None:
         db = self.board_dir / "kanban.db"
         conn = sqlite3.connect(db)

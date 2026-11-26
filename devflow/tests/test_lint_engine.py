@@ -73,13 +73,29 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         (d / "src" / "domain").mkdir(parents=True)
         (d / "web" / "domain").mkdir(parents=True)
         (d / "src" / "domain" / "bad.py").write_text("import src.infra.http\n", encoding="utf-8")
+        (d / "src" / "domain" / "fromsub.py").write_text("from src import infra\n", encoding="utf-8")
         (d / "src" / "domain" / "relbad.py").write_text("from .. import infra\n", encoding="utf-8")
         (d / "src" / "domain" / "ok.py").write_text("import src.infra.http  # devflow: allow no-infra-in-domain L-0001\n", encoding="utf-8")
+        (d / "src" / "domain" / "ok2.py").write_text("from src import types\n", encoding="utf-8")
         (d / "web" / "domain" / "bad.ts").write_text('import { client } from "infra/api";\n', encoding="utf-8")
 
         findings = lint_engine.scan_repo(rules, d)
         paths = sorted(f["file"] for f in findings)
-        self.assertEqual(paths, ["src/domain/bad.py", "src/domain/relbad.py", "web/domain/bad.ts"], findings)
+        self.assertEqual(paths, ["src/domain/bad.py", "src/domain/fromsub.py", "src/domain/relbad.py", "web/domain/bad.ts"], findings)
+
+        # Relative parent + child alias (`from ...src import infra` from src/domain/mod.py)
+        rel_sub_rule = lint_engine.load_rule(rules_dir / "no-infra-in-domain.toml")
+        rel_hits = lint_engine.scan_files(
+            [rel_sub_rule],
+            {"src/domain/other.py": "from ...src import types\n", "src/domain/nested.py": "from ...src import infra\n"},
+        )
+        # Verify single-line multi-alias doesn't emit duplicates
+        dedup_hits = lint_engine.scan_files(
+            [rel_sub_rule],
+            {"src/domain/multi.py": "from src.infra import a, b\n"},
+        )
+        self.assertEqual(len(dedup_hits), 1)
+        self.assertEqual(len(rel_hits), 1)
 
     def test_diff_policy_enforces_max_files_and_added_lines(self) -> None:
         rule_text = (

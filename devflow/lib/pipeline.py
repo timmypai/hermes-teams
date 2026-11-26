@@ -41,8 +41,10 @@ def parse_epic_pipeline(
             pipeline_name = resolved_mode if resolved_mode in pipelines else "deliver"
         else:
             pipeline_name = raw_pipeline
-            if explicit_mode and explicit_mode != pipeline_name:
-                problems.append(f"Pipeline '{pipeline_name}' 與 Mode '{explicit_mode}' 不一致")
+            if pipeline_name != resolved_mode:
+                problems.append(
+                    f"Pipeline '{pipeline_name}' 與有效 Mode '{resolved_mode}' 不一致（請明確宣告 Mode: {pipeline_name}）"
+                )
     else:
         if resolved_mode not in pipelines:
             allowed = " / ".join(sorted(pipelines))
@@ -178,6 +180,42 @@ def advance_epic_body(
     new_body = "\n".join(merged_lines).rstrip() + "\n"
     new_spec = parse_epic_pipeline(new_body, policy, epic_mode=epic_mode)
     return new_body, new_spec
+
+
+def card_step_for_kind(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the pipeline step name owning `kind` (`DEV`/`OPS`/`SHIP`/etc.), or None for meta cards."""
+    upper = (kind or "").strip().upper()
+    if not upper or upper in ("EPIC", "ADJ", "ADV"):
+        return None
+    pipe_cfg = (policy_lib.pipelines_config(policy).get(spec.get("pipeline") or "") or {})
+    step_cards = pipe_cfg.get("step_cards") or {}
+    for step_name, raw_kinds in step_cards.items():
+        kinds = [raw_kinds] if isinstance(raw_kinds, str) else list(raw_kinds or [])
+        if any(str(k).strip().upper() == upper for k in kinds):
+            return str(step_name).strip().lower()
+    return None
+
+
+def is_card_beyond_stop(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    """True when `spec` is valid and `kind` belongs strictly after `spec['stop_after']`."""
+    if not spec.get("valid", True):
+        return False
+    steps = list(spec.get("steps") or [])
+    stop_after = str(spec.get("stop_after") or "").strip().lower()
+    if stop_after not in steps:
+        return False
+    step = card_step_for_kind(kind, spec, policy)
+    if not step or step not in steps:
+        return False
+    return steps.index(step) > steps.index(stop_after)
 
 
 def is_user_paused_card(task: dict[str, Any]) -> bool:

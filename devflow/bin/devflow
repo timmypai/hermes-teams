@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import closing, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, suppress
 from pathlib import Path
 
 os.umask(0o022)
@@ -114,13 +114,65 @@ def locked(name: str):
     path = ROOT / "state" / f"{name}.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with tlk:
-        with open(path, "w") as fh:
+        with open(path, "a+") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
             held.add(name)
             try:
                 yield
             finally:
                 held.discard(name)
+                with suppress(OSError):
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def try_locked(name: str):
+    """Non-blockingly acquire per-thread RLock and OS flock, holding both for the full block."""
+    held = _held_locks()
+    if name in held:
+        yield True
+        return
+    tlk = _get_thread_lock(name)
+    if not tlk.acquire(blocking=False):
+        yield False
+        return
+    path = ROOT / "state" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = None
+    flocked = False
+    try:
+        fh = open(path, "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flocked = True
+        except BlockingIOError:
+            fh.close()
+            fh = None
+            yield False
+            return
+        held.add(name)
+        yield True
+    finally:
+        held.discard(name)
+        if flocked and fh is not None:
+            with suppress(OSError):
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        if fh is not None:
+            with suppress(OSError):
+                fh.close()
+        tlk.release()
+
+
+@contextmanager
+def try_locked_many(names: list[str]):
+    """Non-blockingly acquire distinct locks in sorted order, holding all of them for the block."""
+    ordered = sorted(set(names))
+    with ExitStack() as stack:
+        for name in ordered:
+            if not stack.enter_context(try_locked(name)):
+                yield False
+                return
+        yield True
 
 
 def card_lock_name(board: str, task_id: str) -> str:
@@ -1488,31 +1540,47 @@ def _owning_epic_body(board: str, task_body: str | None) -> str | None:
     return None
 
 
-def completed_arch_target_files(board: str, parent_id: str, parent_card: dict | None = None) -> list[str]:
-    """Read planned `target_files` / `allowed_scope` / `file_plan` from a completed `[ARCH]` run's metadata."""
+def completed_arch_handoff(board: str, parent_id: str, parent_card: dict | None = None) -> tuple[dict | None, bool]:
+    """Read raw structured handoff `metadata` from a completed `[ARCH]` run.
+
+    Returns `(metadata_dict_or_none, has_run_record)`. Never swallows empty metadata.
+    """
     runs = (parent_card or {}).get("runs") or []
     for run_item in reversed(runs):
-        meta = run_item.get("metadata") if isinstance(run_item, dict) else None
+        if not isinstance(run_item, dict):
+            continue
+        if run_item.get("status") not in (None, "done"):
+            continue
+        meta = run_item.get("metadata")
         if isinstance(meta, str):
-            with suppress(ValueError):
+            try:
                 meta = json.loads(meta)
-        if files := handoff_lib.extract_arch_target_files(meta):
-            return files
+            except ValueError:
+                return None, True
+        return (meta if isinstance(meta, dict) else {}), True
     db = BOARDS / board / "kanban.db"
     if db.is_file():
-        with suppress(sqlite3.Error, ValueError):
+        with suppress(sqlite3.Error):
             rows = board_rows(
                 board,
                 "SELECT metadata FROM task_runs WHERE task_id = ? AND status = 'done' ORDER BY id DESC LIMIT 1",
                 (parent_id,),
             )
-            if rows and rows[0].get("metadata"):
-                meta = rows[0]["metadata"]
+            if rows:
+                meta = rows[0].get("metadata")
                 if isinstance(meta, str):
-                    meta = json.loads(meta)
-                if files := handoff_lib.extract_arch_target_files(meta):
-                    return files
-    return []
+                    try:
+                        meta = json.loads(meta)
+                    except ValueError:
+                        return None, True
+                return (meta if isinstance(meta, dict) else {}), True
+    return {}, False
+
+
+def completed_arch_target_files(board: str, parent_id: str, parent_card: dict | None = None) -> list[str]:
+    """Read planned `target_files` / `allowed_scope` / `file_plan` from a completed `[ARCH]` run's metadata."""
+    meta, _ = completed_arch_handoff(board, parent_id, parent_card)
+    return handoff_lib.extract_arch_target_files(meta)
 
 
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
@@ -1565,6 +1633,13 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             continue
         if tid != epic and pipeline_lib.is_user_paused_card(c):
             continue  # explicitly parked by/for user; do not emit spurious plan/ADJ findings
+        if tid != epic and c["status"] not in ("done", "archived", "scheduled") and pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+            if not (c["status"] == "blocked" and c.get("block_kind") == "dependency"
+                    and _card_has_pipeline_stop_hold(board, epic, tid, card=c)):
+                found.append(
+                    f"{tid}: [{kind}] 超出 EPIC 目前流程區段（Stop-After={pipe_spec['stop_after']}），"
+                    "不可處於可派工狀態；請由 tick 暫停或待 `devflow epic advance` 推進後再執行"
+                )
         if c["status"] == "done":
             continue  # history; only pending work can still go wrong
         if tid in body_by_tid:
@@ -1619,19 +1694,26 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
             card_contract = scope_lib.parse_card_contract(c["body"])
             for scope_prob in scope_lib.allowed_scope_problems(card_contract["allowed_scope"], required=req_scope):
                 found.append(f"{tid}: [{kind}] {scope_prob}")
-            if req_scope and card_contract["allowed_scope"]:
+            if req_scope:
                 for pid in c.get("parents", []):
                     pc = cards.get(pid)
                     if pc and card_type(pc.get("title") or "") == "ARCH" and pc.get("status") == "done":
-                        arch_files = completed_arch_target_files(board, pid, pc)
-                        if missing_arch := handoff_lib.missing_arch_scope_files(
-                            arch_files, card_contract["allowed_scope"], test_paths=test_paths
-                        ):
+                        arch_meta, _ = completed_arch_handoff(board, pid, pc)
+                        arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
+                        if handoff_errs:
                             found.append(
-                                f"{tid}: [{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
-                                + ", ".join(missing_arch[:8])
-                                + (f" 等共 {len(missing_arch)} 檔" if len(missing_arch) > 8 else "")
+                                f"{tid}: [{kind}] 的父卡 [ARCH] {pid} 缺少有效結構化交接"
+                                f"（{'；'.join(handoff_errs)}），無法略過 Allowed-Scope 檢查"
                             )
+                        elif card_contract["allowed_scope"]:
+                            if missing_arch := handoff_lib.missing_arch_scope_files(
+                                arch_files, card_contract["allowed_scope"], test_paths=test_paths
+                            ):
+                                found.append(
+                                    f"{tid}: [{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
+                                    + ", ".join(missing_arch[:8])
+                                    + (f" 等共 {len(missing_arch)} 檔" if len(missing_arch) > 8 else "")
+                                )
             covered = list(dict.fromkeys(
                 ac for m in COVER_LINE.finditer(c["body"] or "") for ac in re.findall(r"\bAC-\d+\b", m.group(0))
                 if ac in ac_types))
@@ -2426,6 +2508,89 @@ def _ship_has_plan_risk_hold_marker(board: str, epic: str, ship_id: str) -> bool
         return False
 
 
+PIPELINE_STOP_HOLD_PREFIX = "pipeline-stop-hold:"
+
+
+def pipeline_stop_hold_reason(epic: str, stop_after: str) -> str:
+    return f"{PIPELINE_STOP_HOLD_PREFIX}{epic} 等待 EPIC 推進超過 Stop-After={stop_after}（devflow epic advance）"
+
+
+def _card_has_pipeline_stop_hold(
+    board: str,
+    epic: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> bool:
+    """True when `task_id`'s current block carries this EPIC's `pipeline-stop-hold:` marker."""
+    db = BOARDS / board / "kanban.db"
+    if db.exists():
+        try:
+            ev = block_event(board, task_id)
+            if ev is not None:
+                return block_reason(board, ev).startswith(f"{PIPELINE_STOP_HOLD_PREFIX}{epic}")
+        except sqlite3.Error:
+            pass
+    for ev in reversed((card or {}).get("events") or []):
+        if isinstance(ev, dict) and ev.get("kind") in ("blocked", "unblocked"):
+            if ev["kind"] == "unblocked":
+                return False
+            reason = str((ev.get("payload") or {}).get("reason") or "")
+            return reason.startswith(f"{PIPELINE_STOP_HOLD_PREFIX}{epic}")
+    return False
+
+
+def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
+    """Park runnable cards belonging strictly after `Stop-After` in `blocked (dependency)` until advance."""
+    if not pipe_spec.get("valid"):
+        return False
+    steps = pipe_spec.get("steps") or []
+    if not steps or pipe_spec.get("stop_after") == steps[-1]:
+        return False
+    retry = False
+    reason = pipeline_stop_hold_reason(epic, pipe_spec["stop_after"])
+    for cid, c in cards.items():
+        if cid == epic:
+            continue
+        kind = card_type(c.get("title") or "") or ""
+        if not pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+            continue
+        if c.get("status") not in ("todo", "ready"):
+            continue
+        ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, cid, reason)
+        if failed:
+            retry = True
+        elif ok:
+            c["status"] = "blocked"
+            c["block_kind"] = "dependency"
+    return retry
+
+
+def release_pipeline_stop_holds(board: str, epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
+    """Release cards held by `pipeline-stop-hold:` once the EPIC's active slice reaches their step."""
+    if not pipe_spec.get("valid"):
+        return False
+    retry = False
+    for cid, c in cards.items():
+        if cid == epic:
+            continue
+        kind = card_type(c.get("title") or "") or ""
+        if c.get("status") != "blocked" or c.get("block_kind") != "dependency":
+            continue
+        if pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+            continue
+        if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
+            continue
+        try:
+            resume(board, cid, f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。")
+            c["status"] = "ready"
+            c["block_kind"] = None
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card release failure
+            retry = True
+            print(f"devflow: release pipeline stop hold failed for {board}/{cid}: {err}", file=sys.stderr)
+    return retry
+
+
 def hold_pending_ships_for_plan_risk(board: str, epic: str, cards: dict[str, dict], st: dict) -> bool:
     """Park every pending [SHIP] card in `blocked (dependency)` while `epic` has an unresolved
     plan-risk decision, and register any already-blocked plan-risk [SHIP] cards so release_plan_risk_holds
@@ -2662,66 +2827,77 @@ def tick_board(board: str, st: dict) -> bool:
     for tid in waiting_epics:
         try:
             cards = plan_cards(board, tid)
-            if any(is_card_locked(board, cid) for cid in cards):
-                retry = True
-                continue
-            if fixed := repair_bodies(board, tid, cards):
-                kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
-                                              "補齊缺少的 `goal_mode`）")
-                cards = plan_cards(board, tid)
-            fp = plan_fingerprint(tid, cards, repo, board=board)
-            rec = (st.get("plan_adj") or {}).get(tid)
-            repair_ended = bool(
-                isinstance(rec, dict)
-                and (
-                    (rec.get("adj") and not effective_plan_adj(rec.get("adj"), cards))
-                    or (rec.get("escalated") is not None and not waiting(cards.get(tid, {})))
-                )
-            )
-            if plans.get(tid) != fp or repair_ended:
-                risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
-                run_llm = risk_mode != "off"
-                advise_on = risk_mode == "advisor"
-                rep = check_plan(board, tid, advise=advise_on, cards=cards,
-                                 advised=frozenset(advised.get(tid, [])), run_llm=run_llm)
-                if advise_on and rep.get("advised"):
-                    advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
-                adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
-                retry = adj_retry or retry
-                risk_escalated = False
-                if risk_mode == "needs_input":
-                    risk_escalated, pr_retry = _apply_plan_risk_needs_input(
-                        board, tid, cards, rep.get("gating_risks") or [], st
+            with try_locked_many([card_lock_name(board, cid) for cid in cards]) as got_locks:
+                if not got_locks:
+                    retry = True
+                    continue
+                fresh_cards = plan_cards(board, tid)
+                if set(fresh_cards) - set(cards):
+                    retry = True
+                    continue
+                cards = fresh_cards
+                epic_body = (cards.get(tid) or {}).get("body")
+                ep_mode, _ = scope_lib.parse_epic_mode(epic_body, policy_lib.valid_modes(POLICY))
+                ep_pipe = pipeline_lib.parse_epic_pipeline(epic_body, POLICY, epic_mode=ep_mode)
+                retry = hold_out_of_slice_cards(board, tid, cards, ep_pipe) or retry
+                retry = release_pipeline_stop_holds(board, tid, cards, ep_pipe) or retry
+                if fixed := repair_bodies(board, tid, cards):
+                    kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
+                                                  "補齊缺少的 `goal_mode`）")
+                    cards = plan_cards(board, tid)
+                fp = plan_fingerprint(tid, cards, repo, board=board)
+                rec = (st.get("plan_adj") or {}).get(tid)
+                repair_ended = bool(
+                    isinstance(rec, dict)
+                    and (
+                        (rec.get("adj") and not effective_plan_adj(rec.get("adj"), cards))
+                        or (rec.get("escalated") is not None and not waiting(cards.get(tid, {})))
                     )
-                    retry = pr_retry or retry
-                suffix = []
-                if rep.get("advisor_card"):
-                    suffix.append(f"已建 {rep['advisor_card']}")
-                if risk_escalated:
-                    suffix.append("高風險／範圍疑慮已轉 needs_input 並暫停待出貨 [SHIP] 等待使用者定錨")
-                if adj_id == "user":
-                    suffix.append("已達 [ADJ] 修正上限，已轉 needs_input 通知使用者決定")
-                elif adj_id:
-                    suffix.append(f"已交 {adj_id} 喚醒 orchestrator 修正")
-                if suffix:
-                    note_tail = "\n" + "；".join(suffix)
-                elif not run_llm:
-                    note_tail = "（plan_risk_mode=off：僅執行確定性規則檢查，未啟用自動計畫顧問）"
-                else:
-                    note_tail = "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）"
-                kanban(board, "comment", tid, "devflow check plan：" + (
-                    "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
-                    if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
-                if not adj_retry and not retry:
-                    plans[tid] = plan_fingerprint(tid, cards, repo, board=board)
-            else:
-                pr_rec = load_plan_risk_state().get(plan_risk_key(board, tid))
-                if pr_rec:
-                    live_hash = _live_plan_risk_hash(board, tid, pr_rec, cards=cards)
-                    if live_hash and is_plan_risk_accepted(board, tid, live_hash, (cards.get(tid) or {}).get("body")):
-                        retry = release_plan_risk_holds(board, tid, cards, st) or retry
+                )
+                if plans.get(tid) != fp or repair_ended:
+                    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+                    run_llm = risk_mode != "off"
+                    advise_on = risk_mode == "advisor"
+                    rep = check_plan(board, tid, advise=advise_on, cards=cards,
+                                     advised=frozenset(advised.get(tid, [])), run_llm=run_llm)
+                    if advise_on and rep.get("advised"):
+                        advised[tid] = sorted(set(advised.get(tid, [])) | set(rep["advised"]))
+                    adj_id, adj_retry = open_plan_adj(board, tid, cards, rep.get("actionable_rules") or [], st)
+                    retry = adj_retry or retry
+                    risk_escalated = False
+                    if risk_mode == "needs_input":
+                        risk_escalated, pr_retry = _apply_plan_risk_needs_input(
+                            board, tid, cards, rep.get("gating_risks") or [], st
+                        )
+                        retry = pr_retry or retry
+                    suffix = []
+                    if rep.get("advisor_card"):
+                        suffix.append(f"已建 {rep['advisor_card']}")
+                    if risk_escalated:
+                        suffix.append("高風險／範圍疑慮已轉 needs_input 並暫停待出貨 [SHIP] 等待使用者定錨")
+                    if adj_id == "user":
+                        suffix.append("已達 [ADJ] 修正上限，已轉 needs_input 通知使用者決定")
+                    elif adj_id:
+                        suffix.append(f"已交 {adj_id} 喚醒 orchestrator 修正")
+                    if suffix:
+                        note_tail = "\n" + "；".join(suffix)
+                    elif not run_llm:
+                        note_tail = "（plan_risk_mode=off：僅執行確定性規則檢查，未啟用自動計畫顧問）"
                     else:
-                        retry = hold_pending_ships_for_plan_risk(board, tid, cards, st) or retry
+                        note_tail = "（未建 [ADV]：已交 advisor 判斷過，或屬格式提醒）"
+                    kanban(board, "comment", tid, "devflow check plan：" + (
+                        "\n".join(f"- {f}" for f in rep["findings"]) + note_tail
+                        if rep["findings"] else "通過") + (f"\n{rep['note']}" if rep["note"] else ""))
+                    if not adj_retry and not retry:
+                        plans[tid] = plan_fingerprint(tid, cards, repo, board=board)
+                else:
+                    pr_rec = load_plan_risk_state().get(plan_risk_key(board, tid))
+                    if pr_rec:
+                        live_hash = _live_plan_risk_hash(board, tid, pr_rec, cards=cards)
+                        if live_hash and is_plan_risk_accepted(board, tid, live_hash, (cards.get(tid) or {}).get("body")):
+                            retry = release_plan_risk_holds(board, tid, cards, st) or retry
+                        else:
+                            retry = hold_pending_ships_for_plan_risk(board, tid, cards, st) or retry
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC plan check
             retry = True
             print(f"devflow: check_plan failed for {board}/{tid}: {err}", file=sys.stderr)
@@ -2746,46 +2922,81 @@ def tick_board(board: str, st: dict) -> bool:
             continue
         try:
             cards = plan_cards(board, eid)
-            pr_rec = load_plan_risk_state().get(plan_risk_key(board, eid))
-            if pr_rec:
-                epic_card = cards.get(eid) or {}
-                live_hash = _live_plan_risk_hash(board, eid, pr_rec, cards=cards)
-                if live_hash and is_plan_risk_accepted(board, eid, live_hash, epic_card.get("body")):
-                    with locked("plan-risk"):
-                        data = load_plan_risk_state()
-                        if (cur := data.get(plan_risk_key(board, eid))) and isinstance(cur, dict):
-                            cur["status"] = "accepted"
-                            cur["rhash"] = live_hash
-                            save_plan_risk_state(data)
-                    retry = release_plan_risk_holds(board, eid, cards, st) or retry
-                elif live_hash and live_hash == pr_rec.get("rhash"):
-                    risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
-                    esc_map = st.setdefault("plan_risk_escalated", {})
-                    if (
-                        risk_mode == "needs_input"
-                        and esc_map.get(eid) != live_hash
-                        and epic_card.get("status") in ("todo", "ready", "scheduled")
-                    ):
-                        _, pr_retry = _apply_plan_risk_needs_input(
-                            board, eid, cards, list(pr_rec.get("gating") or []), st
-                        )
-                        retry = pr_retry or retry
+            with try_locked_many([card_lock_name(board, cid) for cid in cards]) as got_locks:
+                if not got_locks:
+                    retry = True
+                    continue
+                cards = plan_cards(board, eid)
+                pr_rec = load_plan_risk_state().get(plan_risk_key(board, eid))
+                if pr_rec:
+                    epic_card = cards.get(eid) or {}
+                    live_hash = _live_plan_risk_hash(board, eid, pr_rec, cards=cards)
+                    if live_hash and is_plan_risk_accepted(board, eid, live_hash, epic_card.get("body")):
+                        with locked("plan-risk"):
+                            data = load_plan_risk_state()
+                            if (cur := data.get(plan_risk_key(board, eid))) and isinstance(cur, dict):
+                                cur["status"] = "accepted"
+                                cur["rhash"] = live_hash
+                                save_plan_risk_state(data)
+                        retry = release_plan_risk_holds(board, eid, cards, st) or retry
+                    elif live_hash and live_hash == pr_rec.get("rhash"):
+                        risk_mode = "advisor" if AUTO_PLAN_ADVISOR else PLAN_RISK_MODE
+                        esc_map = st.setdefault("plan_risk_escalated", {})
+                        if (
+                            risk_mode == "needs_input"
+                            and esc_map.get(eid) != live_hash
+                            and epic_card.get("status") in ("todo", "ready", "scheduled")
+                        ):
+                            _, pr_retry = _apply_plan_risk_needs_input(
+                                board, eid, cards, list(pr_rec.get("gating") or []), st
+                            )
+                            retry = pr_retry or retry
+                        else:
+                            retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
+                    elif eid in cards and epic_card.get("status") != "archived":
+                        # Plan content materially changed while EPIC is outside waiting_epics (e.g. ready/running
+                        # after Option A adjustment): re-evaluate gating risks, clear & release only if risks are
+                        # genuinely removed, or update hash / issue fresh confirmation if risks remain.
+                        _, note, _, gating_list = _evaluate_plan_risks(eid, cards)
+                        _, pr_retry = _apply_plan_risk_needs_input(board, eid, cards, gating_list, st)
+                        retry = bool(note) or pr_retry or retry
                     else:
                         retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
-                elif eid in cards and epic_card.get("status") != "archived":
-                    # Plan content materially changed while EPIC is outside waiting_epics (e.g. ready/running
-                    # after Option A adjustment): re-evaluate gating risks, clear & release only if risks are
-                    # genuinely removed, or update hash / issue fresh confirmation if risks remain.
-                    _, note, _, gating_list = _evaluate_plan_risks(eid, cards)
-                    _, pr_retry = _apply_plan_risk_needs_input(board, eid, cards, gating_list, st)
-                    retry = bool(note) or pr_retry or retry
-                else:
-                    retry = hold_pending_ships_for_plan_risk(board, eid, cards, st) or retry
-            elif not waiting(cards.get(eid, {})):
-                retry = release_plan_risk_holds(board, eid, cards, st) or retry
+                elif not waiting(cards.get(eid, {})):
+                    retry = release_plan_risk_holds(board, eid, cards, st) or retry
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-EPIC hold reconciliation
             retry = True
             print(f"devflow: release_plan_risk_holds failed for {board}/{eid}: {err}", file=sys.stderr)
+    all_stop_epics: set[str] = set()
+    for t in tasks:
+        if t.get("status") == "blocked":
+            try:
+                ev = block_event(board, t["id"])
+                reason = block_reason(board, ev) if ev is not None else ""
+                if reason.startswith(PIPELINE_STOP_HOLD_PREFIX):
+                    rest = reason[len(PIPELINE_STOP_HOLD_PREFIX):].split(None, 1)[0]
+                    if TASK_ID_RE.fullmatch(rest):
+                        all_stop_epics.add(rest)
+            except sqlite3.Error:
+                pass
+    for eid in sorted(all_stop_epics):
+        if eid in waiting_epics:
+            continue
+        try:
+            cards = plan_cards(board, eid)
+            with try_locked_many([card_lock_name(board, cid) for cid in cards]) as got_locks:
+                if not got_locks:
+                    retry = True
+                    continue
+                cards = plan_cards(board, eid)
+                epic_body = (cards.get(eid) or {}).get("body")
+                ep_mode, _ = scope_lib.parse_epic_mode(epic_body, policy_lib.valid_modes(POLICY))
+                ep_pipe = pipeline_lib.parse_epic_pipeline(epic_body, POLICY, epic_mode=ep_mode)
+                retry = hold_out_of_slice_cards(board, eid, cards, ep_pipe) or retry
+                retry = release_pipeline_stop_holds(board, eid, cards, ep_pipe) or retry
+        except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate pipeline stop-hold reconciliation
+            retry = True
+            print(f"devflow: release_pipeline_stop_holds failed for {board}/{eid}: {err}", file=sys.stderr)
     del applied[:-1000]
     del settled[:-1000]
     del wake_ops[:-1000]
@@ -3345,36 +3556,47 @@ def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list]
             or card_type(t["title"]) in ("EPIC", "ADJ")
         ):
             continue
-        if is_card_locked(board, tid):
-            retry = True
-            continue
         blocked_children = [c for c in children.get(tid, []) if tasks.get(c, {}).get("status") in OPEN]
         if not blocked_children:
             continue
-        ev = triage_event(board, tid)
-        key = f"{board}/{tid}/{ev}"
-        if key in seen:
-            continue
-        laps = adjs_for(tid, tasks)
-        if (live := live_adj(laps, tasks)):
-            msg = f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"
-            if hand_to_adj(board, live, tasks[live], msg):
-                seen[key] = live
+        with try_locked(card_lock_name(board, tid)) as got_lock:
+            if not got_lock:
+                retry = True
+                continue
+            if (BOARDS / board / "kanban.db").is_file():
+                with suppress(sqlite3.Error):
+                    fresh = board_rows(board, "SELECT id, status, block_kind FROM tasks WHERE id = ?", (tid,))
+                    if (
+                        not fresh
+                        or fresh[0]["status"] != "triage"
+                        or waiting(fresh[0])
+                        or pipeline_lib.is_user_paused_card(fresh[0])
+                    ):
+                        continue
+            ev = triage_event(board, tid)
+            key = f"{board}/{tid}/{ev}"
+            if key in seen:
+                continue
+            laps = adjs_for(tid, tasks)
+            if (live := live_adj(laps, tasks)):
+                msg = f"{tid} 停在 triage 且無 block 事件，下游 {', '.join(sorted(blocked_children))} 正等待它，由本卡一併處理（tick 不另建 [ADJ]）。"
+                if hand_to_adj(board, live, tasks[live], msg):
+                    seen[key] = live
+                else:
+                    retry = True
+            elif len(laps) >= ADJ_PER_CARD:
+                bev, failed = mark_triage_needs_input(board, tid, triage_cap_reason(tid, t, blocked_children, laps))
+                if bev is not None:
+                    t["block_kind"] = "needs_input"
+                    seen[key] = f"escalated:{bev}"
+                elif failed:
+                    retry = True
             else:
-                retry = True
-        elif len(laps) >= ADJ_PER_CARD:
-            bev, failed = mark_triage_needs_input(board, tid, triage_cap_reason(tid, t, blocked_children, laps))
-            if bev is not None:
-                t["block_kind"] = "needs_input"
-                seen[key] = f"escalated:{bev}"
-            elif failed:
-                retry = True
-        else:
-            adj = open_triage_adj(board, tid, t, ev, blocked_children, next(owning_epics(tid, tasks, children), None))
-            if adj:
-                seen[key] = adj
-            else:
-                retry = True
+                adj = open_triage_adj(board, tid, t, ev, blocked_children, next(owning_epics(tid, tasks, children), None))
+                if adj:
+                    seen[key] = adj
+                else:
+                    retry = True
     for k in list(seen)[:-1000]:
         del seen[k]
     return retry
@@ -3544,6 +3766,10 @@ def cmd_epic_advance(a) -> None:
     kanban(a.board, "edit", a.epic, "--body", new_body)
     kanban(a.board, "comment", a.epic,
            f"devflow epic advance：流程推進至 Start-At={new_spec['start_at']}, Stop-After={new_spec['stop_after']}")
+    with suppress(SystemExit, Exception):
+        cards = plan_cards(a.board, a.epic)
+        if cards:
+            release_pipeline_stop_holds(a.board, a.epic, cards, new_spec)
     print(json.dumps({"ok": True, "board": a.board, "epic": a.epic, "pipeline": new_spec},
                      ensure_ascii=False))
 
@@ -5538,22 +5764,43 @@ def cmd_check_card(a) -> None:
                 findings.append(why)
             findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
             parent_ids = list(getattr(a, "parent", None) or [])
-            if req_scope and contract["allowed_scope"] and board_arg and parent_ids:
+            if req_scope and board_arg and parent_ids:
                 test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
                 for pid in parent_ids:
-                    arch_files = completed_arch_target_files(board_arg, pid)
-                    if not arch_files:
+                    is_arch = False
+                    arch_meta: dict | None = {}
+                    has_run = False
+                    db = BOARDS / board_arg / "kanban.db"
+                    if db.is_file():
+                        with suppress(sqlite3.Error):
+                            prows = board_rows(board_arg, "SELECT title, status FROM tasks WHERE id = ?", (pid,))
+                            if prows and card_type(prows[0].get("title") or "") == "ARCH" and prows[0].get("status") == "done":
+                                is_arch = True
+                                arch_meta, has_run = completed_arch_handoff(board_arg, pid)
+                    if not has_run and not is_arch:
                         with suppress(SystemExit, Exception):
                             pd = json.loads(kanban(board_arg, "show", pid, "--json"))
-                            if card_type((pd.get("task") or {}).get("title") or "") == "ARCH":
-                                arch_files = completed_arch_target_files(board_arg, pid, {"runs": pd.get("runs") or []})
-                    if missing_arch := handoff_lib.missing_arch_scope_files(
-                        arch_files, contract["allowed_scope"], test_paths=test_paths
-                    ):
+                            pt = pd.get("task") or {}
+                            if card_type(pt.get("title") or "") == "ARCH" and pt.get("status") == "done":
+                                is_arch = True
+                                arch_meta, has_run = completed_arch_handoff(
+                                    board_arg, pid, {"runs": pd.get("runs") or []}
+                                )
+                    if not is_arch:
+                        continue
+                    arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
+                    if handoff_errs:
                         findings.append(
-                            f"[{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
-                            + ", ".join(missing_arch[:8])
+                            f"[{kind}] 父卡 [ARCH] {pid} 缺少有效結構化交接（{'；'.join(handoff_errs)}），無法略過 Allowed-Scope 檢查"
                         )
+                    elif contract["allowed_scope"]:
+                        if missing_arch := handoff_lib.missing_arch_scope_files(
+                            arch_files, contract["allowed_scope"], test_paths=test_paths
+                        ):
+                            findings.append(
+                                f"[{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
+                                + ", ".join(missing_arch[:8])
+                            )
         if why := body_problem(kind, a.title, body):
             findings.append(why)
     print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
