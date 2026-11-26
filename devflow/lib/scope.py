@@ -7,9 +7,12 @@ from pathlib import PurePosixPath
 
 ALLOWED_SCOPE_RE = re.compile(r"^\s*Allowed-Scope[：:]\s*(.+)$", re.M | re.I)
 OUT_OF_SCOPE_RE = re.compile(r"^\s*Out-of-Scope[：:]\s*(.+)$", re.M | re.I)
+NON_GOALS_RE = re.compile(r"^\s*Non-Goals[：:]\s*(.+)$", re.M | re.I)
 VERIFY_CMD_RE = re.compile(r"^\s*Verify[：:]\s*(.+)$", re.M | re.I)
+MODE_RE = re.compile(r"^\s*Mode[：:]\s*([a-zA-Z0-9_-]+)\s*$", re.M | re.I)
 KANBAN_TASK_RE = re.compile(r"^\s*Kanban[：:]\s*(t_[0-9A-Za-z]+)\b", re.M | re.I)
 EPIC_SECTION_RE = re.compile(r"^##\s*(目標|驗收|使用者原話|使用者決定|不能碰)[ \t]*\n(.*?)(?=^## |\Z)", re.M | re.S)
+_PATH_TOKEN_RE = re.compile(r"`([^`\s]+)`|(?<![A-Za-z0-9_])((?:\.[A-Za-z0-9_-]+|[A-Za-z0-9_.-]+)/(?:[A-Za-z0-9_.*?/-]+))")
 
 # Deterministic leaks that must never appear in human-facing card bodies (Item #8).
 LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -24,16 +27,49 @@ def split_globs(raw: str) -> list[str]:
 
 
 def parse_card_contract(body: str | None) -> dict:
-    """Extract optional structured scope & verification fields from a card body."""
+    """Extract structured scope, non-goals & verification fields from a card body."""
     text = body or ""
     allowed = [g for m in ALLOWED_SCOPE_RE.finditer(text) for g in split_globs(m.group(1))]
     out_of_scope = [g for m in OUT_OF_SCOPE_RE.finditer(text) for g in split_globs(m.group(1))]
+    non_goals = [m.group(1).strip() for m in NON_GOALS_RE.finditer(text) if m.group(1).strip()]
     verify = [m.group(1).strip() for m in VERIFY_CMD_RE.finditer(text) if m.group(1).strip()]
     return {
         "allowed_scope": list(dict.fromkeys(allowed)),
         "out_of_scope": list(dict.fromkeys(out_of_scope)),
+        "non_goals": non_goals,
         "verify": verify,
     }
+
+
+def parse_epic_mode(epic_body: str | None, valid_modes: set[str] | frozenset[str] | None = None) -> tuple[str, str | None]:
+    """Return `(resolved_mode, invalid_raw_or_none)` from an EPIC's `Mode:` line (defaults to `deliver`)."""
+    m = MODE_RE.search(epic_body or "")
+    if not m:
+        return "deliver", None
+    raw = m.group(1).strip().lower()
+    allowed = valid_modes or frozenset({"deliver", "investigate", "review"})
+    if raw not in allowed:
+        return "deliver", raw
+    return raw, None
+
+
+_ROOT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def extract_do_not_touch_paths(do_not_touch: str | None) -> list[str]:
+    """Extract explicit repo-relative path/glob patterns from EPIC `## 不能碰` for deterministic
+    `Out-of-Scope` inheritance (ignores URLs and plain prose)."""
+    out: list[str] = []
+    text = re.sub(r"https?://\S+", " ", do_not_touch or "")
+    for m in _PATH_TOKEN_RE.finditer(text):
+        tok = (m.group(1) or m.group(2) or "").strip().strip(",;:()[]\"'").rstrip(".")
+        if not tok or "://" in tok or tok.startswith(("http", "/", "-")) or tok in (".", "..") or tok.isdigit():
+            continue
+        if "/" in tok or "*" in tok:
+            out.append(tok)
+        elif m.group(1) and _ROOT_FILENAME_RE.fullmatch(tok):
+            out.append(tok)
+    return list(dict.fromkeys(out))
 
 
 def parse_epic_sections(body: str | None) -> dict[str, str]:
@@ -168,19 +204,25 @@ def build_goal_context(
     if not epic_body and not card_body:
         return None
     epic_secs = parse_epic_sections(epic_body)
+    epic_mode, _ = parse_epic_mode(epic_body)
     contract = parse_card_contract(card_body)
+    raw_do_not_touch = epic_secs.get("不能碰") or ""
+    do_not_touch = raw_do_not_touch[:1000]
+    merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *extract_do_not_touch_paths(raw_do_not_touch)]))
     ctx = {
         "epic_id": epic_id,
         "epic_title": epic_title or "",
+        "epic_mode": epic_mode,
         "user_said": (epic_secs.get("使用者原話") or "")[:2000],
         "user_decisions": (epic_secs.get("使用者決定") or "")[:1500],
         "epic_goal": (epic_secs.get("目標") or "")[:1000],
         "epic_ac": (epic_secs.get("驗收") or "")[:2500],
-        "do_not_touch": (epic_secs.get("不能碰") or "")[:1000],
+        "do_not_touch": do_not_touch,
         "card_id": card_id,
         "card_title": card_title or "",
         "card_body": (card_body or "")[:1500],
         "allowed_scope": contract["allowed_scope"],
-        "out_of_scope": contract["out_of_scope"],
+        "out_of_scope": merged_oos,
+        "non_goals": contract["non_goals"],
     }
     return ctx

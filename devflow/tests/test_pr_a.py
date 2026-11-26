@@ -940,7 +940,9 @@ class DocAndContractConsistency(unittest.TestCase):
         self.assertIn("plan_risk_blocked=true", devops_skill)
 
         shared_skill = (KIT / "skills" / "devflow" / "SKILL.md").read_text(encoding="utf-8")
-        chat_section = shared_skill.split("## 在自己的 Bot Chat 回答卡片問題")[1].split("## 身分與憑證")[0]
+        self.assertIn("skill_view devflow-chat", shared_skill)
+        # The detailed chat/approval protocol lives only in the on-demand `devflow-chat` skill (SSOT).
+        chat_section = (KIT / "skills" / "devflow-chat" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("devflow approve ", chat_section)
         self.assertIn("--request", chat_section)
         self.assertIn("嚴禁改查", chat_section)
