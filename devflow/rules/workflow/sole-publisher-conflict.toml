@@ -1,0 +1,18 @@
+id = "sole_publisher_conflict"
+kind = "regex"
+severity = "warn"
+message = "宣告 devops 為唯一 publisher 會與 devflow developer 推送分支開 PR 衝突（易造成 DEV/SHIP 互鎖）；請移除或明確限定僅適用發版"
+include = ["AGENTS.md", "CLAUDE.md"]
+patterns = [
+  "devops\\s*(?:為|是)?\\s*唯一\\s*(?:source\\s*/?\\s*publisher|publisher)",
+]
+
+[[fixture]]
+expect = "fail"
+path = "AGENTS.md"
+text = "devops 為唯一 source/publisher，其他角色不能推分支。\n"
+
+[[fixture]]
+expect = "pass"
+path = "AGENTS.md"
+text = "developer 推送功能分支並開 PR；devops 在 PR 合併後執行部署。\n"

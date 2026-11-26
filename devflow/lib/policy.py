@@ -51,6 +51,46 @@ DEFAULT_MODES: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_PIPELINES: dict[str, dict[str, Any]] = {
+    "deliver": {
+        "steps": ["repro", "design", "implement", "ci", "review", "ship", "accept"],
+        "default_start": "repro",
+        "default_stop": "accept",
+        "step_cards": {"repro": "RES", "design": "ARCH", "implement": ["DEV", "OPS"], "ship": "SHIP", "accept": "EPIC"},
+    },
+    "investigate": {
+        "steps": ["repro", "accept"],
+        "default_start": "repro",
+        "default_stop": "accept",
+        "step_cards": {"repro": "RES", "accept": "EPIC"},
+    },
+    "review": {
+        "steps": ["review", "accept"],
+        "default_start": "review",
+        "default_stop": "accept",
+        "step_cards": {"review": "RES", "accept": "EPIC"},
+    },
+}
+
+DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, list[str]]] = {
+    "repro": {
+        "required": ["root_cause", "evidence"],
+        "optional": ["affected_paths", "non_goals", "open_questions"],
+    },
+    "design": {
+        "required": ["decisions", "target_files"],
+        "optional": ["interfaces", "non_goals", "risks", "allowed_scope", "file_plan", "pr_slices", "adr_markdown"],
+    },
+    "implement": {
+        "required": ["pr_url", "head_sha", "tests"],
+        "optional": ["published_pr", "changed_files", "followups"],
+    },
+    "ship": {
+        "required": ["merged_sha"],
+        "optional": ["deployed_sha", "acceptance_report", "followups"],
+    },
+}
+
 DEFAULT_POLICY: dict[str, Any] = {
     "port_base": 18100,
     "card_chars": 600,
@@ -73,6 +113,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     "max_role_prompt_chars": 12000,
     "default_test_paths": list(DEFAULT_TEST_PATHS),
     "modes": {k: dict(v) for k, v in DEFAULT_MODES.items()},
+    "pipelines": {k: dict(v) for k, v in DEFAULT_PIPELINES.items()},
+    "handoff_schemas": {k: dict(v) for k, v in DEFAULT_HANDOFF_SCHEMAS.items()},
 }
 
 
@@ -264,3 +306,32 @@ def effective_plan_risk_mode(policy: dict[str, Any]) -> str:
         return "advisor"
     mode = str(policy.get("plan_risk_mode") or "off").strip().lower()
     return mode if mode in VALID_PLAN_RISK_MODES else "off"
+
+
+def pipelines_config(policy: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """Return declarative pipeline definitions (`deliver`, `investigate`, `review`), falling back to defaults."""
+    out = {k: dict(v) for k, v in DEFAULT_PIPELINES.items()}
+    raw = (policy or {}).get("pipelines")
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            key = str(name or "").strip().lower()
+            if key and isinstance(spec, dict) and spec.get("steps"):
+                base = dict(out.get(key) or {})
+                base.update(spec)
+                out[key] = base
+    return out
+
+
+def handoff_schemas(policy: dict[str, Any] | None = None) -> dict[str, dict[str, list[str]]]:
+    """Return declarative handoff schemas keyed by pipeline step."""
+    out = {k: {sk: list(sv) for sk, sv in v.items()} for k, v in DEFAULT_HANDOFF_SCHEMAS.items()}
+    raw = (policy or {}).get("handoff_schemas")
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            key = str(name or "").strip().lower()
+            if key and isinstance(spec, dict):
+                out[key] = {
+                    "required": [str(x).strip() for x in (spec.get("required") or []) if str(x).strip()],
+                    "optional": [str(x).strip() for x in (spec.get("optional") or []) if str(x).strip()],
+                }
+    return out

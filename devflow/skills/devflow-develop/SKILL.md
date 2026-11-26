@@ -15,7 +15,7 @@ cwd 是本卡專屬 worktree（分支 `wt/<task-id>`）。沙箱內 `.git` 唯�
 
 ## 1. 讀契約、鎖範圍（先定案再改碼）
 1. `kanban_show` 讀目標、`覆蓋：AC-n`、`Allowed-Scope:`、`Out-of-Scope:`、`Non-Goals:`、`Verify:`、parent 結論與退件理由；再 `kanban_show(<EPIC>)` 讀 `## 使用者原話`、`## 不能碰` 與對應情境。
-2. 動手前確認：預計改哪些檔、全在 `Allowed-Scope`（或測試路徑）內、不碰 `Out-of-Scope` 與未授權保護路徑、不做 `Non-Goals`。
+2. 動手前確認：預計改哪些檔、全在 `Allowed-Scope`（或測試路徑）內、不碰 `Out-of-Scope` 與未授權保護路徑、不做 `Non-Goals`。若確定必須修改範圍外檔案，**不繞過、不硬改**，直接 `kanban_block(kind="needs_input")` 列出所需精確路徑與理由，請使用者透過 `devflow answer ... --add-scope ...` 核准後再續。
 3. 需要時 `git fetch origin && git rebase origin/<default>`。
 
 ## 2. 先紅後綠、最小改動

@@ -1,0 +1,37 @@
+id = "deploy_policy_mismatch"
+kind = "cross_file"
+severity = "warn"
+message = "DEVFLOW_DEPLOY_MANUAL_ONLY=false 已啟用自動部署，但 AGENTS.md 仍殘留「merge 不部署／僅手動觸發」的過時規則，請同步更新文件"
+
+[[when]]
+path = ".devflow/config.env"
+env_key = "DEVFLOW_DEPLOY_MANUAL_ONLY"
+env_in = ["false", "0", "no", "off"]
+
+[target]
+include = ["AGENTS.md", "CLAUDE.md"]
+mode = "forbid"
+patterns = [
+  "merge\\s*不能觸發部署",
+  "merge\\s*不觸發部署",
+  "merge\\s*不部署",
+  "部署與控制僅走.{0,20}手動",
+]
+
+[[fixture]]
+expect = "fail"
+[fixture.files]
+".devflow/config.env" = "DEVFLOW_DEPLOY_MANUAL_ONLY=false\n"
+"AGENTS.md" = "merge 不部署，部署與控制僅走本 target 手動 workflow。\n"
+
+[[fixture]]
+expect = "pass"
+[fixture.files]
+".devflow/config.env" = "DEVFLOW_DEPLOY_MANUAL_ONLY=true\n"
+"AGENTS.md" = "merge 不部署，部署與控制僅走本 target 手動 workflow。\n"
+
+[[fixture]]
+expect = "pass"
+[fixture.files]
+".devflow/config.env" = "DEVFLOW_DEPLOY_MANUAL_ONLY=false\n"
+"AGENTS.md" = "PR 合併後由 deploy workflow 自動部署。\n"

@@ -20,6 +20,6 @@ metadata:
    - 資料形狀先於邏輯：用型別或結構讓不合法的狀態寫不出來（`pstack:principle-model-the-domain`）；外部輸入在進入點驗證一次，內部信任，商業邏輯放純函式（`pstack:principle-boundary-discipline`）。結果寫進 `interfaces`。
 4. 交付 `kanban_complete`：
    - `summary`：決策摘要。
-   - `metadata`：`decisions`（決策 + 理由 + 放棄的選項）、`interfaces`、`file_plan`、`pr_slices`（建議的 PR 切分與順序）、`risks`、`adr_markdown`（需要進 repo 的 ADR 全文，developer 會放進 `docs/adr/`）。
+   - `metadata`：必填 `decisions`（決策 + 理由 + 放棄的選項）與 **`target_files`**（repo 相對路徑／glob 陣列，下游 `[DEV]`/`[OPS]` 的 `Allowed-Scope:` 會自動檢查是否完整涵蓋）；選填 `interfaces`、`pr_slices`、`risks`、`adr_markdown`（進 repo 的 ADR 全文，developer 會放進 `docs/adr/`）。
 
 不寫產品程式、不開 PR。資訊不足時採最保守、可回頭的設計並寫明假設，不 block。

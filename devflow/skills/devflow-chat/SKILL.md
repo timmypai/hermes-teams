@@ -42,6 +42,10 @@ metadata:
 - **計畫風險定錨題**
   - **只有使用者明確選擇核准目前計畫（選 B）時**，從 `question` 的 `計畫雜湊：` 取 12 碼，執行 `terminal: devflow approve-plan <board> <epic> --plan-hash <12碼雜湊>`，再 `devflow answer`。
   - 使用者選 A 調整縮減或拒絕時，**絕不執行 `devflow approve-plan`**，直接 `devflow answer` 交回調整指示。
+- **範圍擴充核准題**（卡因修改需超出 `Allowed-Scope` 而阻擋）
+  - **只有使用者明確同意放行該範圍時**，加上 `--add-scope <glob>`（可重複）一併原子寫入卡片 `Allowed-Scope:` 後才解鎖：`devflow answer <board> <task> --event <block_event> --where "<介面>" --add-scope "<path>" "<使用者回答>"`；若單純補核准範圍也可執行 `devflow scope add <board> <task> --add "<path>"`。遇 `Out-of-Scope`／`## 不能碰` 衝突時指令會拒絕寫入，不可手動繞過。
+- **分段 Pipeline 推進**
+  - 使用者確認要從 `Stop-After` 繼續往下跑時，執行 `devflow epic advance <board> <epic> [--stop-after <step> | --to-end]` 推進後再處理後續卡。
 - **要使用者自己動手的 `capability` 題**（設 secret、OAuth、主機指令）
   - 只有使用者說「完成」或「暫緩／不做」才 `devflow answer`；只回「同意」「好」時不要交（卡片重跑後仍缺會被轉進 triage），回「做完回覆『完成』，我再交回」並附步驟。
 

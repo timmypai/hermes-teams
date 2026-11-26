@@ -22,7 +22,9 @@ metadata:
 | `devflow repo access SLUG` | 服務唯一存取方式（SSH tunnel + 127.0.0.1 埠） |
 | `devflow repo protect SLUG` | 設 default branch 的 `devflow-ci`／`devflow-judgment` required checks |
 | `devflow contract SLUG [DIR] [--ui] [--sync-standard]` | 補齊契約檔；`--sync-standard` 還原公版交付檔 |
-| `devflow check card --title T [--body-file F] [--board SLUG] [--assignee A] [--workspace W]` | 建卡／改卡前確定性檢查卡型、欄位、範圍宣告與技術洩漏 |
+| `devflow check card --title T [--body-file F] [--board SLUG] [--assignee A] [--workspace W] [--parent P]` | 建卡／改卡前確定性檢查卡型、欄位、範圍宣告、`[ARCH]` 檔案涵蓋與技術洩漏 |
+| `devflow epic advance SLUG EPIC [--stop-after STEP \| --to-end]` | 推進分段 EPIC 的 `Start-At:`／`Stop-After:` 往下一步或結尾 |
+| `devflow scope add SLUG TASK --add GLOB... [--note T]` | 驗證並原子合併核准的 `Allowed-Scope` glob（拒絕萬用與禁止範圍） |
 | `devflow check ac [--said TEXT] < AC行` | D0：建 EPIC 前檢查 AC 草稿 |
 | `devflow check plan SLUG EPIC [--advise]` | 計畫確定性規則（含 Mode）與範圍風險 |
 | `devflow preflight SLUG [TASK] [--dir DIR] [--pr-title T]` | 送審前確定性自檢（範圍、檔數、保護檔、公版、測試） |
@@ -33,7 +35,7 @@ metadata:
 | `devflow operate SLUG OP [--arg K=V]` | 在 VM runner 執行已審查的 UI 操作腳本 |
 | `devflow runner request／status OWNER/REPO` | 申請／查詢 self-hosted runner |
 | `devflow pending [PROFILE]` | 等使用者回答的卡與送達狀態 |
-| `devflow answer SLUG TASK --event N --where W TEXT` | 交回使用者回答（一題一次） |
+| `devflow answer SLUG TASK --event N --where W [--add-scope GLOB] TEXT` | 交回使用者回答（一題一次；可原子附加 `Allowed-Scope`） |
 | `devflow resume SLUG TASK [--note T]` | 聊天端重跑 blocked／held／triage 卡 |
 | `devflow approve SLUG PR --request REQ_ID` | 聊天端記錄受保護檔 exact-head 核准 |
 | `devflow approve-plan SLUG EPIC --plan-hash H` | 聊天端記錄計畫風險核准 |

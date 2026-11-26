@@ -1,0 +1,326 @@
+"""Structured handoff schemas, ARCH target_files inheritance, and atomic Allowed-Scope merging."""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+KIT = Path(__file__).resolve().parents[1]
+if str(KIT) not in sys.path:
+    sys.path.insert(0, str(KIT))
+
+from lib import handoff as handoff_lib  # noqa: E402
+from lib import policy as policy_lib  # noqa: E402
+from test_judgment import REPO, load_devflow  # noqa: E402
+
+
+class HandoffValidation(unittest.TestCase):
+    def setUp(self) -> None:
+        self.roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
+        self.policy = policy_lib.load_policy(KIT, self.roles)
+
+    def test_valid_handoffs_pass_all_pipeline_steps(self) -> None:
+        cases = {
+            "repro": {"root_cause": "timeout on /v1/foo", "evidence": ["logs/1.txt"]},
+            "design": {"decisions": ["split queue"], "target_files": ["app/q.py", "app/worker.py"]},
+            "implement": {"pr_url": "https://github.com/o/r/pull/1", "head_sha": "a" * 40, "tests": "12 passed"},
+            "ship": {"merged_sha": "b" * 40},
+        }
+        for step, meta in cases.items():
+            self.assertEqual(handoff_lib.validate_handoff(step, meta, self.policy), [], step)
+
+    def test_missing_or_empty_required_fields_and_broad_target_files_fail(self) -> None:
+        errs = handoff_lib.validate_handoff("design", {"decisions": ["x"], "target_files": []}, self.policy)
+        self.assertTrue(any("target_files" in e for e in errs), errs)
+        errs2 = handoff_lib.validate_handoff("repro", {"root_cause": ""}, self.policy)
+        self.assertTrue(any("root_cause" in e for e in errs2) and any("evidence" in e for e in errs2), errs2)
+        errs3 = handoff_lib.validate_handoff("design", {"decisions": ["x"], "target_files": ["**/*"]}, self.policy)
+        self.assertTrue(any("萬用" in e or "過寬" in e for e in errs3), errs3)
+        self.assertTrue(handoff_lib.validate_handoff("unknown", {}, self.policy))
+        self.assertTrue(handoff_lib.validate_handoff("implement", None, self.policy))
+
+
+class ArchTargetFileInheritance(unittest.TestCase):
+    def test_extracts_target_files_and_flags_missing_downstream_allowed_scope_replay_7cebef22_26a85b2b(self) -> None:
+        """Replay t_7cebef22 [ARCH] -> t_26a85b2b [DEV]: missing ARCH target file is caught at planning."""
+        arch_meta = {
+            "decisions": ["wire state + store"],
+            "target_files": [
+                "pkg/calendar_client.py",
+                "pkg/assistant_store.py",
+                "pkg/daemon.py",
+            ],
+        }
+        files = handoff_lib.extract_arch_target_files(arch_meta)
+        self.assertEqual(files, ["pkg/calendar_client.py", "pkg/assistant_store.py", "pkg/daemon.py"])
+
+        # [DEV] forgot pkg/daemon.py
+        missing = handoff_lib.missing_arch_scope_files(files, ["pkg/calendar_client.py", "pkg/assistant_store.py"])
+        self.assertEqual(missing, ["pkg/daemon.py"])
+
+        # Covered via dir glob or exact list
+        self.assertEqual(handoff_lib.missing_arch_scope_files(files, ["pkg/**"]), [])
+
+    def test_extracts_legacy_file_plan_dicts_and_strings(self) -> None:
+        meta = {
+            "file_plan": [
+                {"path": "app/a.py", "note": "x"},
+                "app/b.py",
+            ]
+        }
+        self.assertEqual(handoff_lib.extract_arch_target_files(meta), ["app/a.py", "app/b.py"])
+
+    def test_test_paths_are_exempted_when_explicitly_provided(self) -> None:
+        files = ["app/core.py", "tests/test_core.py"]
+        self.assertEqual(handoff_lib.missing_arch_scope_files(files, ["app/**"]), ["tests/test_core.py"])
+        self.assertEqual(handoff_lib.missing_arch_scope_files(files, ["app/**"], test_paths=["tests/**"]), [])
+
+
+class AtomicScopeMerge(unittest.TestCase):
+    def test_merge_appends_deduped_globs_in_place(self) -> None:
+        body = (
+            "## 目標\n修 bug\n\n"
+            "## 本卡完成\n完成。\n\n"
+            "## 驗收\n覆蓋：AC-1\n"
+            "Allowed-Scope: app/a.py\n"
+            "Out-of-Scope: secrets/**, docker/seccomp.json\n"
+            "EPIC: t_ep1\n"
+        )
+        new_body, merged = handoff_lib.merge_allowed_scope_into_body(
+            body, ["app/b.py", "app/a.py", "app/c/**"]
+        )
+        self.assertEqual(merged, ["app/a.py", "app/b.py", "app/c/**"])
+        self.assertIn("Allowed-Scope: app/a.py, app/b.py, app/c/**\n", new_body)
+        self.assertIn("EPIC: t_ep1", new_body)
+
+    def test_merge_adds_allowed_scope_line_when_missing(self) -> None:
+        body = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nEPIC: t_ep1\n"
+        new_body, merged = handoff_lib.merge_allowed_scope_into_body(body, ["app/x.py"])
+        self.assertEqual(merged, ["app/x.py"])
+        self.assertIn("Allowed-Scope: app/x.py\nEPIC: t_ep1", new_body)
+
+    def test_merge_preserves_leading_dot_on_dotfiles(self) -> None:
+        body = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: ./.devflow/verify.sh\nEPIC: t_ep1\n"
+        new_body, merged = handoff_lib.merge_allowed_scope_into_body(body, [".github/workflows/ci.yml"])
+        self.assertEqual(merged, [".devflow/verify.sh", ".github/workflows/ci.yml"])
+        self.assertIn("Allowed-Scope: .devflow/verify.sh, .github/workflows/ci.yml\n", new_body)
+
+    def test_merge_rejects_broad_wildcards_out_of_scope_and_epic_do_not_touch(self) -> None:
+        body = (
+            "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\n"
+            "Allowed-Scope: app/a.py\n"
+            "Out-of-Scope: secrets/**, infra/prod.yml\n"
+            "EPIC: t_ep1\n"
+        )
+        epic_body = "## 目標\nx\n## 不能碰\n- `deploy/**` 與 `auth/keys.json`\n"
+        for bad in (["*"], ["**/*"], ["."], ["secrets/api.key"], ["infra/**"], ["deploy/compose.yml"], ["auth/keys.json"]):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                handoff_lib.merge_allowed_scope_into_body(body, bad, epic_body=epic_body)
+        with self.assertRaises(ValueError):
+            handoff_lib.merge_allowed_scope_into_body(body, [])
+
+
+class BinDevflowHandoffIntegration(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="devflow-handoff-int-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.hermes = self.root / "hermes"
+        self.board_dir = self.hermes / "kanban" / "boards" / "b"
+        self.board_dir.mkdir(parents=True)
+        repo_dir = self.root / "repo"
+        (repo_dir / ".devflow").mkdir(parents=True)
+        (repo_dir / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY=true\n", encoding="utf-8")
+        (self.root / "state").mkdir(parents=True)
+        (self.root / "state" / "repos.json").write_text(
+            json.dumps({"b": {"slug": "b", "repo": REPO, "path": str(repo_dir), "default_branch": "main",
+                              "port": 18100, "contract": True}}),
+            encoding="utf-8",
+        )
+        shutil.copy(KIT / "roles.json", self.root / "roles.json")
+        old_data = os.environ.get("DEVFLOW_HERMES_DATA")
+        os.environ["DEVFLOW_HERMES_DATA"] = str(self.hermes)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("DEVFLOW_HERMES_DATA", old_data)
+            if old_data is not None else os.environ.pop("DEVFLOW_HERMES_DATA", None)
+        )
+        self.df = load_devflow(self.root)
+        patcher = mock.patch.object(self.df.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _dev_body(self, scope: str) -> str:
+        return (
+            f"## 目標\n修流程\n\n## 本卡完成\n{self.df.DONE_TEXT}\n\n"
+            f"## 驗收\n覆蓋：AC-1\nAllowed-Scope: {scope}\n"
+            "Out-of-Scope: secrets/**\nEPIC: t_ep1\n"
+        )
+
+    def test_plan_rules_and_check_card_catch_missing_arch_target_files(self) -> None:
+        epic_body = (
+            "Mode: deliver\n## 目標\ng\n## 不能碰\n- `deploy/**`\n## 驗收\n- AC-1 [lib] x\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        cards = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "assignee": "orchestrator",
+                      "workspace_kind": "dir", "parents": ["t_ship1"], "children": [], "goal_mode": False,
+                      "body": epic_body},
+            "t_arch1": {"id": "t_arch1", "title": "[ARCH] 設計", "status": "done", "assignee": "architect",
+                        "workspace_kind": "dir", "parents": [], "children": ["t_dev1"], "goal_mode": False,
+                        "body": "EPIC: t_ep1\n",
+                        "runs": [{"status": "done", "metadata": {
+                            "decisions": ["wire all 3"],
+                            "target_files": ["app/store.py", "app/daemon.py", "app/cli.py"],
+                        }}]},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] 實作", "status": "todo", "assignee": "developer",
+                       "workspace_kind": "worktree", "parents": ["t_arch1"], "children": ["t_ship1"],
+                       "goal_mode": True, "completion_contract": REPO,
+                       "body": self._dev_body("app/store.py, app/daemon.py")},
+            "t_ship1": {"id": "t_ship1", "title": "[SHIP] 出貨", "status": "todo", "assignee": "devops",
+                        "workspace_kind": "dir", "parents": ["t_dev1"], "children": ["t_ep1"],
+                        "goal_mode": False, "body": "EPIC: t_ep1\n"},
+        }
+        found = self.df.plan_rules("b", "t_ep1", cards)
+        self.assertTrue(any("app/cli.py" in f and "t_arch1" in f for f in found), found)
+
+        # Adding app/cli.py makes plan_rules pass
+        cards["t_dev1"]["body"] = self._dev_body("app/store.py, app/daemon.py, app/cli.py")
+        self.assertEqual(self.df.plan_rules("b", "t_ep1", cards), [])
+
+        # check card --parent checks the same contract before creating a card
+        self.df.kanban = lambda b, cmd, tid, *a: json.dumps({"task": cards[tid], "runs": cards[tid]["runs"]})
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.df.cmd_check_card(types.SimpleNamespace(
+                board="b", title="[DEV] 實作", body=self._dev_body("app/store.py"),
+                body_file=None, assignee="developer", workspace="worktree", parent=["t_arch1"],
+            ))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.df.cmd_check_card(types.SimpleNamespace(
+                board="b", title="[DEV] 實作", body=self._dev_body("app/**"),
+                body_file=None, assignee="developer", workspace="worktree", parent=["t_arch1"],
+            ))
+
+    def test_empty_or_invalid_arch_handoff_never_silently_bypasses_scope_check(self) -> None:
+        epic_body = (
+            "Mode: deliver\n## 目標\ng\n## 驗收\n- AC-1 [lib] x\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        base_cards = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "assignee": "orchestrator",
+                      "workspace_kind": "dir", "parents": ["t_ship1"], "children": [], "goal_mode": False,
+                      "body": epic_body},
+            "t_arch1": {"id": "t_arch1", "title": "[ARCH] 設計", "status": "done", "assignee": "architect",
+                        "workspace_kind": "dir", "parents": [], "children": ["t_dev1"], "goal_mode": False,
+                        "body": "EPIC: t_ep1\n", "runs": []},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] 實作", "status": "todo", "assignee": "developer",
+                       "workspace_kind": "worktree", "parents": ["t_arch1"], "children": ["t_ship1"],
+                       "goal_mode": True, "completion_contract": REPO,
+                       "body": self._dev_body("app/store.py")},
+            "t_ship1": {"id": "t_ship1", "title": "[SHIP] 出貨", "status": "todo", "assignee": "devops",
+                        "workspace_kind": "dir", "parents": ["t_dev1"], "children": ["t_ep1"],
+                        "goal_mode": False, "body": "EPIC: t_ep1\n"},
+        }
+        for bad_runs in (
+            [],
+            [{"status": "done", "metadata": {}}],
+            [{"status": "done", "metadata": {"decisions": ["split"]}}],
+            [{"status": "done", "metadata": {"decisions": ["split"], "target_files": ["**/*"]}}],
+        ):
+            cards = json.loads(json.dumps(base_cards))
+            cards["t_arch1"]["runs"] = bad_runs
+            found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_arch1" in f and "結構化交接" in f for f in found), (bad_runs, found))
+
+            self.df.kanban = lambda b, cmd, tid, *a: json.dumps({"task": cards[tid], "runs": cards[tid]["runs"]})
+            with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+                self.df.cmd_check_card(types.SimpleNamespace(
+                    board="b", title="[DEV] 實作", body=self._dev_body("app/store.py"),
+                    body_file=None, assignee="developer", workspace="worktree", parent=["t_arch1"],
+                ))
+
+        # Supported legacy file_plan + decisions passes handoff check and enforces Allowed-Scope
+        legacy_cards = json.loads(json.dumps(base_cards))
+        legacy_cards["t_arch1"]["runs"] = [
+            {"status": "done", "metadata": {"decisions": ["keep"], "file_plan": ["app/store.py", "app/cli.py"]}}
+        ]
+        found_leg = self.df.plan_rules("b", "t_ep1", legacy_cards)
+        self.assertFalse(any("結構化交接" in f for f in found_leg), found_leg)
+        self.assertTrue(any("app/cli.py" in f for f in found_leg), found_leg)
+        legacy_cards["t_dev1"]["body"] = self._dev_body("app/store.py, app/cli.py")
+        self.assertEqual(self.df.plan_rules("b", "t_ep1", legacy_cards), [])
+
+    def test_answer_add_scope_and_cmd_scope_add_atomic_and_fail_closed(self) -> None:
+        db = self.board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+        """)
+        epic_body = "## 目標\nx\n## 不能碰\n- `infra/**`\n"
+        dev_body = self._dev_body("app/a.py")
+        conn.execute("INSERT INTO tasks VALUES ('t_ep1', '[EPIC] e', ?, 'todo', NULL, 'orchestrator')", (epic_body,))
+        conn.execute("INSERT INTO tasks VALUES ('t_dev1', '[DEV] d', ?, 'blocked', 'needs_input', 'developer')", (dev_body,))
+        conn.execute("INSERT INTO task_events VALUES (5, 't_dev1', 'blocked', '{}')")
+        conn.commit()
+        conn.close()
+
+        state = {"t_dev1": {"status": "blocked", "assignee": "developer", "body": dev_body}}
+        ops_log: list[tuple[str, str]] = []
+
+        def fake_kanban(board, cmd, tid, *args):
+            ops_log.append((cmd, " ".join(args)))
+            if cmd == "show":
+                if tid == "t_ep1":
+                    return json.dumps({"task": {"id": "t_ep1", "body": epic_body}, "events": []})
+                return json.dumps({"task": dict(state["t_dev1"]), "events": []})
+            if cmd == "edit":
+                state["t_dev1"]["body"] = args[args.index("--body") + 1]
+                return ""
+            if cmd == "assign":
+                state["t_dev1"]["assignee"] = None if args[0] == "none" else args[0]
+                return ""
+            if cmd == "unblock":
+                state["t_dev1"]["status"] = "ready"
+                return ""
+            if cmd == "comment":
+                return ""
+            return ""
+
+        self.df.kanban = fake_kanban
+        # Adding Out-of-Scope or EPIC ## 不能碰 path via answer --add-scope fails closed with zero writes
+        with self.assertRaises(SystemExit):
+            self.df.answer("b", "t_dev1", 5, "核准", "App", add_scope=["infra/deploy.yml"])
+        self.assertEqual(state["t_dev1"]["status"], "blocked")
+        self.assertEqual([c for c, _ in ops_log if c in ("edit", "unblock", "assign")], [])
+
+        # cmd_scope_add rejects wildcard without writing
+        with self.assertRaises(SystemExit):
+            self.df.cmd_scope_add(types.SimpleNamespace(slug="b", task="t_dev1", add=["**/*"], note=""))
+        self.assertEqual([c for c, _ in ops_log if c == "edit"], [])
+
+        # Valid cmd_scope_add writes atomically
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.df.cmd_scope_add(types.SimpleNamespace(slug="b", task="t_dev1", add=["app/b.py"], note="ok"))
+        self.assertIn("app/b.py", state["t_dev1"]["body"])
+
+        # Valid answer --add-scope edits BEFORE unblock/resume
+        ops_log.clear()
+        self.df.answer("b", "t_dev1", 5, "核准新增", "App", add_scope=["app/c.py"])
+        self.assertEqual(state["t_dev1"]["status"], "ready")
+        self.assertIn("Allowed-Scope: app/a.py, app/b.py, app/c.py", state["t_dev1"]["body"])
+        edit_idx = next(i for i, (c, _) in enumerate(ops_log) if c == "edit")
+        unblock_idx = next(i for i, (c, _) in enumerate(ops_log) if c == "unblock")
+        self.assertLess(edit_idx, unblock_idx)
+
+
+if __name__ == "__main__":
+    unittest.main()

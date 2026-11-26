@@ -1,0 +1,18 @@
+id = "draft_pr_only"
+kind = "regex"
+severity = "warn"
+message = "要求一律開 Draft PR 會與 devflow 自動送審流程不一致；請移除並由 devflow 控制送審"
+include = ["AGENTS.md", "CLAUDE.md"]
+patterns = [
+  "(?:準備|只開|一律開)\\s*\\*{0,2}Draft\\s+PR\\*{0,2}",
+]
+
+[[fixture]]
+expect = "fail"
+path = "AGENTS.md"
+text = "PR 一律準備 **Draft PR**，不得直接送正式審查。\n"
+
+[[fixture]]
+expect = "pass"
+path = "AGENTS.md"
+text = "手動工作流可先開 Draft PR；由 devflow 派工時直接開正式 PR 送獨立審查。\n"

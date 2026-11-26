@@ -26,7 +26,7 @@ ROOT = DATA / "devflow"
 _KIT_DIR = Path(__file__).resolve().parent
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
-from lib import vendor as vendor_lib  # noqa: E402
+from lib import lint_engine, vendor as vendor_lib  # noqa: E402
 
 ROLES = json.loads((ROOT / "roles.json").read_text())
 VENDOR = ROOT / "vendor" / "mattpocock-skills"
@@ -311,6 +311,9 @@ def install_developer_codex() -> None:
 
 
 def main() -> None:
+    if (ROOT / "rules" / "workflow").is_dir():
+        if errs := lint_engine.self_test_dir(ROOT / "rules" / "workflow"):
+            sys.exit("FAILED rules/workflow self-test:\n" + "\n".join(errs))
     BACKUP.mkdir(parents=True, exist_ok=True)
     for d in ("state", "runner/requests", "runner/status"):
         (ROOT / d).mkdir(parents=True, exist_ok=True)
