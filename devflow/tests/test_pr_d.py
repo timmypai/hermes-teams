@@ -171,6 +171,27 @@ class StructuralScope(unittest.TestCase):
         self.assertFalse(off["ok"])
         self.assertTrue(any("tests/test_a.py" in f for f in off["findings"]), off["findings"])
 
+    def test_do_not_touch_extracts_root_files_even_past_1000_chars(self) -> None:
+        prose_pad = "禁止修改既有的發布與設定檔案。\n" * 80  # > 1000 chars before explicit paths
+        epic = (
+            f"## 目標\ng\n## 不能碰\n{prose_pad}"
+            "`README.md`、`Dockerfile`、`package.json`、`-rf`、`123`、`.env.local` 與 app/secret/**\n"
+        )
+        secs = self.scope.parse_epic_sections(epic)
+        self.assertGreater(len(secs["不能碰"]), 1000)
+        paths = self.scope.extract_do_not_touch_paths(secs["不能碰"])
+        self.assertEqual(paths, ["README.md", "Dockerfile", "package.json", ".env.local", "app/secret/**"])
+        ctx = self.scope.build_goal_context(
+            epic_id="t_e", epic_title="e", epic_body=epic, card_id="t_d", card_title="[DEV] d",
+            card_body="Allowed-Scope: app/**",
+        )
+        for root_file in ("README.md", "Dockerfile", "package.json", ".env.local", "app/secret/**"):
+            self.assertIn(root_file, ctx["out_of_scope"])
+        for filename in ("README.md", "Dockerfile", "package.json"):
+            rep = self._preflight("DEVFLOW_DEPLOY=false\n", epic, {"app/a.py": "x = 2\n", filename: "touch\n"})
+            self.assertFalse(rep["ok"], (filename, rep))
+            self.assertTrue(any("Out-of-Scope" in f and filename in f for f in rep["findings"]), (filename, rep))
+
 
 class DeterministicPrFailFast(JudgmentCase):
     def setUp(self) -> None:
@@ -210,6 +231,19 @@ class DeterministicPrFailFast(JudgmentCase):
         code, out = self.ship()
         self.assertEqual(code, 0, out)
         self.assertEqual(self.f.statuses, ["success"])
+
+    def test_judgment_catches_root_file_after_1000_chars_in_epic_do_not_touch(self) -> None:
+        epic = "## 目標\ng\n## 不能碰\n" + ("禁止碰根目錄設定。\n" * 120) + "`Dockerfile`、`README.md`、`package.json`\n"
+        ctx = self.df.scope_lib.build_goal_context(
+            epic_id="t_e", epic_title="e", epic_body=epic, card_id="t_dev", card_title="[DEV] d",
+            card_body="Allowed-Scope: app/**",
+        )
+        self.df.pr_goal_context = lambda board, repo, number, pr: ctx
+        self.f.files = [{"filename": "Dockerfile", "status": "modified", "patch": "+FROM python:3.12"}]
+        rec = self.df.judgment("b", REPO, 7)
+        self.assertTrue(any("Out-of-Scope" in f and "Dockerfile" in f for f in rec["deterministic_findings"]), rec)
+        _, verdict = self.df.gate("b", REPO, 7)
+        self.assertEqual(verdict, "deterministic_fail")
 
 
 class AdjConvergence(unittest.TestCase):
@@ -289,6 +323,22 @@ class AdjConvergence(unittest.TestCase):
         self._edit("t_ep1", body="## 目標\n改寫\n")
         self.assertEqual([c[0] for c in self.calls], ["edit", "edit"])
 
+    def test_title_only_edit_converting_to_dev_or_ops_is_rejected_without_touching_board(self) -> None:
+        for prefix in ("[DEV]", "[OPS]"):
+            with self.assertRaises(ValueError) as cm:
+                self._edit("t_ep1", title=f"{prefix} 偷轉任務卡")
+            self.assertTrue("本卡完成" in str(cm.exception) or "Allowed-Scope" in str(cm.exception), cm.exception)
+        with self.assertRaises(ValueError):
+            self._edit("t_dev1", title="[DEV] 缺結構正文也應擋")
+        self.assertEqual(self.calls, [])
+
+    def test_title_only_edit_on_valid_dev_card_succeeds(self) -> None:
+        valid_body = f"## 目標\ng\n## 本卡完成\n{self.df.DONE_TEXT}\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1"
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("UPDATE tasks SET body = ? WHERE id = 't_dev1'", (valid_body,))
+        self._edit("t_dev1", title="[DEV] 改合法標題")
+        self.assertEqual(self.calls, [("edit", "t_dev1", "--title", "[DEV] 改合法標題")])
+
 
 class PrSubmit(unittest.TestCase):
     def setUp(self) -> None:
@@ -307,20 +357,37 @@ class PrSubmit(unittest.TestCase):
                 CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT,
                     payload TEXT, created_at INTEGER);
             """)
-            c.execute("INSERT INTO tasks VALUES ('t_dev1', '[DEV] d', ?, 'running')",
-                      (f"## 目標\ng\n## 本卡完成\n{self.df.DONE_TEXT}\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\n",))
+            c.executemany("INSERT INTO tasks VALUES (?,?,?,?)", [
+                ("t_ep1", "[EPIC] e", "## 目標\ng\n## 驗收\n- AC-1 [api] e\n  - S1: ok", "todo"),
+                ("t_dev1", "[DEV] d", f"## 目標\ng\n## 本卡完成\n{self.df.DONE_TEXT}\n## 驗收\n覆蓋：AC-1\n"
+                                      "Allowed-Scope: app/**\nEPIC: t_ep1\n", "running"),
+            ])
         self.calls: list[list[str]] = []
-        self.pr_exists = False
+        self.pr: dict | None = None
+
+        def _flag(cmd: list[str], name: str) -> str | None:
+            return cmd[cmd.index(name) + 1] if name in cmd else None
 
         def run(cmd, **kw):
             self.calls.append(list(cmd))
             if cmd[:3] == ["gh", "pr", "view"]:
-                if not self.pr_exists:
+                if self.pr is None:
                     return SimpleNamespace(returncode=1, stdout="", stderr="no pull requests found")
-                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
-                    {"url": f"https://github.com/{REPO}/pull/5", "number": 5, "headRefOid": "a" * 40}))
+                return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(self.pr))
             if cmd[:3] == ["gh", "pr", "create"]:
-                self.pr_exists = True
+                self.pr = {
+                    "url": f"https://github.com/{REPO}/pull/5",
+                    "number": 5,
+                    "headRefOid": "a" * 40,
+                    "state": "OPEN",
+                    "title": _flag(cmd, "--title") or "",
+                    "body": _flag(cmd, "--body") or "",
+                }
+            elif cmd[:3] == ["gh", "pr", "edit"] and self.pr is not None:
+                if (t := _flag(cmd, "--title")) is not None:
+                    self.pr["title"] = t
+                if (b := _flag(cmd, "--body")) is not None:
+                    self.pr["body"] = b
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         self.df.run = run
 
@@ -328,6 +395,9 @@ class PrSubmit(unittest.TestCase):
         base = dict(slug="b", task="t_dev1", dir=str(self.repo), base="HEAD~1", pr_title="feat: x", pr_body="做了 x",
                     pr_body_file=None, no_test=True, allow_dirty=False, dry_run=False)
         return SimpleNamespace(**{**base, **kw})
+
+    def _mutating_calls(self) -> list[list[str]]:
+        return [c for c in self.calls if c[:2] == ["git", "-C"] or c[:3] in (["gh", "pr", "create"], ["gh", "pr", "edit"])]
 
     def submit(self, **kw) -> tuple[int, dict]:
         buf = io.StringIO()
@@ -340,34 +410,95 @@ class PrSubmit(unittest.TestCase):
         return code, json.loads(buf.getvalue())
 
     def make(self, change: dict[str, str]) -> None:
-        _init_repo(self.repo, {".devflow/config.env": "DEVFLOW_DEPLOY=false\n", "app/a.py": "x = 1\n"}, change)
+        sc = {"t_ep1/AC-1.S1": {"description": "d", "given": "g", "when": "w", "then": "t"}}
+        _init_repo(
+            self.repo,
+            {".devflow/config.env": "DEVFLOW_DEPLOY=false\n", ".devflow/scenarios.json": json.dumps(sc), "app/a.py": "x = 1\n"},
+            change,
+        )
 
     def test_out_of_scope_change_stops_at_preflight_and_never_pushes(self) -> None:
         self.make({"docs/readme.md": "hi\n"})
         code, out = self.submit()
         self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
         self.assertTrue(any("Allowed-Scope" in f for f in out["preflight"]["findings"]))
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self._mutating_calls(), [])
 
     def test_dry_run_stops_after_a_green_preflight(self) -> None:
         self.make({"app/a.py": "x = 2\n"})
         code, out = self.submit(dry_run=True)
         self.assertEqual((code, out["ok"], out["dry_run"]), (0, True, True))
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self._mutating_calls(), [])
 
     def test_green_preflight_pushes_opens_the_pr_and_binds_the_card(self) -> None:
         self.make({"app/a.py": "x = 2\n"})
         code, out = self.submit()
         self.assertEqual(code, 0, out)
-        self.assertEqual((out["stage"], out["created"], out["pr_number"], out["head_sha"]), ("submitted", True, 5, "a" * 40))
-        self.assertEqual(self.calls[0][:2], ["git", "-C"])
-        self.assertIn("push", self.calls[0])
+        self.assertEqual((out["stage"], out["created"], out["updated_metadata"], out["pr_number"], out["head_sha"]),
+                         ("submitted", True, False, 5, "a" * 40))
+        push_idx = next(i for i, c in enumerate(self.calls) if c[:2] == ["git", "-C"])
+        self.assertIn("push", self.calls[push_idx])
         create = next(c for c in self.calls if c[:3] == ["gh", "pr", "create"])
         self.assertIn("Kanban: t_dev1", create[create.index("--body") + 1])
         self.calls.clear()
-        code, out = self.submit()  # PR already exists: push again, do not create a second one
-        self.assertEqual((code, out["created"]), (0, False))
-        self.assertFalse(any(c[:3] == ["gh", "pr", "create"] for c in self.calls))
+        code, out = self.submit()  # PR already exists with same metadata: push again, no create/edit
+        self.assertEqual((code, out["created"], out["updated_metadata"]), (0, False, False))
+        self.assertFalse(any(c[:3] in (["gh", "pr", "create"], ["gh", "pr", "edit"]) for c in self.calls))
+
+    def test_repeated_submit_updates_pr_metadata_with_gh_pr_edit_and_verifies(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        code, _ = self.submit()
+        self.assertEqual(code, 0)
+        self.calls.clear()
+        code, out = self.submit(pr_title="fix: 修 x", pr_body="修好 x\nLesson: L-0001\nCovers: t_ep1/AC-1.S1")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((out["created"], out["updated_metadata"]), (False, True))
+        edits = [c for c in self.calls if c[:3] == ["gh", "pr", "edit"]]
+        self.assertEqual(len(edits), 1)
+        self.assertIn("fix: 修 x", edits[0])
+        self.assertIn("Covers: t_ep1/AC-1.S1", self.pr["body"])
+        self.assertIn("Lesson: L-0001", self.pr["body"])
+        self.assertIn("Kanban: t_dev1", self.pr["body"])
+        self.assertEqual(self.calls[-1][:3], ["gh", "pr", "view"])
+
+    def test_repeated_submit_omitting_flags_validates_remote_pr_metadata(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        self.pr = {
+            "url": f"https://github.com/{REPO}/pull/5", "number": 5, "headRefOid": "a" * 40,
+            "state": "OPEN", "title": "fix: 遠端缺 lesson", "body": "說明\nCovers: t_ep1/AC-99.S1\n\nKanban: t_dev1",
+        }
+        code, out = self.submit(pr_title=None, pr_body=None)
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "preflight"))
+        self.assertTrue(any("Lesson" in f for f in out["preflight"]["findings"]), out)
+        self.assertTrue(any("AC-99.S1" in f for f in out["preflight"]["findings"]), out)
+        self.assertEqual(self._mutating_calls(), [])
+
+    def test_conflicting_kanban_owner_fails_closed_before_push(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        self.pr = {
+            "url": f"https://github.com/{REPO}/pull/5", "number": 5, "headRefOid": "a" * 40,
+            "state": "OPEN", "title": "feat: other", "body": "x\n\nKanban: t_other1",
+        }
+        code, out = self.submit(task="t_dev1")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "pr_owner_conflict"))
+        self.assertEqual(self._mutating_calls(), [])
+        self.pr = None
+        self.calls.clear()
+        code, out = self.submit(task="t_dev1", pr_body="寫錯卡\n\nKanban: t_other1")
+        self.assertEqual((code, out["ok"], out["stage"]), (1, False, "pr_owner_conflict"))
+        self.assertEqual(self._mutating_calls(), [])
+
+    def test_closed_or_merged_pr_refuses_before_preflight_or_push(self) -> None:
+        self.make({"app/a.py": "x = 2\n"})
+        for st in ("CLOSED", "MERGED"):
+            self.calls.clear()
+            self.pr = {
+                "url": f"https://github.com/{REPO}/pull/5", "number": 5, "headRefOid": "a" * 40,
+                "state": st, "title": "feat: done", "body": "Kanban: t_dev1",
+            }
+            code, out = self.submit()
+            self.assertEqual((code, out["ok"], out["stage"], out["pr_state"]), (1, False, "pr_state", st))
+            self.assertEqual(self._mutating_calls(), [])
 
 
 class DoctorAndStats(unittest.TestCase):

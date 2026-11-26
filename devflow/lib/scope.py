@@ -53,16 +53,21 @@ def parse_epic_mode(epic_body: str | None, valid_modes: set[str] | frozenset[str
     return raw, None
 
 
+_ROOT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
 def extract_do_not_touch_paths(do_not_touch: str | None) -> list[str]:
     """Extract explicit repo-relative path/glob patterns from EPIC `## 不能碰` for deterministic
     `Out-of-Scope` inheritance (ignores URLs and plain prose)."""
     out: list[str] = []
     text = re.sub(r"https?://\S+", " ", do_not_touch or "")
     for m in _PATH_TOKEN_RE.finditer(text):
-        tok = (m.group(1) or m.group(2) or "").strip().strip(".,;:()[]\"'")
-        if not tok or "://" in tok or tok.startswith(("http", "/")) or tok in (".", ".."):
+        tok = (m.group(1) or m.group(2) or "").strip().strip(",;:()[]\"'").rstrip(".")
+        if not tok or "://" in tok or tok.startswith(("http", "/", "-")) or tok in (".", "..") or tok.isdigit():
             continue
         if "/" in tok or "*" in tok:
+            out.append(tok)
+        elif m.group(1) and _ROOT_FILENAME_RE.fullmatch(tok):
             out.append(tok)
     return list(dict.fromkeys(out))
 
@@ -201,8 +206,9 @@ def build_goal_context(
     epic_secs = parse_epic_sections(epic_body)
     epic_mode, _ = parse_epic_mode(epic_body)
     contract = parse_card_contract(card_body)
-    do_not_touch = (epic_secs.get("不能碰") or "")[:1000]
-    merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *extract_do_not_touch_paths(do_not_touch)]))
+    raw_do_not_touch = epic_secs.get("不能碰") or ""
+    do_not_touch = raw_do_not_touch[:1000]
+    merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *extract_do_not_touch_paths(raw_do_not_touch)]))
     ctx = {
         "epic_id": epic_id,
         "epic_title": epic_title or "",

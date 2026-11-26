@@ -1937,7 +1937,7 @@ def _validate_edit_op(board: str, op: dict) -> list[str]:
     if new_title is not None and kind not in CARDS:
         return [f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]"]
     errs: list[str] = []
-    if kind in ("DEV", "OPS") and new_body is not None:
+    if kind in ("DEV", "OPS"):
         if why := done_problem(eff_title, eff_body):
             errs.append(why)
         repo_cfg = policy_lib.load_repo_config(entry(board).get("path")) if board in load_state() else {}
@@ -5008,7 +5008,12 @@ def cmd_ship_merge(a) -> None:
                       "protect": keep_protected(e)}, ensure_ascii=False))
 
 
-def _run_card_preflight(a) -> tuple[dict, dict, Path, str | None]:
+def _run_card_preflight(
+    a,
+    *,
+    override_pr_title: str | None = None,
+    override_pr_body: str | None = None,
+) -> tuple[dict, dict, Path, str | None]:
     e = entry(a.slug)
     repo_dir = Path(a.dir).resolve()
     base_ref = a.base or f"origin/{e['default_branch']}"
@@ -5049,7 +5054,9 @@ def _run_card_preflight(a) -> tuple[dict, dict, Path, str | None]:
         review_loop = breakers.review_round_breaker(
             github_rejections=0, kanban_rejections=cr_count, approved_latest=False, max_rounds=MAX_REVIEW_ROUNDS
         )
-    pr_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
+    raw_pr_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
+    pr_title = a.pr_title if override_pr_title is None else override_pr_title
+    pr_body = raw_pr_body if override_pr_body is None else override_pr_body
     require_scope_for_card = (not card_title) or (card_type(card_title) in ("DEV", "OPS"))
     rep = preflight_lib.run_preflight(
         repo_dir,
@@ -5059,7 +5066,7 @@ def _run_card_preflight(a) -> tuple[dict, dict, Path, str | None]:
         epic_id=epic_id,
         epic_body=epic_body,
         valid_scenarios=valid_scenarios,
-        pr_title=a.pr_title,
+        pr_title=pr_title,
         pr_body=pr_body,
         run_tests=not a.no_test,
         allow_dirty=a.allow_dirty,
@@ -5080,9 +5087,72 @@ def cmd_preflight(a) -> None:
 
 
 def cmd_pr_submit(a) -> None:
-    """Shift-left single entry for developers: run deterministic preflight, then push branch and
-    create/read back the PR (never pushes or opens a PR when preflight fails)."""
-    e, rep, repo_dir, pr_body = _run_card_preflight(a)
+    """Shift-left single entry for developers: resolve existing PR metadata/owner/state, run
+    deterministic preflight against effective PR title/body, then push and create/edit PR."""
+    e = entry(a.slug)
+    repo_dir = Path(a.dir).resolve()
+    supplied_title = a.pr_title
+    supplied_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
+
+    existing_view = run(
+        ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
+        cwd=repo_dir, gh="builder", check=False,
+    )
+    existing: dict | None = None
+    if existing_view.returncode == 0 and existing_view.stdout.strip():
+        try:
+            existing = json.loads(existing_view.stdout)
+        except ValueError as err:
+            die(f"pr submit 無法解析現有 PR metadata：{err}")
+
+    if existing is not None:
+        state = str(existing.get("state") or "").upper()
+        if state != "OPEN":
+            print(json.dumps({
+                "ok": False,
+                "stage": "pr_state",
+                "error": f"PR #{existing.get('number')} 狀態為 {state or 'UNKNOWN'}（僅允許 OPEN PR 重送）",
+                "pr_url": existing.get("url"),
+                "pr_number": existing.get("number"),
+                "pr_state": existing.get("state"),
+            }, ensure_ascii=False, indent=2))
+            sys.exit(1)
+
+    existing_owner = scope_lib.extract_kanban_task_id(existing.get("body")) if existing is not None else None
+    supplied_owner = scope_lib.extract_kanban_task_id(supplied_body) if supplied_body is not None else None
+    conflict_msg = None
+    if a.task and existing_owner and existing_owner != a.task:
+        conflict_msg = f"現有 PR #{existing.get('number')} 已綁定 {existing_owner}，與指定任務 {a.task} 衝突"
+    elif a.task and supplied_owner and supplied_owner != a.task:
+        conflict_msg = f"提供的 PR 內文已指定 {supplied_owner}，與指定任務 {a.task} 衝突"
+    elif existing_owner and supplied_owner and supplied_owner != existing_owner:
+        conflict_msg = f"提供的 PR 內文指定 {supplied_owner}，與現有 PR #{existing.get('number')} 的 {existing_owner} 衝突"
+    if conflict_msg:
+        print(json.dumps({
+            "ok": False,
+            "stage": "pr_owner_conflict",
+            "error": conflict_msg,
+            **({"pr_url": existing.get("url"), "pr_number": existing.get("number")} if existing is not None else {}),
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
+
+    if existing is not None:
+        eff_title = supplied_title if supplied_title is not None else (existing.get("title") or "")
+        base_body_raw = supplied_body if supplied_body is not None else (existing.get("body") or "")
+    else:
+        eff_title = supplied_title or ""
+        base_body_raw = supplied_body or ""
+    if a.task and not scope_lib.extract_kanban_task_id(base_body_raw):
+        trimmed = base_body_raw.rstrip()
+        eff_body = (trimmed + "\n\n" if trimmed else "") + f"Kanban: {a.task}"
+    elif existing is None or supplied_body is not None:
+        eff_body = base_body_raw.rstrip()
+    else:
+        eff_body = base_body_raw
+
+    _, rep, _, _ = _run_card_preflight(
+        a, override_pr_title=eff_title, override_pr_body=eff_body,
+    )
     if not rep["ok"]:
         print(json.dumps({"ok": False, "stage": "preflight", "preflight": rep}, ensure_ascii=False, indent=2))
         sys.exit(1)
@@ -5090,32 +5160,62 @@ def cmd_pr_submit(a) -> None:
         print(json.dumps({"ok": True, "stage": "preflight", "dry_run": True, "preflight": rep},
                          ensure_ascii=False, indent=2))
         return
-    body = (pr_body or "").rstrip()
-    if a.task and not scope_lib.extract_kanban_task_id(body):
-        body = (body + "\n\n" if body else "") + f"Kanban: {a.task}"
+    if existing is None and not eff_title.strip():
+        die("pr submit 建立新 PR 需要 --pr-title")
+    if existing is not None and not eff_title.strip():
+        die("pr submit PR 標題不可為空白")
+
     push = run(["git", "-C", str(repo_dir), "push", "-u", "origin", "HEAD"], gh="builder", check=False)
     if push.returncode != 0:
         die(f"pr submit 推送分支失敗：{(push.stderr or push.stdout).strip()[-400:]}")
-    view = run(["gh", "pr", "view", "--json", "url,number,headRefOid"], cwd=repo_dir, gh="builder", check=False)
-    if view.returncode == 0 and view.stdout.strip():
-        pr_info = json.loads(view.stdout)
+
+    if existing is not None:
         created = False
+        updated_metadata = (
+            eff_title != (existing.get("title") or "")
+            or eff_body != (existing.get("body") or "")
+        )
+        if updated_metadata:
+            edit = run(
+                ["gh", "pr", "edit", str(existing["number"]), "--title", eff_title, "--body", eff_body],
+                cwd=repo_dir, gh="builder", check=False,
+            )
+            if edit.returncode != 0:
+                die(f"pr submit 更新 PR metadata 失敗：{(edit.stderr or edit.stdout).strip()[-400:]}")
+        view = run(
+            ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
+            cwd=repo_dir, gh="builder", check=False,
+        )
+        if view.returncode != 0 or not view.stdout.strip():
+            die(f"pr submit 讀回 PR 失敗：{(view.stderr or view.stdout).strip()[-400:]}")
+        pr_info = json.loads(view.stdout)
+        if str(pr_info.get("state") or "").upper() != "OPEN":
+            die(f"pr submit 讀回 PR #{pr_info.get('number')} 狀態非 OPEN：{pr_info.get('state')}")
+        if updated_metadata and (
+            (pr_info.get("title") or "").strip() != eff_title.strip()
+            or (pr_info.get("body") or "").replace("\r\n", "\n").rstrip() != eff_body.replace("\r\n", "\n").rstrip()
+        ):
+            die(f"pr submit 讀回 PR #{pr_info.get('number')} metadata 未反映更新")
     else:
-        if not a.pr_title:
-            die("pr submit 建立新 PR 需要 --pr-title")
         create = run(
-            ["gh", "pr", "create", "--base", e["default_branch"], "--title", a.pr_title, "--body", body],
+            ["gh", "pr", "create", "--base", e["default_branch"], "--title", eff_title, "--body", eff_body],
             cwd=repo_dir, gh="builder", check=False,
         )
         if create.returncode != 0:
             die(f"pr submit 建立 PR 失敗：{(create.stderr or create.stdout).strip()[-400:]}")
-        view = run(["gh", "pr", "view", "--json", "url,number,headRefOid"], cwd=repo_dir, gh="builder")
+        view = run(
+            ["gh", "pr", "view", "--json", "url,number,headRefOid,state,title,body"],
+            cwd=repo_dir, gh="builder",
+        )
         pr_info = json.loads(view.stdout)
         created = True
+        updated_metadata = False
+
     print(json.dumps({
         "ok": True,
         "stage": "submitted",
         "created": created,
+        "updated_metadata": updated_metadata,
         "pr_url": pr_info.get("url"),
         "pr_number": pr_info.get("number"),
         "head_sha": pr_info.get("headRefOid"),

@@ -52,8 +52,9 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
 7. `kanban_comment(EPIC, 計畫摘要：卡片清單、順序、AC 對應)`，再 `kanban_block(kind="dependency", reason="等待子卡完成：t_a, t_b…")`。
 
 ## B. 驗收（EPIC 被喚醒）
-- **`investigate`／`review`**：核對子卡的真實證據與限制；足夠就 `kanban_complete`，不足就誠實回報「未通過」或 `capability`，不拿舊場次或推測替代。
-- **`deliver`**：
+- **`investigate`**：核對子卡真實證據與限制；足夠就 `kanban_complete`，不足就誠實回報「未通過」或 `capability`，不拿舊場次或推測替代。
+- **`review`**：核對獨立審查的 exact-head GitHub review／merge 讀回證據（含 `user/login`、完整 head SHA、review 連結與實際結論，不採信未讀回的自稱），再據實 `kanban_complete` 或回報未通過。
+- **`deliver`**：一律跑 `devflow check acceptance`（不可跳過）：
   1. 收集本 EPIC 所有已合併 PR 號，跑 `devflow check acceptance <slug> <EPIC> --pr <N> [--pr <M> ...] --json`。
   2. 結束碼 `0` → `kanban_complete`（白話 summary；`metadata` 放 `prs`、`deploy_runs`、`integration_run`、`acceptance`、`followups`）。
   3. 結束碼 `3`（只剩 `UNJUDGED`）→ 不建補救卡，`kanban_block(kind="needs_input", reason="Decisions API 無法使用，AC-x 未判定；恢復後 devflow resume 重跑驗收")`。
