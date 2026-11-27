@@ -14,6 +14,7 @@ import ast
 import os
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -607,6 +608,28 @@ def _prune_depths(
             stack.pop()
 
 
+_JS_HORIZ_WS = frozenset(("\t", "\v", "\f", " ", "\u00a0", "\ufeff"))
+
+
+def _is_js_ws(ch: str) -> bool:
+    """Return True for ECMAScript WhiteSpace characters excluding line terminators."""
+    return ch in _JS_HORIZ_WS or unicodedata.category(ch) == "Zs"
+
+
+def _count_js_line_breaks(text: str, start: int, end: int) -> int:
+    """Count ECMAScript line breaks (coalescing CRLF) in `text[start:end]`."""
+    count = 0
+    pos = start
+    while pos < end:
+        ch = text[pos]
+        if ch in _JS_LINE_BREAKS:
+            count += 1
+            pos += 2 if (ch == "\r" and pos + 1 < end and text[pos + 1] == "\n") else 1
+        else:
+            pos += 1
+    return count
+
+
 def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
     """Speculatively scan single-line `/pattern/flags`; return next index or None if unterminated or invalid flags."""
     i = start + 1
@@ -615,11 +638,11 @@ def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
     while i < n:
         rc = text[i]
         if rc == "\\" and i + 1 < n:
-            if text[i + 1] in ("\n", "\r"):
+            if text[i + 1] in _JS_LINE_BREAKS:
                 return None
             i += 2
             continue
-        if rc in ("\n", "\r"):
+        if rc in _JS_LINE_BREAKS:
             return None
         if rc == "[":
             in_cls = True
@@ -638,8 +661,8 @@ def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
     return None
 
 
-_JSX_CLOSE_TAG_RE = re.compile(r"</\s*([A-Za-z_$][\w$.-]*)?\s*>")
-_JSX_CLOSE_TAG_AT_RE = re.compile(r"</([ \t\r\n]*)([A-Za-z_$][\w$.-]*)?([ \t\r\n]*)>")
+_JSX_CLOSE_TAG_RE = re.compile(r"</(?:\s|\ufeff)*([A-Za-z_$][\w$.-]*)?(?:\s|\ufeff)*>")
+_JSX_CLOSE_TAG_AT_RE = _JSX_CLOSE_TAG_RE
 
 
 def _last_jsx_closes(text: str) -> dict[str, int]:
@@ -660,14 +683,19 @@ def _scan_jsx_attr_string(text: str, start: int, lineno: int) -> tuple[int, int]
     while i < n:
         c = text[i]
         if c == "\\" and i + 1 < n:
-            if text[i + 1] == "\n":
+            nxt = text[i + 1]
+            if nxt in _JS_LINE_BREAKS:
                 lineno += 1
+                i += 3 if (nxt == "\r" and i + 2 < n and text[i + 2] == "\n") else 2
+                continue
             i += 2
             continue
         if c == q:
             return i + 1, lineno
-        if c == "\n":
+        if c in _JS_LINE_BREAKS:
             lineno += 1
+            i += 2 if (c == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
+            continue
         i += 1
     return None
 
@@ -692,18 +720,18 @@ def _scan_jsx_open_tag(
         q += 1
     tag_name = text[p:q]
     p = q
-    if p < n and not (text[p] in (" ", "\t", "\r", "\n", ">", "/", "<")):
+    if p < n and not (text[p] in _JS_LINE_BREAKS or _is_js_ws(text[p]) or text[p] in (">", "/", "<")):
         return None
 
     prop_tokens: list[tuple[str, str, int]] = []
     angle = 0
     while p < n:
         ch = text[p]
-        if ch in (" ", "\t", "\r"):
-            p += 1
-            continue
-        if ch == "\n":
+        if ch in _JS_LINE_BREAKS:
             lineno += 1
+            p += 2 if (ch == "\r" and p + 1 < n and text[p + 1] == "\n") else 1
+            continue
+        if _is_js_ws(ch):
             p += 1
             continue
         if ch == "<":
@@ -769,9 +797,9 @@ def _try_scan_jsx(
     n = len(text)
     while stack and i < n:
         ch = text[i]
-        if ch == "\n":
+        if ch in _JS_LINE_BREAKS:
             cur_line += 1
-            i += 1
+            i += 2 if (ch == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
             continue
         if ch == "{":
             expr_line = cur_line
@@ -788,8 +816,8 @@ def _try_scan_jsx(
         if ch == "<" and i + 1 < n:
             if text.startswith("</", i):
                 m = _JSX_CLOSE_TAG_AT_RE.match(text, i)
-                if m and (m.group(2) or "") == stack[-1]:
-                    cur_line += text.count("\n", i, m.end())
+                if m and (m.group(1) or "") == stack[-1]:
+                    cur_line += _count_js_line_breaks(text, i, m.end())
                     i = m.end()
                     stack.pop()
                     continue
@@ -830,16 +858,23 @@ def _tokenize_js_span(
     closes = _last_jsx_closes(text) if jsx_closes is None else jsx_closes
     i = start
     n = len(text)
+    if start == 0:
+        if i < n and text[i] == "\ufeff":
+            i += 1
+        if text.startswith("#!", i):
+            i += 2
+            while i < n and text[i] not in _JS_LINE_BREAKS:
+                i += 1
     while i < n:
         ch = text[i]
-        if ch in (" ", "\t", "\r"):
-            i += 1
-            continue
         if ch in _JS_LINE_BREAKS:
             if not tokens or tokens[-1][0] != "NL":
                 tokens.append(("NL", "\n", lineno))
             lineno += 1
             i += 2 if (ch == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
+            continue
+        if _is_js_ws(ch):
+            i += 1
             continue
         if ch == "/" and i + 1 < n:
             nxt = text[i + 1]

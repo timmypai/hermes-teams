@@ -178,7 +178,7 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         rules_dir.mkdir()
         (rules_dir / "imp.toml").write_text(
             'id = "imp"\nkind = "import_boundary"\nmessage = "no infra"\n'
-            'include = ["src/**/*.py", "web/**/*.ts", "web/**/*.tsx"]\nforbidden_modules = ["infra", "infra/"]\n'
+            'include = ["src/**/*.py", "web/**/*.js", "web/**/*.ts", "web/**/*.tsx"]\nforbidden_modules = ["infra", "infra/"]\n'
             '[[fixture]]\nexpect = "fail"\npath = "src/a.py"\ntext = "import infra\\n"\n'
             '[[fixture]]\nexpect = "pass"\npath = "src/a.py"\ntext = "import app\\n"\n',
             encoding="utf-8",
@@ -215,6 +215,22 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     '/* import { z } from "infra/commented";\nexport * from "infra/commented_exp"; */\n'
                     'const u = "https://x";\n'
                 ),
+                "web/clean_ws.js": (
+                    "#!/usr/bin/env node\r"
+                    "\ufeffconst\u00a0a = 1\r"
+                    "const re = /import\\('infra\\/re_cr'\\)/g\r"
+                    '/*\u2028import x from "infra/cmt_ls";\r*/\r'
+                ),
+                "web/bom.ts": '\ufeffimport x from "infra/bom";\n',
+                "web/hashbang.js": '#!/usr/bin/env node\nimport x from "infra/hashbang";\n',
+                "web/bom_hashbang.js": '\ufeff#!/usr/bin/env node\r\nimport x from "infra/bom_hb";\r\n',
+                "web/nbsp.ts": '\u00a0import\u00a0x\u00a0from\u00a0"infra/nbsp";\n',
+                "web/ecmas_ws.ts": '\v\f\u2003import\u2003{ a }\u00a0from\ufeff"infra/ecmas_ws";\n',
+                "web/cr_asi.js": 'const x = 1\rimport y from "infra/cr_asi";\r',
+                "web/cr_export.js": 'const x = 1\rexport { y } from "infra/cr_exp";\r',
+                "web/crlf_asi.js": 'const x = 1\r\nimport y from "infra/crlf_asi";\r\n',
+                "web/jsx_ws.tsx": 'const\u00a0el = <Box\u00a0v={1}\u2028>don\'t</Box\u00a0>;\rimport\u00a0j\u00a0from\u00a0"infra/jsx_ws";\r',
+                "web/div_ls.ts": 'const r = 1 / 2\u2028const m = await import("infra/after_ls");\u2029',
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
                 "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
                 "web/req.ts": "const r = require('infra/sync_client');\n",
@@ -249,7 +265,18 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         )
         by_file = {h["file"]: h for h in hits}
         self.assertNotIn("web/clean.ts", by_file)
+        self.assertNotIn("web/clean_ws.js", by_file)
         for bad_js in (
+            "web/bom.ts",
+            "web/hashbang.js",
+            "web/bom_hashbang.js",
+            "web/nbsp.ts",
+            "web/ecmas_ws.ts",
+            "web/cr_asi.js",
+            "web/cr_export.js",
+            "web/crlf_asi.js",
+            "web/jsx_ws.tsx",
+            "web/div_ls.ts",
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/req.ts",
@@ -282,6 +309,16 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         ):
             self.assertIn(bad_js, by_file, bad_js)
         self.assertEqual(by_file["web/jsx_quote.tsx"]["match"], "infra/inside_jsx")
+        self.assertEqual(by_file["web/bom.ts"]["line"], 1)
+        self.assertEqual(by_file["web/hashbang.js"]["line"], 2)
+        self.assertEqual(by_file["web/bom_hashbang.js"]["line"], 2)
+        self.assertEqual(by_file["web/nbsp.ts"]["line"], 1)
+        self.assertEqual(by_file["web/ecmas_ws.ts"]["line"], 1)
+        self.assertEqual(by_file["web/cr_asi.js"]["line"], 2)
+        self.assertEqual(by_file["web/cr_export.js"]["line"], 2)
+        self.assertEqual(by_file["web/crlf_asi.js"]["line"], 2)
+        self.assertEqual(by_file["web/jsx_ws.tsx"]["line"], 3)
+        self.assertEqual(by_file["web/div_ls.ts"]["line"], 2)
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
 
     def test_preflight_enforces_repo_diff_policy_rules(self) -> None:
