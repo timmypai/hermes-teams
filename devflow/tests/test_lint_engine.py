@@ -590,6 +590,125 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         self.assertEqual(rep_canon_new["checks"].get("static_rules"), "fail")
         self.assertTrue(any("no-infra" in f and "web/ok.js:2" in f for f in rep_canon_new["findings"]), rep_canon_new["findings"])
 
+    def test_regex_overlapping_patterns_dedup_per_line_and_baseline(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="devflow-lint-regex-dedup-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rule_toml = (
+            'id = "no-sleep-fix"\n'
+            'message = "avoid fixed sleep"\n'
+            'include = ["**/*.py", "**/*.go"]\n'
+            'patterns = [\n'
+            r"  '\btime\.sleep\('," + "\n"
+            r"  '\btime\.Sleep\('," + "\n"
+            ']\n'
+            '[[fixture]]\nexpect = "fail"\npath = "app/run.py"\ntext = "time.sleep(1)"\n'
+            '[[fixture]]\nexpect = "pass"\npath = "app/run.py"\ntext = "wait_ready()"\n'
+        )
+        rfile = d / "no-sleep-fix.toml"
+        rfile.write_text(rule_toml, encoding="utf-8")
+        self.assertEqual(lint_engine.self_test_dir(d), [])
+        rule = lint_engine.load_rule(rfile)
+        hits = lint_engine.scan_files([rule], {"app/run.py": "    time.sleep(.5)\n"})
+        self.assertEqual([(h["file"], h["line"]) for h in hits], [("app/run.py", 1)], hits)
+
+        repo = d / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+        for cfg_k, cfg_v in (("user.name", "Dev"), ("user.email", "dev@example.com")):
+            subprocess.run(["git", "-C", str(repo), "config", cfg_k, cfg_v], check=True)
+        (repo / ".devflow" / "rules").mkdir(parents=True)
+        (repo / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        (repo / ".devflow" / "rules" / "no-sleep-fix.toml").write_text(rule_toml, encoding="utf-8")
+        (repo / ".devflow" / "rules" / "baseline.json").write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [{"rule": "no-sleep-fix", "path": "app/run.py", "text": "time.sleep(.5)"}],
+            }),
+            encoding="utf-8",
+        )
+        (repo / "app").mkdir()
+        (repo / "app" / "run.py").write_text("def wait():\n    time.sleep(.5)\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "app" / "run.py").write_text("def wait():\n    time.sleep(.5)\n    return True\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "app/run.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "touch baselined file cleanly"], check=True)
+        roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
+        pol = policy_lib.load_policy(KIT, roles)
+        card = "## 目標\nx\n\n## 本卡完成\nok\n\n## 驗收\nAllowed-Scope: app/**\n"
+        rep = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+        self.assertTrue(rep["ok"], rep)
+        self.assertEqual(rep["checks"].get("static_rules"), "ok")
+
+    def test_regex_multiple_lines_and_exempt_lines_sorted_and_preflight(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="devflow-lint-regex-multi-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rule_toml = (
+            'id = "no-sleep-fix"\n'
+            'message = "avoid fixed sleep"\n'
+            'include = ["**/*.py"]\n'
+            'patterns = [\n'
+            r"  '\btime\.sleep\('," + "\n"
+            r"  '\basyncio\.sleep\('," + "\n"
+            r"  '\btime\.Sleep\('," + "\n"
+            ']\n'
+            '[[fixture]]\nexpect = "fail"\npath = "app/run.py"\ntext = "time.sleep(1)"\n'
+            '[[fixture]]\nexpect = "pass"\npath = "app/run.py"\ntext = "wait_ready()"\n'
+        )
+        rfile = d / "no-sleep-fix.toml"
+        rfile.write_text(rule_toml, encoding="utf-8")
+        rule = lint_engine.load_rule(rfile)
+        hits = lint_engine.scan_files(
+            [rule],
+            {
+                "app/run.py": (
+                    "time.sleep(.5)\n"
+                    "time.sleep(2)\n"
+                    "time.sleep(1)  # devflow: allow no-sleep-fix L-0001\n"
+                    "wait_ready()\n"
+                    "await asyncio.sleep(3)\n"
+                ),
+            },
+        )
+        self.assertEqual([(h["file"], h["line"]) for h in hits], [("app/run.py", 1), ("app/run.py", 2), ("app/run.py", 5)], hits)
+
+        repo = d / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+        for cfg_k, cfg_v in (("user.name", "Dev"), ("user.email", "dev@example.com")):
+            subprocess.run(["git", "-C", str(repo), "config", cfg_k, cfg_v], check=True)
+        (repo / ".devflow" / "rules").mkdir(parents=True)
+        (repo / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        (repo / ".devflow" / "rules" / "no-sleep-fix.toml").write_text(rule_toml, encoding="utf-8")
+        (repo / ".devflow" / "rules" / "baseline.json").write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [{"rule": "no-sleep-fix", "path": "app/run.py", "text": "time.sleep(.5)"}],
+            }),
+            encoding="utf-8",
+        )
+        (repo / "app").mkdir()
+        (repo / "app" / "run.py").write_text("time.sleep(.5)\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "app" / "run.py").write_text(
+            "time.sleep(.5)\ntime.sleep(2)\ntime.sleep(1)  # devflow: allow no-sleep-fix L-0001\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "app/run.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "add new unbaselined sleep on line 2"], check=True)
+        roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
+        pol = policy_lib.load_policy(KIT, roles)
+        card = "## 目標\nx\n\n## 本卡完成\nok\n\n## 驗收\nAllowed-Scope: app/**\n"
+        rep_fail = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+        self.assertFalse(rep_fail["ok"], rep_fail)
+        self.assertEqual(rep_fail["checks"].get("static_rules"), "fail")
+        self.assertTrue(any("no-sleep-fix" in f and "app/run.py:2" in f for f in rep_fail["findings"]), rep_fail["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()
