@@ -348,12 +348,71 @@ def mark_triage_needs_input(
     return (int(out), False) if out.isdigit() else (None, True)
 
 
+def _hold_task_dependency_sqlite(
+    db: Path,
+    task_id: str,
+    reason: str,
+    *,
+    allow_review: bool,
+) -> int:
+    with closing(sqlite3.connect(db)) as c, c:
+        if allow_review:
+            cur = c.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'dependency' "
+                "WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            if cur.rowcount == 1:
+                payload = {
+                    "kind": "dependency",
+                    "reason": reason,
+                    "source_status": "review",
+                    "resume_status": "review",
+                }
+                c.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+                    (task_id, json.dumps(payload, ensure_ascii=False), int(time.time())),
+                )
+                return 1
+        cur = c.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'dependency' "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')",
+            (task_id,),
+        )
+        if cur.rowcount == 1:
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
+                (task_id, json.dumps({"kind": "dependency", "reason": reason}, ensure_ascii=False), int(time.time())),
+            )
+        return cur.rowcount
+
+
 def hold_task_dependency(
-    run_fn: Callable, hermes_py: str, boards_dir: Path, board: str, task_id: str, reason: str,
+    run_fn: Callable,
+    hermes_py: str,
+    boards_dir: Path,
+    board: str,
+    task_id: str,
+    reason: str,
+    *,
+    allow_review: bool = False,
 ) -> tuple[bool, bool]:
-    """Durably park a pending [SHIP] card in `blocked (dependency)` while its EPIC awaits a user
-    plan-risk decision. Returns `(held_or_already_blocked, transient_failure)`."""
+    """Durably park a pending card in `blocked (dependency)` (plus `review` cards when
+    `allow_review=True`). Returns `(held_or_already_blocked, transient_failure)`."""
     db = boards_dir / board / "kanban.db"
+    review_branch = (
+        "        cur = c.execute(\n"
+        "            \"UPDATE tasks SET status = 'blocked', block_kind = 'dependency' \"\n"
+        "            \"WHERE id = ? AND status = 'review'\",\n"
+        "            (sys.argv[2],),\n"
+        "        )\n"
+        "        if cur.rowcount == 1:\n"
+        "            kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'dependency', 'reason': sys.argv[3], 'source_status': 'review', 'resume_status': 'review'})\n"
+        "            held = 1\n"
+        "        else:\n"
+        if allow_review
+        else "        if True:\n"
+    )
     code = (
         "import sys\n"
         "from pathlib import Path\n"
@@ -361,14 +420,17 @@ def hold_task_dependency(
         "c = k.connect(Path(sys.argv[1]))\n"
         "try:\n"
         "    with kb.write_txn(c):\n"
-        "        cur = c.execute(\n"
-        "            \"UPDATE tasks SET status = 'blocked', block_kind = 'dependency' \"\n"
-        "            \"WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')\",\n"
-        "            (sys.argv[2],),\n"
-        "        )\n"
-        "        if cur.rowcount == 1:\n"
-        "            kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'dependency', 'reason': sys.argv[3]})\n"
-        "        print(cur.rowcount)\n"
+        "        held = 0\n"
+        + review_branch
+        + "            cur = c.execute(\n"
+        "                \"UPDATE tasks SET status = 'blocked', block_kind = 'dependency' \"\n"
+        "                \"WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')\",\n"
+        "                (sys.argv[2],),\n"
+        "            )\n"
+        "            if cur.rowcount == 1:\n"
+        "                kb._append_event(c, sys.argv[2], 'blocked', {'kind': 'dependency', 'reason': sys.argv[3]})\n"
+        "                held = 1\n"
+        "        print(held)\n"
         "finally:\n"
         "    c.close()\n"
     )
@@ -381,18 +443,7 @@ def hold_task_dependency(
         return p.stdout.strip() == "1", False
     if db.exists():
         try:
-            with closing(sqlite3.connect(db)) as c, c:
-                cur = c.execute(
-                    "UPDATE tasks SET status = 'blocked', block_kind = 'dependency' "
-                    "WHERE id = ? AND status IN ('todo', 'ready', 'scheduled')",
-                    (task_id,),
-                )
-                if cur.rowcount == 1:
-                    c.execute(
-                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)",
-                        (task_id, json.dumps({"kind": "dependency", "reason": reason}, ensure_ascii=False), int(time.time())),
-                    )
-                return cur.rowcount == 1, False
+            return _hold_task_dependency_sqlite(db, task_id, reason, allow_review=allow_review) == 1, False
         except sqlite3.Error as err:
             print(f"devflow: hold_task_dependency sqlite fallback for {board}/{task_id} failed: {err}", file=sys.stderr)
             return False, True

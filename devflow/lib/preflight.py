@@ -1,10 +1,12 @@
 """Developer preflight CLI gate (`devflow preflight`): deterministic local checks before PR/review."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +156,35 @@ def configured_test_commands(
     return cmds
 
 
+def _load_repo_baseline(repo_dir: Path) -> Counter[tuple[str, str, str]]:
+    """Load optional `.devflow/baseline.json` using `(rule, path, line_text)` keys."""
+    baseline_path = repo_dir / ".devflow" / "baseline.json"
+    if not baseline_path.is_file():
+        return Counter()
+    try:
+        data = json.loads(baseline_path.read_text(encoding="utf-8"))
+        entries = data.get("entries") or []
+        return Counter(
+            (str(e["rule"]), str(e["path"]), str(e["text"]).strip())
+            for e in entries
+            if isinstance(e, dict) and "rule" in e and "path" in e and "text" in e
+        )
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
+        return Counter()
+
+
+def _line_text_at(repo_dir: Path, rel_path: str, lineno: int, cache: dict[str, list[str]]) -> str:
+    if lineno <= 0 or not rel_path:
+        return ""
+    if rel_path not in cache:
+        try:
+            cache[rel_path] = (repo_dir / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            cache[rel_path] = []
+    lines = cache[rel_path]
+    return lines[lineno - 1].strip() if lineno <= len(lines) else ""
+
+
 def run_preflight(
     repo_dir: Path,
     *,
@@ -280,17 +311,9 @@ def run_preflight(
         checks["standard_delivery"] = "ok"
 
     # 4c. Declarative TOML rules under .devflow/rules/*.toml
-    # Always evaluate diff_policy/diff_budget. Also evaluate static rules (`regex`, `import_boundary`,
-    # `cross_file`) via lint_engine whenever tests are skipped OR `.devflow/check.sh` is absent or
-    # does not invoke `.devflow/check.py` so rules/*.toml are never silently bypassed.
+    # Always evaluate diff_policy/diff_budget AND all static rules (`regex`, `import_boundary`,
+    # `cross_file`) unconditionally via lint_engine so check.sh stubs/comments never bypass enforcement.
     rules_dir = repo_dir / ".devflow" / "rules"
-    check_sh = repo_dir / ".devflow" / "check.sh"
-    check_sh_runs_check_py = False
-    if check_sh.is_file():
-        try:
-            check_sh_runs_check_py = "check.py" in check_sh.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            check_sh_runs_check_py = False
     if rules_dir.is_dir():
         dp_rules: list[lint_engine.LintRule] = []
         static_rules: list[lint_engine.LintRule] = []
@@ -322,16 +345,26 @@ def run_preflight(
             findings.extend(dp_findings)
             checks["diff_policy"] = "fail" if dp_findings else "ok"
 
-        need_static_scan = bool(static_rules) and ((not run_tests) or (not check_sh_runs_check_py))
-        if need_static_scan:
+        if static_rules:
             touched_set = set(all_touched)
+            legacy_baseline = _load_repo_baseline(repo_dir)
+            line_cache: dict[str, list[str]] = {}
             for hit in lint_engine.scan_repo(static_rules, repo_dir):
-                if hit["kind"] != "cross_file" and hit["file"] not in touched_set:
-                    continue
+                if hit["kind"] != "cross_file":
+                    if hit["file"] not in touched_set:
+                        continue
+                    key = (
+                        str(hit["id"]),
+                        str(hit["file"]),
+                        _line_text_at(repo_dir, str(hit["file"]), int(hit["line"] or 0), line_cache),
+                    )
+                    if legacy_baseline[key] > 0:
+                        legacy_baseline[key] -= 1
+                        continue
                 static_findings.append(
                     f"{hit['file']}:{hit['line']} [{hit['id']}] {hit['detail']} ({hit['match']})"
                 )
-        if static_findings or need_static_scan:
+        if static_findings or static_rules:
             findings.extend(static_findings)
             checks["static_rules"] = "fail" if static_findings else "ok"
 

@@ -515,6 +515,54 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         self.assertEqual(rep_bad["checks"].get("static_rules"), "fail")
         self.assertTrue(any("no-infra" in f and "web/ok.js" in f for f in rep_bad["findings"]), rep_bad["findings"])
 
+        # 4. Spoofed `.devflow/check.sh` mentioning `check.py` in comments or dead code must NOT bypass static_rules
+        for label, script_body in (
+            ("comment", "#!/bin/sh\n# TODO: invoke check.py\nexit 0\n"),
+            ("dead_branch", "#!/bin/sh\nif false; then python3 .devflow/check.py; fi\nexit 0\n"),
+        ):
+            chk = repo / ".devflow" / "check.sh"
+            chk.write_text(script_body, encoding="utf-8")
+            chk.chmod(0o755)
+            subprocess.run(["git", "-C", str(repo), "add", ".devflow/check.sh"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"spoof {label}"], check=True)
+            rep_spoof = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+            self.assertFalse(rep_spoof["ok"], (label, rep_spoof))
+            self.assertEqual(rep_spoof["checks"].get("static_rules"), "fail", (label, rep_spoof))
+            self.assertTrue(any("no-infra" in f and "web/ok.js" in f for f in rep_spoof["findings"]), (label, rep_spoof))
+
+        # 5. `.devflow/baseline.json` suppresses matching legacy line counts while catching new violations
+        (repo / "web" / "ok.js").write_text('const v = 2;\n', encoding="utf-8")
+        (repo / ".devflow" / "baseline.json").write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [
+                    {"rule": "no-infra", "path": "web/ok.js", "text": 'const db = require.resolve("infra/db");'},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", ".devflow/baseline.json", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline legacy"], check=True)
+        base_2 = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "web" / "ok.js").write_text('const db = require.resolve("infra/db");\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baselined line"], check=True)
+        rep_base = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_2, card_body=card, run_tests=True)
+        self.assertTrue(rep_base["ok"], rep_base)
+        self.assertEqual(rep_base["checks"].get("static_rules"), "ok")
+
+        (repo / "web" / "ok.js").write_text(
+            'const db = require.resolve("infra/db");\nconst db2 = require.resolve("infra/cache");\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "new violation"], check=True)
+        rep_new = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_2, card_body=card, run_tests=True)
+        self.assertFalse(rep_new["ok"], rep_new)
+        self.assertEqual(rep_new["checks"].get("static_rules"), "fail")
+        self.assertTrue(any("no-infra" in f and "web/ok.js:2" in f for f in rep_new["findings"]), rep_new["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()

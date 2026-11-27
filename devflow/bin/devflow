@@ -2986,6 +2986,54 @@ def _card_has_pipeline_stop_hold(
     return False
 
 
+def _card_is_held_from_review(
+    board: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> bool:
+    """True when `task_id`'s latest resume-relevant event came from the `review` lane."""
+    db = BOARDS / board / "kanban.db"
+    if db.exists():
+        try:
+            kinds = tuple(sorted(RESUME_EVENTS))
+            marks = ",".join("?" * len(kinds))
+            rows = board_rows(
+                board,
+                f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
+                (task_id, *kinds),
+            )
+            if rows:
+                ev = rows[0]
+                if ev.get("kind") == "unblocked":
+                    return False
+                raw_p = ev.get("payload")
+                if isinstance(raw_p, dict):
+                    payload = raw_p
+                else:
+                    try:
+                        parsed = json.loads(raw_p or "{}")
+                        payload = parsed if isinstance(parsed, dict) else {}
+                    except ValueError:
+                        payload = {}
+                return any(payload.get(k) == "review" for k in ("resume_status", "retry_status", "source_status"))
+        except sqlite3.Error:
+            pass
+    for ev in reversed((card or {}).get("events") or []):
+        if not isinstance(ev, dict):
+            continue
+        kind = str(ev.get("kind") or "").strip()
+        if kind == "unblocked":
+            return False
+        if kind not in RESUME_EVENTS:
+            continue
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return any(payload.get(k) == "review" for k in ("resume_status", "retry_status", "source_status"))
+    return False
+
+
 def _slice_has_open_active_cards(epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
     steps = list(pipe_spec.get("steps") or [])
     start_at = str(pipe_spec.get("start_at") or "").strip().lower()
@@ -3046,7 +3094,9 @@ def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_
         )
         if not hold_child:
             continue
-        ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, cid, reason)
+        ok, failed = kanban_adapter.hold_task_dependency(
+            run, HERMES_PY, BOARDS, board, cid, reason, allow_review=(st_c == "review"),
+        )
         if failed:
             retry = True
         elif ok:
@@ -3098,24 +3148,17 @@ def release_pipeline_stop_holds(board: str, epic: str, cards: dict[str, dict], p
                 if kind in ("DEV", "OPS") and not review_active:
                     # Only keep holding if it was parked from review lane (has stop-hold and active span straddles review).
                     # Cards still in todo/ready are released once implement/ci is active.
-                    last_ev = _card_block_reason(board, cid, card=c) or ""
                     if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
                         continue
-                    events_c = c.get("events") or []
-                    from_rev = any(
-                        isinstance(e, dict) and e.get("kind") in RESUME_EVENTS
-                        and "review" in ((e.get("payload") or {}).get(k) for k in ("resume_status", "retry_status", "source_status"))
-                        for e in reversed(events_c[-4:])
-                    )
-                    if from_rev:
+                    if _card_is_held_from_review(board, cid, card=c):
                         continue
-                    _ = last_ev
                 elif not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
                     continue
                 resume_msg = f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。"
         try:
+            was_from_review = (cid != epic) and _card_is_held_from_review(board, cid, card=c)
             resume(board, cid, resume_msg)
-            c["status"] = "ready"
+            c["status"] = "review" if was_from_review else "ready"
             c["block_kind"] = None
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card release failure
             retry = True

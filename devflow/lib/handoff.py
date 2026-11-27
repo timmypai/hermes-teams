@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from functools import lru_cache
+from collections import deque
 from typing import Any
 
 from . import policy as policy_lib
@@ -203,237 +203,250 @@ def missing_arch_scope_files(
     return missing
 
 
-_TOKEN_KIND_STARSTAR = "STARSTAR"
-_TOKEN_KIND_TREE_DESC = "TREE_DESC"
-_TOKEN_KIND_WILD = "WILD"
-_TOKEN_KIND_LIT = "LIT"
+class _CharNFA:
+    """Compact epsilon-NFA over characters for exact `scope.match_glob` intersection."""
+
+    def __init__(self) -> None:
+        self.eps: list[list[int]] = []
+        self.step: list[list[tuple[tuple[str, Any], int]]] = []
+        self.start = self.new_state()
+        self.accept = self.new_state()
+
+    def new_state(self) -> int:
+        idx = len(self.eps)
+        self.eps.append([])
+        self.step.append([])
+        return idx
+
+    def add_eps(self, src: int, dst: int) -> None:
+        self.eps[src].append(dst)
+
+    def add_step(self, src: int, matcher: tuple[str, Any], dst: int) -> None:
+        self.step[src].append((matcher, dst))
+
+    def emit_literal(self, src: int, text: str) -> int:
+        cur = src
+        for ch in text:
+            nxt = self.new_state()
+            self.add_step(cur, ("lit", ch), nxt)
+            cur = nxt
+        return cur
+
+    def emit_any_star(self, src: int) -> int:
+        loop = self.new_state()
+        self.add_eps(src, loop)
+        self.add_step(loop, ("any", None), loop)
+        return loop
+
+    def emit_fnmatch(self, src: int, pat: str, *, allow_doublestar: bool = False) -> int:
+        cur = src
+        i = 0
+        n = len(pat)
+        while i < n:
+            if allow_doublestar and pat.startswith("**/", i):
+                after = self.new_state()
+                self.add_eps(cur, after)
+                mid = self.emit_any_star(cur)
+                self.add_step(mid, ("lit", "/"), after)
+                cur = after
+                i += 3
+                continue
+            ch = pat[i]
+            if ch == "*":
+                cur = self.emit_any_star(cur)
+                while i < n and pat[i] == "*":
+                    i += 1
+            elif ch == "?":
+                nxt = self.new_state()
+                self.add_step(cur, ("any", None), nxt)
+                cur = nxt
+                i += 1
+            elif ch == "[":
+                matcher, next_i = _parse_fnmatch_class(pat, i)
+                nxt = self.new_state()
+                self.add_step(cur, matcher, nxt)
+                cur = nxt
+                i = next_i
+            else:
+                nxt = self.new_state()
+                self.add_step(cur, ("lit", ch), nxt)
+                cur = nxt
+                i += 1
+        return cur
 
 
-def _seg_lit_prefix(seg: str) -> str:
-    wilds = [seg.find(ch) for ch in ("*", "?", "[") if ch in seg]
-    return seg[: min(wilds)] if wilds else seg
-
-
-def _seg_lit_suffix(seg: str) -> str:
-    i = len(seg) - 1
-    while i >= 0:
-        ch = seg[i]
-        if ch in ("*", "?"):
-            break
-        if ch == "]":
-            if "[" in seg[:i]:
-                break
-        i -= 1
-    else:
-        return seg
-    return seg[i + 1 :]
-
-
-def _can_span_slash(seg: str) -> bool:
-    if "*" in seg or "?" in seg:
-        return True
-    i = 0
-    n = len(seg)
-    while i < n:
-        if seg[i] == "[":
-            j = i + 1
-            if j < n and seg[j] in ("!", "^"):
-                j += 1
-            if j < n and seg[j] == "]":
-                j += 1
-            while j < n and seg[j] != "]":
-                j += 1
-            if j < n and fnmatch.fnmatchcase("/", seg[i : j + 1]):
-                return True
-            i = j + 1 if j < n else i + 1
+def _parse_fnmatch_class(pat: str, i: int) -> tuple[tuple[str, Any], int]:
+    """Parse Python `fnmatch`-style `[...]` character class at `i` (or literal `[` if unclosed)."""
+    n = len(pat)
+    j = i + 1
+    neg = j < n and pat[j] == "!"
+    if neg:
+        j += 1
+    if j < n and pat[j] == "]":
+        j += 1
+    while j < n and pat[j] != "]":
+        j += 1
+    if j >= n:
+        return ("lit", "["), i + 1
+    stuff = pat[(i + 2 if neg else i + 1) : j]
+    chars: set[str] = set()
+    k = 0
+    m = len(stuff)
+    while k < m:
+        if k + 2 < m and stuff[k + 1] == "-" and ord(stuff[k]) <= ord(stuff[k + 2]):
+            chars.update(chr(code) for code in range(ord(stuff[k]), ord(stuff[k + 2]) + 1))
+            k += 3
         else:
-            i += 1
-    return False
+            chars.add(stuff[k])
+            k += 1
+    return ("cls", (neg, frozenset(chars))), j + 1
 
 
-def _segs_can_overlap(sa: str, sb: str, k_a: str, k_b: str) -> bool:
-    if k_a == _TOKEN_KIND_LIT and k_b == _TOKEN_KIND_LIT:
-        return sa == sb
-    if k_a == _TOKEN_KIND_LIT:
-        return fnmatch.fnmatchcase(sa, sb)
-    if k_b == _TOKEN_KIND_LIT:
-        return fnmatch.fnmatchcase(sb, sa)
-    pa, pb = _seg_lit_prefix(sa), _seg_lit_prefix(sb)
-    if pa and pb and not (pa.startswith(pb) or pb.startswith(pa)):
-        return False
-    ea, eb = _seg_lit_suffix(sa), _seg_lit_suffix(sb)
-    if ea and eb and not (ea.endswith(eb) or eb.endswith(ea)):
-        return False
-    return True
-
-
-def _span_head_token(seg: str) -> str:
-    """Portion of a slash-spanning segment up to and including its first slash-spanning wildcard."""
-    i = 0
-    n = len(seg)
-    while i < n:
-        ch = seg[i]
-        if ch in ("*", "?"):
-            return seg[: i + 1] + "*"
-        if ch == "[":
-            j = i + 1
-            if j < n and seg[j] in ("!", "^"):
-                j += 1
-            if j < n and seg[j] == "]":
-                j += 1
-            while j < n and seg[j] != "]":
-                j += 1
-            if j < n and fnmatch.fnmatchcase("/", seg[i : j + 1]):
-                return seg[: j + 1] + "*"
-            i = j + 1 if j < n else i + 1
-            continue
-        i += 1
-    return seg
-
-
-def _span_tail_token(seg: str) -> str:
-    """Portion of a slash-spanning segment from its last slash-spanning wildcard to end."""
-    lit = _seg_lit_suffix(seg)
-    return "*" + lit if lit else "*"
-
-
-def _compile_overlap_spec(raw_pat: str) -> tuple[tuple[tuple[str, str], ...], bool, str]:
-    """Compile normalized pattern tokens, `is_tree`, and required trailing literal suffix."""
+def _compile_glob_nfa(raw_pat: str) -> _CharNFA | None:
+    """Build a character NFA whose accepted language matches `scope_lib.match_glob`."""
     raw = (raw_pat or "").strip().strip("`'\"")
-    trailing_slash = raw.endswith("/")
-    pat = _normalize_glob_token(raw)
+    while raw.startswith("./"):
+        raw = raw[2:]
+    raw_stripped = raw.lstrip("/")
+    if not raw_stripped:
+        return None
+    trailing_slash = raw_stripped.endswith("/")
+    pat = _normalize_glob_token(raw_pat)
     if not pat:
-        return (), False, ""
-    has_wild = any(ch in pat for ch in ("*", "?", "["))
+        return None
+
+    nfa = _CharNFA()
+    if trailing_slash:
+        end = nfa.emit_literal(nfa.start, pat + "/")
+        end = nfa.emit_any_star(end)
+        nfa.add_eps(end, nfa.accept)
+        return nfa
+
     if "**" in pat:
         prefix, _, suffix = pat.partition("**")
         prefix = prefix.rstrip("/")
         suffix = suffix.lstrip("/")
-        tokens: list[tuple[str, str]] = []
-        if prefix:
-            for seg in prefix.split("/"):
-                if not seg:
-                    continue
-                tokens.append((_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg))
-        tokens.append((_TOKEN_KIND_STARSTAR, "**"))
         if not suffix:
-            return tuple(tokens), True, ""
-        suf_raw_trailing = suffix.endswith("/")
-        suf_segs = [s for s in suffix.rstrip("/").split("/") if s]
-        for idx, seg in enumerate(suf_segs):
-            # `scope.match_glob` checks `fnmatch(p, f"*{suffix}")`, so the first post-`**`
-            # segment may match the tail of a longer segment without a `/` boundary.
-            eff = ("*" + seg) if (idx == 0 and not seg.startswith("*")) else seg
-            if eff == "**":
-                tokens.append((_TOKEN_KIND_STARSTAR, "**"))
-            else:
-                tokens.append((_TOKEN_KIND_WILD if any(c in eff for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, eff))
-        if suf_raw_trailing:
-            tokens.append((_TOKEN_KIND_TREE_DESC, "/"))
-            return tuple(tokens), True, ""
-        return tuple(tokens), False, _seg_lit_suffix(suf_segs[-1]) if suf_segs else ""
+            if not prefix:
+                end = nfa.emit_any_star(nfa.start)
+                nfa.add_eps(end, nfa.accept)
+                return nfa
+            pend = nfa.emit_literal(nfa.start, prefix)
+            nfa.add_eps(pend, nfa.accept)
+            slash = nfa.emit_literal(pend, "/")
+            tail = nfa.emit_any_star(slash)
+            nfa.add_eps(tail, nfa.accept)
+            return nfa
 
-    if trailing_slash:
-        tokens = [
-            (_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg)
-            for seg in pat.split("/") if seg
-        ]
-        tokens.append((_TOKEN_KIND_TREE_DESC, "/"))
-        return tuple(tokens), True, ""
+        if prefix and scope_lib.match_glob(prefix, pat):
+            nfa.add_eps(nfa.emit_literal(nfa.start, prefix), nfa.accept)
+        head = nfa.emit_literal(nfa.start, prefix + "/") if prefix else nfa.start
+        mid = nfa.emit_any_star(head)
+        end = nfa.emit_fnmatch(mid, suffix, allow_doublestar=("**" in suffix))
+        nfa.add_eps(end, nfa.accept)
+        return nfa
 
-    if not has_wild:
-        tokens = [(_TOKEN_KIND_LIT, seg) for seg in pat.split("/") if seg]
-        tokens.append((_TOKEN_KIND_STARSTAR, "**"))
-        return tuple(tokens), True, ""
+    # Single-stage glob or exact/directory prefix (`fnmatch(p, pat) or p == pat or p.startswith(pat + '/')`)
+    fend = nfa.emit_fnmatch(nfa.start, pat)
+    nfa.add_eps(fend, nfa.accept)
+    if not any(ch in pat for ch in ("*", "?", "[")):
+        pend = nfa.emit_literal(nfa.start, pat)
+        nfa.add_eps(pend, nfa.accept)
+        sub = nfa.emit_any_star(nfa.emit_literal(pend, "/"))
+        nfa.add_eps(sub, nfa.accept)
+    return nfa
 
-    segs = [s for s in pat.split("/") if s]
-    tokens = [
-        (_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg)
-        for seg in segs
-    ]
-    end_lit = _seg_lit_suffix(segs[-1]) if segs else ""
-    return tuple(tokens), False, end_lit
+
+def _matchers_intersect(m1: tuple[str, Any], m2: tuple[str, Any]) -> bool:
+    k1, v1 = m1
+    k2, v2 = m2
+    if k1 == "any" or k2 == "any":
+        if k1 == "cls" and not v1[0] and not v1[1]:
+            return False
+        if k2 == "cls" and not v2[0] and not v2[1]:
+            return False
+        return True
+    if k1 == "lit" and k2 == "lit":
+        return v1 == v2
+    if k1 == "lit":
+        neg, chars = v2
+        return (v1 not in chars) if neg else (v1 in chars)
+    if k2 == "lit":
+        neg, chars = v1
+        return (v2 not in chars) if neg else (v2 in chars)
+    neg1, s1 = v1
+    neg2, s2 = v2
+    if not neg1 and not neg2:
+        return bool(s1 & s2)
+    if not neg1 and neg2:
+        return bool(s1 - s2)
+    if neg1 and not neg2:
+        return bool(s2 - s1)
+    return any(chr(code) not in s1 and chr(code) not in s2 for code in range(32, 127))
+
+
+def _eps_closure(nfa: _CharNFA, starts: list[int]) -> set[int]:
+    seen = set(starts)
+    stack = list(starts)
+    while stack:
+        s = stack.pop()
+        for nxt in nfa.eps[s]:
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
 
 
 def _globs_overlap(a: str, b: str) -> bool:
-    """Segment-aware over-approximation of `scope.match_glob` intersection with zero false negatives."""
+    """Exact character-NFA intersection of `scope.match_glob` languages (zero false negatives)."""
     pa = _normalize_glob_token(a)
     pb = _normalize_glob_token(b)
     if not pa or not pb:
         return False
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
-    toks_a, tree_a, end_a = _compile_overlap_spec(a)
-    toks_b, tree_b, end_b = _compile_overlap_spec(b)
-    if not toks_a or not toks_b:
-        return False
-    if not tree_a and not tree_b and end_a and end_b:
-        if not (end_a.endswith(end_b) or end_b.endswith(end_a)):
-            return False
-
-    na, nb = len(toks_a), len(toks_b)
-
-    @lru_cache(maxsize=None)
-    def dp(ia: int, ib: int) -> bool:
-        if ia == na and ib == nb:
-            return True
-        if ia < na and toks_a[ia][0] == _TOKEN_KIND_STARSTAR:
-            if dp(ia + 1, ib) or (ib < nb and dp(ia, ib + 1)):
-                return True
-        if ib < nb and toks_b[ib][0] == _TOKEN_KIND_STARSTAR:
-            if dp(ia, ib + 1) or (ia < na and dp(ia + 1, ib)):
-                return True
-        if ia == na or ib == nb:
-            return False
-
-        ka, sa = toks_a[ia]
-        kb, sb = toks_b[ib]
-
-        if ka == _TOKEN_KIND_TREE_DESC:
-            # Trailing `/` requires >= 1 concrete segment on B (or absorption into B's wildcard tail).
-            if kb in (_TOKEN_KIND_TREE_DESC,):
-                return dp(ia + 1, ib + 1) or dp(ia + 1, ib) or dp(ia, ib + 1)
-            if dp(ia + 1, ib + 1) or dp(ia, ib + 1):
-                return True
-            if kb == _TOKEN_KIND_WILD and _can_span_slash(sb) and dp(ia + 1, ib):
-                return True
-            return False
-        if kb == _TOKEN_KIND_TREE_DESC:
-            if dp(ia + 1, ib + 1) or dp(ia + 1, ib):
-                return True
-            if ka == _TOKEN_KIND_WILD and _can_span_slash(sa) and dp(ia, ib + 1):
-                return True
-            return False
-
-        if _segs_can_overlap(sa, sb, ka, kb) and dp(ia + 1, ib + 1):
-            return True
-
-        # A slash-spanning segment on one side can absorb >= 1 segments on the other side.
-        if ka == _TOKEN_KIND_WILD and _can_span_slash(sa):
-            head_a = _span_head_token(sa)
-            tail_a = _span_tail_token(sa)
-            if _segs_can_overlap(head_a, sb, _TOKEN_KIND_WILD, kb):
-                for jb in range(ib + 1, nb):
-                    kjb, sjb = toks_b[jb]
-                    if kjb in (_TOKEN_KIND_STARSTAR, _TOKEN_KIND_TREE_DESC):
-                        if dp(ia + 1, jb) or dp(ia + 1, jb + 1):
-                            return True
-                    elif _segs_can_overlap(tail_a, sjb, _TOKEN_KIND_WILD, kjb) and dp(ia + 1, jb + 1):
-                        return True
-        if kb == _TOKEN_KIND_WILD and _can_span_slash(sb):
-            head_b = _span_head_token(sb)
-            tail_b = _span_tail_token(sb)
-            if _segs_can_overlap(sa, head_b, ka, _TOKEN_KIND_WILD):
-                for ja in range(ia + 1, na):
-                    kja, sja = toks_a[ja]
-                    if kja in (_TOKEN_KIND_STARSTAR, _TOKEN_KIND_TREE_DESC):
-                        if dp(ja, ib + 1) or dp(ja + 1, ib + 1):
-                            return True
-                    elif _segs_can_overlap(sja, tail_b, kja, _TOKEN_KIND_WILD) and dp(ja + 1, ib + 1):
-                        return True
+    nfa_a = _compile_glob_nfa(a)
+    nfa_b = _compile_glob_nfa(b)
+    if nfa_a is None or nfa_b is None:
         return False
 
-    return dp(0, 0)
+    init_a = _eps_closure(nfa_a, [nfa_a.start])
+    init_b = _eps_closure(nfa_b, [nfa_b.start])
+    if nfa_a.accept in init_a and nfa_b.accept in init_b:
+        return True
+
+    visited: set[tuple[int, int]] = set()
+    queue: deque[tuple[int, int]] = deque()
+    for sa in init_a:
+        for sb in init_b:
+            pair = (sa, sb)
+            visited.add(pair)
+            queue.append(pair)
+
+    max_states = 50_000
+    while queue:
+        sa, sb = queue.popleft()
+        steps_a = nfa_a.step[sa]
+        steps_b = nfa_b.step[sb]
+        if not steps_a or not steps_b:
+            continue
+        for ma, da in steps_a:
+            next_as = _eps_closure(nfa_a, [da])
+            for mb, db in steps_b:
+                if not _matchers_intersect(ma, mb):
+                    continue
+                next_bs = _eps_closure(nfa_b, [db])
+                if nfa_a.accept in next_as and nfa_b.accept in next_bs:
+                    return True
+                for na in next_as:
+                    for nb in next_bs:
+                        pair = (na, nb)
+                        if pair not in visited:
+                            visited.add(pair)
+                            if len(visited) > max_states:
+                                return True
+                            queue.append(pair)
+    return False
 
 
 def merge_allowed_scope_into_body(

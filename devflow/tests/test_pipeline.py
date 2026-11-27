@@ -1158,13 +1158,18 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         # 2. hold_out_of_slice_cards NEVER holds fresh 1-card intake EPIC, DOES hold finished Stop-After: ship EPIC
         held_calls: list[tuple[str, str]] = []
 
-        def fake_hold(run_fn, hpy, boards, brd, cid, reason):
+        def fake_hold(run_fn, hpy, boards, brd, cid, reason, *, allow_review=False):
             held_calls.append((cid, reason))
             with sqlite3.connect(db) as c:
+                prev = c.execute("SELECT status FROM tasks WHERE id = ?", (cid,)).fetchone()
+                payload = {"kind": "dependency", "reason": reason}
+                if allow_review and prev and prev[0] == "review":
+                    payload["source_status"] = "review"
+                    payload["resume_status"] = "review"
                 c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = ?", (cid,))
                 c.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 20)",
-                    (cid, json.dumps({"kind": "dependency", "reason": reason}, ensure_ascii=False)),
+                    (cid, json.dumps(payload, ensure_ascii=False)),
                 )
                 c.commit()
             return True, False
@@ -1219,6 +1224,129 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
                     "Mode: deliver\nStart-At: design\nStop-After: design\n", df.POLICY, epic_mode="deliver"
                 ))
             self.assertEqual(resumed_ids, ["t_ep1"])
+
+        # 2b. PR #41 Findings #1 & #2: REAL hold_task_dependency(allow_review=True) + plan_cards() -> SQLite event lookup
+        # Test both inline hermes_py SQL script (via stubbed hermes_cli) and SQLite fallback, then release on advance to review.
+        import subprocess as _subproc
+        stub_pkg = self.root / "stub_hermes_cli"
+        (stub_pkg / "hermes_cli").mkdir(parents=True, exist_ok=True)
+        (stub_pkg / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+        (stub_pkg / "hermes_cli" / "kanban_db_connect.py").write_text(
+            "import sqlite3\ndef connect(p):\n    return sqlite3.connect(p)\n", encoding="utf-8",
+        )
+        (stub_pkg / "hermes_cli" / "kanban_db.py").write_text(
+            "import contextlib, json, time\n"
+            "@contextlib.contextmanager\n"
+            "def write_txn(c):\n"
+            "    with c:\n"
+            "        yield\n"
+            "def _append_event(c, tid, kind, payload):\n"
+            "    c.execute('INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',\n"
+            "              (tid, kind, json.dumps(payload, ensure_ascii=False), int(time.time())))\n",
+            encoding="utf-8",
+        )
+
+        with sqlite3.connect(db) as c:
+            c.execute("DELETE FROM task_events WHERE task_id = 't_dev1'")
+            c.execute("UPDATE tasks SET status = 'review', block_kind = NULL, assignee = 'reviewer' WHERE id = 't_dev1'")
+            c.execute(
+                "UPDATE tasks SET status = 'ready', block_kind = NULL, body = ? WHERE id = 't_ep1'",
+                ("Mode: deliver\nStart-At: implement\nStop-After: ci\n## 目標\nx\n## 驗收\n- AC-1 [api] ok\n",),
+            )
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_dev1', 'review_requested', ?, 30)",
+                (json.dumps({"implementer": "developer"}),),
+            )
+            c.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("t_dev_sub", "[DEV] 副線", dev_body, "review", None, "reviewer", "worktree", str(repo_dir), REPO, "orchestrator", None, 1),
+            )
+            c.execute("INSERT INTO task_links VALUES ('t_arch1', 't_dev_sub')")
+            c.commit()
+
+        # Path A: SQLite fallback via hold_out_of_slice_cards (HERMES_PY missing)
+        ci_pipe_real = pipe_lib.parse_epic_pipeline("Mode: deliver\nStop-After: ci\n", df.POLICY, epic_mode="deliver")
+        with mock.patch.object(df, "HERMES_PY", str(self.root / "missing-hermes-py")):
+            df.hold_out_of_slice_cards("b", "t_ep1", {"t_ep1": df.plan_cards("b", "t_ep1")["t_ep1"], "t_dev1": df.plan_cards("b", "t_ep1")["t_dev1"]}, ci_pipe_real)
+
+        # Path B: Real inline hermes_py script execution against stubbed hermes_cli -> SQLite
+        def _run_with_stub_pkg(cmd, **kw):
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(stub_pkg) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            return _subproc.run(cmd, env=env, text=True, capture_output=True, check=kw.get("check", True))
+
+        held_sub, fail_sub = df.kanban_adapter.hold_task_dependency(
+            _run_with_stub_pkg, sys.executable, df.BOARDS, "b", "t_dev_sub",
+            df.pipeline_stop_hold_reason("t_ep1", "ci"), allow_review=True,
+        )
+        self.assertTrue(held_sub and not fail_sub, (held_sub, fail_sub))
+
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            for tid in ("t_dev1", "t_dev_sub"):
+                trow = dict(c.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (tid,)).fetchone())
+                self.assertEqual(trow, {"status": "blocked", "block_kind": "dependency"}, tid)
+                evrow = dict(c.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1", (tid,)).fetchone())
+                epay = json.loads(evrow["payload"])
+                self.assertEqual(epay.get("source_status"), "review", (tid, epay))
+                self.assertEqual(epay.get("resume_status"), "review", (tid, epay))
+            c.execute("DELETE FROM tasks WHERE id = 't_dev_sub'")
+            c.execute("DELETE FROM task_links WHERE child_id = 't_dev_sub'")
+            c.commit()
+
+        # Reload through REAL plan_cards() (no `events` key on cards!) and verify release_pipeline_stop_holds keeps t_dev1 held under Stop-After: ci
+        reloaded_cards = df.plan_cards("b", "t_ep1")
+        self.assertNotIn("events", reloaded_cards["t_dev1"])
+        with mock.patch.object(df, "resume", side_effect=AssertionError("review-held card must stay blocked while review step is inactive")):
+            df.release_pipeline_stop_holds("b", "t_ep1", reloaded_cards, ci_pipe_real)
+        self.assertEqual(reloaded_cards["t_dev1"]["status"], "blocked")
+
+        # Advance EPIC to review via REAL cmd_epic_advance -> unblocks t_dev1 back into review
+        def sqlite_kanban(board, cmd, *args):
+            with sqlite3.connect(db) as kc:
+                kc.row_factory = sqlite3.Row
+                if cmd == "show":
+                    tid = args[0]
+                    t = dict(kc.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    evs = []
+                    for r in kc.execute("SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC", (tid,)):
+                        evs.append({"id": r["id"], "kind": r["kind"], "payload": json.loads(r["payload"] or "{}"), "created_at": r["created_at"]})
+                    return json.dumps({"task": t, "events": evs})
+                if cmd == "edit":
+                    tid, flag, val = args[0], args[1], args[2]
+                    if flag == "--body":
+                        kc.execute("UPDATE tasks SET body = ? WHERE id = ?", (val, tid))
+                        kc.commit()
+                    return ""
+                if cmd == "comment":
+                    tid, msg = args[0], args[1]
+                    kc.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'comment', ?, 40)",
+                               (tid, json.dumps({"body": msg}, ensure_ascii=False)))
+                    kc.commit()
+                    return ""
+                if cmd == "assign":
+                    tid, who = args[0], args[1]
+                    kc.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (None if who == "none" else who, tid))
+                    kc.commit()
+                    return ""
+                if cmd == "unblock":
+                    tid = args[0]
+                    rows = kc.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1", (tid,)).fetchall()
+                    p_old = json.loads(rows[0]["payload"] or "{}") if rows else {}
+                    dest = "review" if p_old.get("resume_status") == "review" else "ready"
+                    kc.execute("UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ?", (dest, tid))
+                    kc.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'unblocked', ?, 41)",
+                               (tid, json.dumps({"to": dest})))
+                    kc.commit()
+                    return ""
+            return ""
+
+        with mock.patch.object(df, "kanban", side_effect=sqlite_kanban), \
+             contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after="review", to_end=False))
+        with sqlite3.connect(db) as c:
+            row_after = c.execute("SELECT status, block_kind, assignee FROM tasks WHERE id = 't_dev1'").fetchone()
+            self.assertEqual(tuple(row_after), ("review", None, "reviewer"))
 
         # 3. Worker identity lock & --no-test spoofing prevention in cmd_checkpoint / cmd_pr_submit
         with sqlite3.connect(db) as c:
