@@ -569,6 +569,55 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         self.assertEqual(code_pr, 1, out_pr)
         self.assertIn("changed_files=2 > max_files=1", out_pr)
 
+    def test_character_class_globs_and_invalid_range_config_error(self) -> None:
+        self.write(
+            ".devflow/rules/charcls.toml",
+            """\
+            id = "charcls"
+            kind = "import_boundary"
+            message = "character class boundary"
+            include = ["src/[ab]/*.py", "src/[!z]/ok.py"]
+            exclude = ["src/[b]/*.py"]
+            forbidden_modules = ["infra"]
+
+            [[fixture]]
+            expect = "fail"
+            path = "src/a/x.py"
+            text = "import infra\\n"
+
+            [[fixture]]
+            expect = "pass"
+            path = "src/c/x.py"
+            text = "import infra\\n"
+            """,
+        )
+        self.write("src/a/x.py", "import infra\n")
+        self.write("src/b/x.py", "import infra\n")
+        self.write("src/c/x.py", "import infra\n")
+        self.write("src/c/ok.py", "import infra\n")
+        self.write("src/z/ok.py", "import infra\n")
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("src/a/x.py:1 [charcls]", out)
+        self.assertIn("src/c/ok.py:1 [charcls]", out)
+        self.assertNotIn("src/b/x.py", out)
+        self.assertNotIn("src/c/x.py", out)
+        self.assertNotIn("src/z/ok.py", out)
+
+        self.write(
+            ".devflow/rules/charcls.toml",
+            """\
+            id = "charcls"
+            kind = "import_boundary"
+            message = "bad range"
+            include = ["src/[z-a]/*.py"]
+            forbidden_modules = ["infra"]
+            """,
+        )
+        code_bad, out_bad = self.check()
+        self.assertEqual(code_bad, 2, out_bad)
+        self.assertIn("invalid glob pattern", out_bad)
+
 
 if __name__ == "__main__":
     unittest.main()

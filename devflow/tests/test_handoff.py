@@ -135,6 +135,35 @@ class AtomicScopeMerge(unittest.TestCase):
         with self.assertRaises(ValueError):
             handoff_lib.merge_allowed_scope_into_body(body, [])
 
+    def test_merge_matches_scope_match_glob_crossing_slash_semantics(self) -> None:
+        base = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: tests/**\nOut-of-Scope: src/private/**\nEPIC: t_ep1\n"
+        # `src/*.py` matches `src/private/secret.py` under `scope.match_glob`, so merging MUST be rejected.
+        for oos_body, epic_body, bad_add in (
+            (base, None, ["src/*.py"]),
+            (base.replace("src/private/**", "src/private/"), None, ["src/*.py"]),
+            (base.replace("src/private/**", "src/private"), None, ["src/*.py"]),
+            ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: tests/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `src/private/**`\n", ["src/*.py"]),
+            (base.replace("src/private/**", "src/api/**"), None, ["src/a*.py"]),
+        ):
+            with self.assertRaises(ValueError, msg=f"{oos_body} / {epic_body} + {bad_add}"):
+                handoff_lib.merge_allowed_scope_into_body(oos_body, bad_add, epic_body=epic_body)
+
+        # Genuinely disjoint prefixes/extensions or root filenames still pass
+        _, ok1 = handoff_lib.merge_allowed_scope_into_body(base, ["tests/unit/*.py"], epic_body=None)
+        self.assertIn("tests/unit/*.py", ok1)
+        py_only_oos = base.replace("src/private/**", "src/private/*.py")
+        _, ok2 = handoff_lib.merge_allowed_scope_into_body(py_only_oos, ["src/private/*.ts"], epic_body=None)
+        self.assertIn("src/private/*.ts", ok2)
+        _, ok_ext = handoff_lib.merge_allowed_scope_into_body(
+            py_only_oos.replace("src/private/*.py", "src/*.py"), ["src/private/*.ts"], epic_body=None,
+        )
+        self.assertIn("src/private/*.ts", ok_ext)
+        _, ok3 = handoff_lib.merge_allowed_scope_into_body(base, ["src/public*.py"], epic_body=None)
+        self.assertIn("src/public*.py", ok3)
+        df_body = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nOut-of-Scope: **/*.env\nEPIC: t_ep1\n"
+        _, ok4 = handoff_lib.merge_allowed_scope_into_body(df_body, ["Dockerfile"], epic_body=None)
+        self.assertIn("Dockerfile", ok4)
+
 
 class BinDevflowHandoffIntegration(unittest.TestCase):
     def setUp(self) -> None:

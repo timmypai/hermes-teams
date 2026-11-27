@@ -47,7 +47,8 @@ def _strip_rel_prefix(path: str) -> str:
 def _compile_glob_regex(pattern: str) -> re.Pattern[str]:
     out: list[str] = []
     i = 0
-    while i < len(pattern):
+    n = len(pattern)
+    while i < n:
         if pattern.startswith("**/", i):
             out.append("(?:.*/)?")
             i += 3
@@ -60,10 +61,38 @@ def _compile_glob_regex(pattern: str) -> re.Pattern[str]:
         elif pattern[i] == "?":
             out.append("[^/]")
             i += 1
+        elif pattern[i] == "[":
+            j = i + 1
+            if j < n and pattern[j] in ("!", "^"):
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(r"\[")
+                i += 1
+            else:
+                stuff = pattern[i + 1 : j]
+                neg = stuff.startswith(("!", "^"))
+                body = stuff[1:] if neg else stuff
+                if not body:
+                    raise ValueError(f"invalid glob pattern {pattern!r}: empty character class")
+                body = body.replace("\\", r"\\").replace("[", r"\[").replace("--", r"\-\-")
+                body = re.sub(r"([&~|])", r"\\\1", body)
+                if body.startswith("]"):
+                    body = r"\]" + body[1:]
+                if not neg and body.startswith("^"):
+                    body = r"\^" + body[1:]
+                out.append(f"(?!/)[{'^' if neg else ''}{body}]")
+                i = j + 1
         else:
             out.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("".join(out) + r"\Z")
+    try:
+        return re.compile("".join(out) + r"\Z")
+    except re.error as err:
+        raise ValueError(f"invalid glob pattern {pattern!r}: {err}") from err
 
 
 def glob_matches(path: str, pattern: str) -> bool:
@@ -120,6 +149,17 @@ class LintRule:
         return any(glob_matches(rel_path, inc) for inc in incs) if incs else False
 
 
+def _validate_rule_globs(globs: tuple[str, ...], *, src: Path, label: str) -> None:
+    for g in globs:
+        pat = _strip_rel_prefix(g)
+        if not pat or pat.endswith("/"):
+            continue
+        try:
+            _compile_glob_regex(pat)
+        except ValueError as err:
+            raise LintConfigError(f"{src}: `{label}` {err}") from err
+
+
 def _compile_patterns(raw: Any, *, flags: int, src: Path, label: str) -> tuple[re.Pattern[str], ...]:
     if not isinstance(raw, list) or not raw or not all(isinstance(x, str) and x for x in raw):
         raise LintConfigError(f"{src}: `{label}` must be a non-empty list of regex strings")
@@ -161,6 +201,8 @@ def load_rule(path: Path) -> LintRule:
 
     include = tuple(str(x) for x in (data.get("include") or []) if str(x).strip())
     exclude = tuple(str(x) for x in (data.get("exclude") or []) if str(x).strip())
+    _validate_rule_globs(include, src=path, label="include")
+    _validate_rule_globs(exclude, src=path, label="exclude")
     fixtures = tuple(f for f in (data.get("fixture") or []) if isinstance(f, dict))
 
     patterns: tuple[re.Pattern[str], ...] = ()
@@ -207,6 +249,8 @@ def load_rule(path: Path) -> LintRule:
             raise LintConfigError(f"{path}: cross_file rule requires `[target]` table")
         target_include = tuple(str(x) for x in (target.get("include") or []) if str(x).strip())
         target_exclude = tuple(str(x) for x in (target.get("exclude") or []) if str(x).strip())
+        _validate_rule_globs(target_include, src=path, label="target.include")
+        _validate_rule_globs(target_exclude, src=path, label="target.exclude")
         if not target_include:
             raise LintConfigError(f"{path}: [target] requires non-empty `include`")
         target_mode = str(target.get("mode") or "forbid").strip().lower()

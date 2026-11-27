@@ -154,8 +154,37 @@ class DeclarativePipelineSpec(unittest.TestCase):
             "t_ship1": {"id": "t_ship1", "title": "[SHIP] s", "status": "blocked"},
         }
         self.assertFalse(pipe_lib.slice_stop_reached(cards_running, "t_ep1", s1, self.policy))
+        # Review-lane DEV requires verified CI step_evidence for Stop-After: ci
+        cards_running["t_dev1"]["status"] = "review"
+        self.assertFalse(pipe_lib.slice_stop_reached(cards_running, "t_ep1", s1, self.policy))
+        self.assertFalse(pipe_lib.slice_stop_reached(
+            cards_running, "t_ep1", s1, self.policy,
+            step_evidence={"t_dev1": {"step": "ci", "ok": False, "pr_number": 7, "head_sha": "a" * 40}},
+        ))
+        self.assertFalse(pipe_lib.slice_stop_reached(
+            cards_running, "t_ep1", s1, self.policy,
+            step_evidence={"t_dev1": {"step": "implement", "ok": True, "pr_number": 7, "head_sha": "a" * 40}},
+        ))
+        self.assertTrue(pipe_lib.slice_stop_reached(
+            cards_running, "t_ep1", s1, self.policy,
+            step_evidence={"t_dev1": {"step": "ci", "ok": True, "pr_number": 7, "head_sha": "a" * 40}},
+        ))
+        # Multi-DEV slice still waits if a second DEV is running
+        cards_running["t_dev2"] = {"id": "t_dev2", "title": "[DEV] d2", "status": "running"}
+        self.assertFalse(pipe_lib.slice_stop_reached(
+            cards_running, "t_ep1", s1, self.policy,
+            step_evidence={"t_dev1": {"step": "ci", "ok": True, "pr_number": 7, "head_sha": "a" * 40}},
+        ))
+        cards_running.pop("t_dev2")
+        # Under Stop-After: review, a review-lane DEV is NOT done even with CI evidence
+        rev_spec = pipe_lib.parse_epic_pipeline("Mode: deliver\nStop-After: review\n## 目標\nr\n", self.policy, epic_mode="deliver")
+        self.assertFalse(pipe_lib.slice_stop_reached(
+            cards_running, "t_ep1", rev_spec, self.policy,
+            step_evidence={"t_dev1": {"step": "ci", "ok": True, "pr_number": 7, "head_sha": "a" * 40}},
+        ))
         cards_running["t_dev1"]["status"] = "done"
         self.assertTrue(pipe_lib.slice_stop_reached(cards_running, "t_ep1", s1, self.policy))
+        self.assertTrue(pipe_lib.slice_stop_reached(cards_running, "t_ep1", rev_spec, self.policy))
 
 
 class BinDevflowPipelineIntegration(unittest.TestCase):
@@ -487,6 +516,150 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
                 df.cmd_ship_merge(types.SimpleNamespace(board="b", pr=7))
         self.assertEqual(ctx_ship.exception.code, 7)
         self.assertTrue(json.loads(buf_ship.getvalue())["pipeline_stop_blocked"])
+
+    def test_stop_after_ci_pauses_review_lane_dev_only_after_exact_head_ci_and_retains_review_handoff(self) -> None:
+        import os
+        import sqlite3
+        from unittest import mock
+
+        hermes = self.root / "hermes-ci-slice"
+        board_dir = hermes / "kanban" / "boards" / "b"
+        board_dir.mkdir(parents=True)
+        old_data = os.environ.get("DEVFLOW_HERMES_DATA")
+        os.environ["DEVFLOW_HERMES_DATA"] = str(hermes)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("DEVFLOW_HERMES_DATA", old_data)
+            if old_data is not None else os.environ.pop("DEVFLOW_HERMES_DATA", None)
+        )
+        df = load_devflow(self.root)
+        epic_body = (
+            "Mode: deliver\nStop-After: ci\n## 目標\n只先跑到 CI\n\n## 驗收\n- AC-1 [api] 200\n"
+            "  - S1 [smoke]\n    - Given ready\n    - When GET /ok\n    - Then 200\n"
+        )
+        dev_body = (
+            f"## 目標\n修\n\n## 本卡完成\n{df.DONE_TEXT}\n\n"
+            "## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n"
+        )
+        head_sha = "c" * 40
+        db = board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT,
+                block_kind TEXT, assignee TEXT, workspace_kind TEXT,
+                workspace_path TEXT, completion_contract TEXT,
+                created_by TEXT, result TEXT, goal_mode INTEGER
+            );
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT, metadata TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("t_ep1", "[EPIC] CI stop", epic_body, "todo", None, "orchestrator", "dir", None, None, "user", None, 0),
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("t_dev1", "[DEV] 修 /ok", dev_body, "review", None, "reviewer", "worktree", None, REPO, "orchestrator", None, 1),
+        )
+        conn.execute("INSERT INTO task_links VALUES ('t_dev1', 't_ep1')")
+        conn.execute(
+            "INSERT INTO task_runs VALUES (1, 't_dev1', 'review', ?)",
+            (json.dumps({"pr_url": f"https://github.com/{REPO}/pull/7", "pr_number": 7}),),
+        )
+        conn.commit()
+        conn.close()
+
+        edits: list[str] = []
+        comments: list[str] = []
+        gate_calls: list[int] = []
+
+        def fake_kanban(b: str, cmd: str, tid: str, *args: str) -> str:
+            if cmd == "show":
+                with sqlite3.connect(db) as c:
+                    c.row_factory = sqlite3.Row
+                    t = dict(c.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    runs = [
+                        {"status": r["status"], "metadata": json.loads(r["metadata"])}
+                        for r in c.execute("SELECT status, metadata FROM task_runs WHERE task_id = ?", (tid,))
+                    ]
+                return json.dumps({"task": t, "runs": runs})
+            if cmd == "edit":
+                body = args[args.index("--body") + 1]
+                edits.append(body)
+                with sqlite3.connect(db) as c:
+                    c.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, tid))
+                    c.commit()
+                return ""
+            if cmd == "comment":
+                comments.append(args[0])
+                return ""
+            return ""
+
+        df.kanban = fake_kanban
+        df.gate = lambda *a: (gate_calls.append(1) or {"fingerprint": "fp", "findings": []}, "ok")
+
+        cards = df.plan_cards("b", "t_ep1")
+        ep_pipe = pipe_lib.parse_epic_pipeline(cards["t_ep1"]["body"], df.POLICY, epic_mode="deliver")
+
+        # 1. Pending CI -> does NOT stamp Paused-At: ci and signals retry
+        with mock.patch.object(df, "pr_meta", return_value={"state": "OPEN", "headRefOid": head_sha}), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 101, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "in_progress", "conclusion": None,
+             }]):
+            retry_flags: list[bool] = []
+            self.assertFalse(df._maybe_mark_slice_paused("b", "t_ep1", cards, ep_pipe, retry_out=retry_flags))
+            self.assertTrue(retry_flags)
+            self.assertEqual(edits, [])
+
+        # 2. Failed CI -> does NOT stamp Paused-At: ci
+        with mock.patch.object(df, "pr_meta", return_value={"state": "OPEN", "headRefOid": head_sha}), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 102, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "completed", "conclusion": "failure",
+             }]):
+            self.assertFalse(df._maybe_mark_slice_paused("b", "t_ep1", cards, ep_pipe))
+            self.assertEqual(edits, [])
+
+        # 3. Exact-head CI succeeded with DEV in review -> stamps Paused-At: ci and skips tick_prs gate
+        with mock.patch.object(df, "pr_meta", return_value={"state": "OPEN", "headRefOid": head_sha}), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 103, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "completed", "conclusion": "success",
+             }]):
+            self.assertTrue(df._maybe_mark_slice_paused("b", "t_ep1", cards, ep_pipe))
+        self.assertEqual(len(edits), 1)
+        self.assertIn("Paused-At: ci", cards["t_ep1"]["body"])
+        self.assertTrue(any("--stop-after review" in c for c in comments), comments)
+
+        # Idempotent once Paused-At: ci is recorded (no further GitHub probes)
+        paused_pipe = pipe_lib.parse_epic_pipeline(cards["t_ep1"]["body"], df.POLICY, epic_mode="deliver")
+        with mock.patch.object(df, "pr_meta", side_effect=AssertionError("must not probe when already paused")):
+            self.assertFalse(df._maybe_mark_slice_paused("b", "t_ep1", cards, paused_pipe))
+
+        # tick_prs still skips gate() while Stop-After: ci is active
+        df.tick_prs("b", REPO, [cards["t_dev1"]])
+        self.assertEqual(gate_calls, [])
+
+        # 4. Advancing to Stop-After: review keeps t_dev1 in review/reviewer handoff, enables tick_prs gate(),
+        #    and does NOT mark Paused-At: review until t_dev1 becomes done.
+        with contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after="review", to_end=False))
+        cards_rev = df.plan_cards("b", "t_ep1")
+        self.assertEqual(cards_rev["t_dev1"]["status"], "review")
+        self.assertEqual(cards_rev["t_dev1"]["assignee"], "reviewer")
+        rev_pipe = pipe_lib.parse_epic_pipeline(cards_rev["t_ep1"]["body"], df.POLICY, epic_mode="deliver")
+        self.assertFalse(df._maybe_mark_slice_paused("b", "t_ep1", cards_rev, rev_pipe))
+        self.assertNotIn("Paused-At: review", cards_rev["t_ep1"]["body"])
+        df.tick_prs("b", REPO, [cards_rev["t_dev1"]])
+        self.assertEqual(gate_calls, [1])
+
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE tasks SET status = 'done', assignee = 'reviewer' WHERE id = 't_dev1'")
+            c.commit()
+        cards_rev_done = df.plan_cards("b", "t_ep1")
+        self.assertTrue(df._maybe_mark_slice_paused("b", "t_ep1", cards_rev_done, rev_pipe))
+        self.assertIn("Paused-At: review", cards_rev_done["t_ep1"]["body"])
 
 
 if __name__ == "__main__":

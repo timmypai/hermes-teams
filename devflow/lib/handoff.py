@@ -165,35 +165,21 @@ def missing_arch_scope_files(
     return missing
 
 
-def _parse_glob_scope(raw_pat: str) -> tuple[str, bool, str, bool]:
-    """Return `(literal_dir_prefix, recursive_dirs, leaf_pattern, has_wildcards)`."""
+def _literal_prefix_before_wild(raw_pat: str) -> tuple[str, str, bool]:
+    """Return `(literal_prefix_before_first_wildcard, leaf_pattern, has_wildcards)` aligned to `scope.match_glob`."""
     raw = (raw_pat or "").strip().strip("`'\"")
     trailing_slash = raw.endswith("/")
     pat = _normalize_glob_token(raw)
-    has_wild = trailing_slash or any(ch in pat for ch in ("*", "?", "["))
+    if not pat:
+        return "", "*", False
     if trailing_slash:
-        return pat, True, "*", True
-    if "**" in pat:
-        prefix, _, suffix = pat.partition("**")
-        prefix = prefix.rstrip("/")
-        suffix = suffix.lstrip("/")
-        leaf = suffix.rsplit("/", 1)[-1] if suffix else "*"
-        return prefix, True, (leaf or "*"), True
-    if "/" not in pat:
-        # In `scope.match_glob`, Python `fnmatch` lets `*` cross `/` (e.g. `*.yml` matches subdirs).
-        if has_wild:
-            return "", True, pat, True
-        return pat, True, pat, False
-    parts = pat.split("/")
-    lit_dirs: list[str] = []
-    for part in parts[:-1]:
-        if any(ch in part for ch in ("*", "?", "[")):
-            break
-        lit_dirs.append(part)
-    dir_prefix = "/".join(lit_dirs)
-    rem = parts[len(lit_dirs) :]
-    recursive = len(rem) > 1 or any(any(ch in seg for ch in ("*", "?", "[")) for seg in rem[:-1])
-    return dir_prefix, recursive, (rem[-1] if rem else "*"), has_wild
+        return pat + "/", "*", True
+    wild_idxs = [pat.find(ch) for ch in ("*", "?", "[") if ch in pat]
+    if not wild_idxs:
+        return pat, pat.rsplit("/", 1)[-1], False
+    idx = min(wild_idxs)
+    leaf = pat.rsplit("/", 1)[-1] or "*"
+    return pat[:idx], leaf, True
 
 
 def _leaf_ext(leaf: str) -> str | None:
@@ -205,16 +191,6 @@ def _leaf_ext(leaf: str) -> str | None:
     return "." + ext
 
 
-def _dir_prefixes_can_overlap(da: str, rec_a: bool, db: str, rec_b: bool) -> bool:
-    if da == db:
-        return True
-    if rec_a and (not da or db == da or db.startswith(da + "/")):
-        return True
-    if rec_b and (not db or da == db or da.startswith(db + "/")):
-        return True
-    return False
-
-
 def _globs_overlap(a: str, b: str) -> bool:
     pa = _normalize_glob_token(a)
     pb = _normalize_glob_token(b)
@@ -223,18 +199,34 @@ def _globs_overlap(a: str, b: str) -> bool:
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
 
-    da, rec_a, leaf_a, wild_a = _parse_glob_scope(a)
-    db, rec_b, leaf_b, wild_b = _parse_glob_scope(b)
-    if not (wild_a and wild_b):
-        return False
-    if not _dir_prefixes_can_overlap(da, rec_a, db, rec_b):
-        return False
+    lit_a, leaf_a, wild_a = _literal_prefix_before_wild(a)
+    lit_b, leaf_b, wild_b = _literal_prefix_before_wild(b)
+    if wild_a and wild_b:
+        # `scope.match_glob` uses Python `fnmatch`, where `*`/`?`/`[...]` cross `/`:
+        # e.g. `src/*.py` matches `src/private/secret.py`.
+        if not (lit_a.startswith(lit_b) or lit_b.startswith(lit_a)):
+            return False
+        ext_a = _leaf_ext(leaf_a)
+        ext_b = _leaf_ext(leaf_b)
+        if ext_a and ext_b and ext_a != ext_b:
+            return False
+        return True
 
-    ext_a = _leaf_ext(leaf_a)
-    ext_b = _leaf_ext(leaf_b)
-    if ext_a and ext_b and ext_a != ext_b:
-        return False
-    return True
+    if wild_a != wild_b:
+        conc = pb if wild_a else pa
+        wild = pa if wild_a else pb
+        lit_w, leaf_w = (lit_a, leaf_a) if wild_a else (lit_b, leaf_b)
+        conc_leaf = leaf_b if wild_a else leaf_a
+        if _leaf_ext(conc_leaf) is not None:
+            return False
+        if lit_w and ((conc + "/").startswith(lit_w) or lit_w.startswith(conc + "/")):
+            ext_w = _leaf_ext(leaf_w) or ""
+            probes = (
+                f"{conc}/__p__{ext_w}",
+                f"{lit_w.rstrip('/')}/__p__{ext_w}" if lit_w.endswith("/") else f"{lit_w}__p__{ext_w}",
+            )
+            return any(scope_lib.match_glob(p, conc) and scope_lib.match_glob(p, wild) for p in probes)
+    return False
 
 
 def merge_allowed_scope_into_body(

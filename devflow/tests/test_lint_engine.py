@@ -291,6 +291,57 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         self.assertEqual(rep["checks"].get("diff_policy"), "fail")
         self.assertTrue(any("added_lines=5 > 4" in f or "PR 過大" in f for f in rep["findings"]), rep["findings"])
 
+    def test_character_class_globs_preserve_support_and_anchor_root(self) -> None:
+        d = Path(tempfile.mkdtemp(prefix="devflow-lint-charcls-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        # Positive & negated classes, ranges, leading literal ], non-crossing '/'
+        self.assertTrue(lint_engine.glob_matches("src/a/x.py", "src/[ab]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/b/x.py", "src/[ab]/*.py"))
+        self.assertFalse(lint_engine.glob_matches("src/c/x.py", "src/[ab]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/b/x.py", "src/[a-c]/*.py"))
+        self.assertFalse(lint_engine.glob_matches("src/d/x.py", "src/[a-c]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/c/x.py", "src/[!a]/*.py"))
+        self.assertFalse(lint_engine.glob_matches("src/a/x.py", "src/[!a]/*.py"))
+        self.assertFalse(lint_engine.glob_matches("src/c/sub/x.py", "src/[!a]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/c/x.py", "src/[^a]/*.py"))
+        self.assertFalse(lint_engine.glob_matches("src/a/x.py", "src/[^a]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/]/x.py", "src/[]a]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/a/x.py", "src/[]a]/*.py"))
+        self.assertTrue(lint_engine.glob_matches("src/[a.py", "src/[a.py"))
+        self.assertFalse(lint_engine.glob_matches("sub/AGENTS.md", "AGENTS.md"))
+        self.assertTrue(lint_engine.glob_matches("AGENTS.md", "AGENTS.md"))
+
+        rules_dir = d / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "cls-imp.toml").write_text(
+            'id = "cls-imp"\nkind = "import_boundary"\nmessage = "no infra"\n'
+            'include = ["src/[ab]/*.py"]\nexclude = ["src/[b]/*.py"]\nforbidden_modules = ["infra"]\n'
+            '[[fixture]]\nexpect = "fail"\npath = "src/a/x.py"\ntext = "import infra\\n"\n'
+            '[[fixture]]\nexpect = "pass"\npath = "src/c/x.py"\ntext = "import infra\\n"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(lint_engine.self_test_dir(rules_dir), [])
+        rule = lint_engine.load_rule(rules_dir / "cls-imp.toml")
+        hits = lint_engine.scan_files(
+            [rule],
+            {
+                "src/a/x.py": "import infra\n",
+                "src/b/x.py": "import infra\n",
+                "src/c/x.py": "import infra\n",
+            },
+        )
+        self.assertEqual([h["file"] for h in hits], ["src/a/x.py"], hits)
+
+        # Invalid character range fails closed at load time
+        bad_rule = rules_dir / "bad-range.toml"
+        bad_rule.write_text(
+            'id = "bad-range"\nkind = "import_boundary"\nmessage = "bad"\n'
+            'include = ["src/[z-a]/*.py"]\nforbidden_modules = ["infra"]\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(lint_engine.LintConfigError):
+            lint_engine.load_rule(bad_rule)
+
 
 if __name__ == "__main__":
     unittest.main()

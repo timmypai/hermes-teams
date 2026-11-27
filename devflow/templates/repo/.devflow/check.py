@@ -61,8 +61,8 @@ class ConfigError(Exception):
 
 
 def glob_regex(glob: str) -> re.Pattern:
-    out, i = [], 0
-    while i < len(glob):
+    out, i, n = [], 0, len(glob)
+    while i < n:
         if glob.startswith("**/", i):
             out.append("(?:.*/)?"); i += 3
         elif glob.startswith("**", i):
@@ -71,9 +71,36 @@ def glob_regex(glob: str) -> re.Pattern:
             out.append("[^/]*"); i += 1
         elif glob[i] == "?":
             out.append("[^/]"); i += 1
+        elif glob[i] == "[":
+            j = i + 1
+            if j < n and glob[j] in ("!", "^"):
+                j += 1
+            if j < n and glob[j] == "]":
+                j += 1
+            while j < n and glob[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(r"\["); i += 1
+            else:
+                stuff = glob[i + 1 : j]
+                neg = stuff.startswith(("!", "^"))
+                body = stuff[1:] if neg else stuff
+                if not body:
+                    raise ConfigError(f"invalid glob pattern {glob!r}: empty character class")
+                body = body.replace("\\", r"\\").replace("[", r"\[").replace("--", r"\-\-")
+                body = re.sub(r"([&~|])", r"\\\1", body)
+                if body.startswith("]"):
+                    body = r"\]" + body[1:]
+                if not neg and body.startswith("^"):
+                    body = r"\^" + body[1:]
+                out.append(f"(?!/)[{'^' if neg else ''}{body}]")
+                i = j + 1
         else:
             out.append(re.escape(glob[i])); i += 1
-    return re.compile("".join(out) + r"\Z")
+    try:
+        return re.compile("".join(out) + r"\Z")
+    except re.error as err:
+        raise ConfigError(f"invalid glob pattern {glob!r}: {err}") from err
 
 
 @dataclass(frozen=True)
@@ -157,6 +184,8 @@ def load_rules() -> list[Rule]:
                     exclude=exclude, max_files=mf, max_added_lines=ml,
                     fixtures=tuple(d.get("fixture", []))))
             seen.add(rid)
+        except ConfigError as e:
+            raise ConfigError(f"{f}: {e}") from e
         except (KeyError, tomllib.TOMLDecodeError, re.error) as e:
             raise ConfigError(f"{f}: {e}") from e
     return rules

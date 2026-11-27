@@ -301,8 +301,15 @@ def slice_stop_reached(
     epic: str,
     spec: dict[str, Any],
     policy: dict[str, Any] | None = None,
+    *,
+    step_evidence: dict[str, dict[str, Any]] | None = None,
 ) -> bool:
-    """True when a partial pipeline (`stop_after != terminal`) has finished every card overlapping `active_steps`."""
+    """True when a partial pipeline (`stop_after != terminal`) has satisfied every card overlapping `active_steps`.
+
+    Cards whose span continues beyond `stop_after` (such as `[DEV]`/`[OPS]` across `implement -> ci -> review`
+    under `Stop-After: ci`) count as completed up to `stop_after` when they are already in `review` with
+    verified exact-head `step_evidence` for `stop_after`.
+    """
     if not spec.get("valid"):
         return False
     steps = list(spec.get("steps") or [])
@@ -311,16 +318,32 @@ def slice_stop_reached(
     if not steps or start_at not in steps or stop_after not in steps or stop_after == steps[-1]:
         return False
     s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
-    in_slice: list[dict[str, Any]] = []
+    ev_map = step_evidence or {}
+    has_cards = False
     for cid, c in cards.items():
         if cid == epic or c.get("status") == "archived":
             continue
         title = str(c.get("title") or "").lstrip()
         kind = title[1:].split("]", 1)[0] if title.startswith("[") and "]" in title else ""
         span = card_step_span(kind, spec, policy)
-        if span is not None and not (span[1] < s_idx or span[0] > e_idx):
-            in_slice.append(c)
-    return bool(in_slice) and all(c.get("status") in ("done", "archived") for c in in_slice)
+        if span is None or span[1] < s_idx or span[0] > e_idx:
+            continue
+        has_cards = True
+        status = str(c.get("status") or "").strip().lower()
+        if status in ("done", "archived"):
+            continue
+        if span[0] <= e_idx < span[1] and status == "review":
+            ev = ev_map.get(cid)
+            if (
+                isinstance(ev, dict)
+                and str(ev.get("step") or "").strip().lower() == stop_after
+                and ev.get("ok") is True
+                and bool(str(ev.get("head_sha") or "").strip())
+                and ev.get("pr_number") is not None
+            ):
+                continue
+        return False
+    return has_cards
 
 
 def is_user_paused_card(task: dict[str, Any]) -> bool:
