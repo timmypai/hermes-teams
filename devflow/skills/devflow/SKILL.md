@@ -17,17 +17,17 @@ metadata:
 - ① 必照做，做不到就 `kanban_block` 問使用者，不自行略過。
 - ③ 只遵守程式碼風格、測試與既有模組邊界；**嚴禁為 ③ 新增 AC、開卡、或改寫 devflow 的角色分工與送審流程**，差異記進 summary `followups` 一行即可。
 
-## 2. 三種任務模式（EPIC 的 `Mode:`，預設 `deliver`）
-- **`deliver`**：新功能、修 bug、CI/CD 變更。完整走 AC + 情境 + `[DEV]`/`[OPS]` + `[SHIP]` + 整合驗收。需分段暫停時在 EPIC 加 `Start-At:` / `Stop-After:`（步驟 `repro -> design -> implement -> ci -> review -> ship -> accept`，推進用 `devflow epic advance`）。
-- **已授權 EPIC 不重問**：一旦 EPIC 已授權交付，直接依模式與 `Allowed-Scope` 向前推進，不反覆重問使用者是否改為僅本地修補。
-- **`investigate`**：線上故障查真因、唯讀取證。不強求 Given/When/Then 情境與 `[SHIP]`；`[RES]` 可指派 `researcher` 或 `devops`（`scratch`／`dir`）；**禁止開 `[DEV]`/`[OPS]` 補丁卡**；入口不可達就 `capability` 結案。
-- **`review`**：獨立審查既有 PR。不需假造情境，直接審 exact-head PR，通過才進條件式 `[SHIP]`；禁止開 `[DEV]`/`[OPS]`。
+## 2. 邊界與授權上限（`Allow-Write:`／相容 `Mode:`，預設開放全鏈）
+- **單一動態引擎**：流程不寫死步驟；`orchestrator` 依實際未知與證據動態拆解 DAG（未知真因先探索 `[RES]`/`[ARCH]`，確認後開交付卡 `[DEV]`/`[OPS]`/`[SHIP]`）。
+- **只查不改上限**：使用者限制不可改碼時設 `Allow-Write: false`（或相容寫法 `Mode: investigate` / `review`），此時嚴禁開 `[DEV]`/`[OPS]`。
+- **探索不綁死、承諾不漏項**：還在純探索階段（只有未完成 `[RES]`/`[ARCH]`、未開交付卡）不強迫預猜 `Allowed-Scope`、預建 `[SHIP]` 或預配 AC；**一旦開出任一張交付卡（`[DEV]`/`[OPS]`/`[SHIP]`）或結束探索，必須立刻完整覆蓋所有 AC**。
+- **分段暫停**：需要分批推到特定步驟（`repro -> design -> implement -> ci -> review -> ship -> accept`）時加 `Start-At:` / `Stop-After:`，推進用 `devflow epic advance`。一旦已授權交付該階段，不再反覆重問使用者。
 
-## 3. 八種卡型
+## 3. 八種卡型與角色邊界
 | 卡片 | assignee | workspace | 交付 |
 |---|---|---|---|
 | `[EPIC]` | orchestrator | `dir` | 驗收結論（Hermes 建） |
-| `[RES]` | researcher（`investigate` 可 devops；`review` 可 reviewer） | `scratch`（非 `deliver` 可 `dir`） | 結論 + 來源 |
+| `[RES]` | researcher（`scratch`，查碼/歷史）或 devops（`dir`，唯讀 `oracle-debug`）；`review` 可 reviewer（`dir`） | 成對綁定：`scratch`／`dir` | 結論 + 來源 |
 | `[ARCH]` | architect | `dir`（唯讀） | 決策 + 介面 + 檔案計畫 |
 | `[DEV]` | developer | `worktree` | PR（CI 綠、review 通過） |
 | `[OPS]` | devops | `worktree` | infra PR（同走 review） |

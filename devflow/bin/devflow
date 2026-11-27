@@ -1863,6 +1863,52 @@ def _maybe_mark_slice_paused(
     return True
 
 
+def _epic_authorization_state(body: str | None) -> tuple[str, dict[str, Any], bool | None, bool, list[str]]:
+    """Resolve Mode / Allow-Write authorization boundaries on an EPIC body (fail closed on conflicts)."""
+    epic_mode, bad_mode = scope_lib.parse_epic_mode(body, policy_lib.valid_modes(POLICY))
+    mode_cfg = policy_lib.mode_config(POLICY, epic_mode)
+    allow_write_override, bad_allow_write = scope_lib.parse_epic_allow_write(body)
+    mode_allow_write = bool(mode_cfg.get("allow_write", mode_cfg.get("allow_dev_cards", True)))
+    errors: list[str] = []
+    if bad_mode:
+        allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
+        errors.append(f"Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
+    if bad_allow_write:
+        errors.append(f"Allow-Write '{bad_allow_write}' 無效（允許：true / false）")
+    if not mode_allow_write and allow_write_override is True:
+        errors.append(f"Allow-Write: true 與唯讀 Mode '{epic_mode}' 衝突（請移除衝突或明確允許改碼）")
+    allow_write = mode_allow_write and (allow_write_override is not False)
+    return epic_mode, mode_cfg, allow_write_override, allow_write, errors
+
+
+def _card_executor_problems(
+    tid: str,
+    kind: str,
+    assignee: str | None,
+    workspace: str | None,
+    mode_cfg: dict[str, Any],
+    *,
+    allow_review_assignee: bool = True,
+) -> list[str]:
+    """Validate paired `(assignee, workspace)` against declarative policy executor rules."""
+    want = CARDS[kind]
+    pairs = list(policy_lib.allowed_executors_for_card(POLICY, mode_cfg, kind, want["assignee"], want["workspace"]))
+    if allow_review_assignee and kind in ("DEV", "OPS") and assignee == "reviewer":
+        pairs.append(("reviewer", want["workspace"]))
+    prefix = f"{tid}: " if tid else ""
+    errs: list[str] = []
+    allowed_asg = list(dict.fromkeys(a for a, _ in pairs))
+    if assignee and assignee not in allowed_asg:
+        errs.append(f"{prefix}[{kind}] assignee 應為 {'/'.join(allowed_asg)}，現在是 {assignee}")
+    if workspace:
+        matching = [p for p in pairs if (not assignee or p[0] == assignee)] or pairs
+        allowed_ws = list(dict.fromkeys(w for _, w in matching))
+        if workspace not in allowed_ws:
+            who = f"（{assignee}）" if assignee and len(allowed_asg) > 1 else ""
+            errs.append(f"{prefix}[{kind}]{who} workspace 應為 {'/'.join(allowed_ws)}，現在是 {workspace}")
+    return errs
+
+
 def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     e = entry(board)
     repo_cfg = policy_lib.load_repo_config(e.get("path"))
@@ -1878,24 +1924,50 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if t not in feeds:
             feeds.add(t)
             stack.extend(cards.get(t, {}).get("parents", []))
-    epic_mode, bad_mode = scope_lib.parse_epic_mode(cards[epic]["body"], policy_lib.valid_modes(POLICY))
-    mode_cfg = policy_lib.mode_config(POLICY, epic_mode)
+    epic_mode, mode_cfg, allow_write_override, allow_write, auth_errors = _epic_authorization_state(
+        cards[epic]["body"]
+    )
     pipe_spec = pipeline_lib.parse_epic_pipeline(cards[epic]["body"], POLICY, epic_mode=epic_mode)
     spec = epic_acceptance_spec(board, epic, cards[epic]["body"], cards=cards)
     acs = [a["ac"] for a in spec]
     ac_types = {a["ac"]: a["type"] for a in spec}
-    work_kinds = [card_type(c["title"]) for t, c in cards.items() if t != epic and c.get("status") != "archived"
-                  and card_type(c["title"]) in ("RES", "ARCH", "DEV", "OPS", "SHIP")]
+    work_items = [
+        (t, c, card_type(c["title"]))
+        for t, c in cards.items()
+        if t != epic and c.get("status") != "archived"
+        and card_type(c["title"]) in ("RES", "ARCH", "DEV", "OPS", "SHIP")
+    ]
+    work_kinds = [k for _, _, k in work_items]
     ship_only = bool(work_kinds) and all(k == "SHIP" for k in work_kinds)
-    if bad_mode:
-        allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
-        found.append(f"{epic}: Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
+    # Two-boundary constraint ("探索不綁死、承諾不漏項"): while only open exploration cards
+    # ([RES]/[ARCH]) exist and no delivery card has been created yet, allow discovery to clarify
+    # root cause & scope before committing ACs / [SHIP]. As soon as any delivery card exists (or
+    # exploration finished without opening delivery), full AC coverage & scenarios enforce up front.
+    delivery_kinds = frozenset({"RES", "SHIP"}) if not allow_write else policy_lib.delivery_card_kinds(mode_cfg)
+    has_delivery_card = any(k in delivery_kinds for _, _, k in work_items)
+    has_open_exploration_card = any(
+        k in ("RES", "ARCH") and k not in delivery_kinds and c.get("status") not in ("done", "archived")
+        for _, c, k in work_items
+    )
+    in_discovery_phase = (not auth_errors) and (not has_delivery_card) and has_open_exploration_card
+    for herr in auth_errors:
+        found.append(f"{epic}: {herr}")
     for pprob in pipe_spec["problems"]:
         found.append(f"{epic}: {pprob}")
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
-    skip_scenarios = ship_only or (not pipeline_lib.requires_scenarios_for_epic(pipe_spec, mode_cfg))
-    need_ship = repo_deploys(board) and pipeline_lib.requires_ship_for_epic(pipe_spec, mode_cfg)
+    skip_scenarios = (
+        ship_only
+        or in_discovery_phase
+        or (not allow_write)
+        or (not pipeline_lib.requires_scenarios_for_epic(pipe_spec, mode_cfg))
+    )
+    need_ship = (
+        repo_deploys(board)
+        and allow_write
+        and (not in_discovery_phase)
+        and pipeline_lib.requires_ship_for_epic(pipe_spec, mode_cfg)
+    )
     for a in spec:
         probs = [p for p in spec_problems(a) if not (skip_scenarios and "沒有任何情境" in p)]
         found += [f"{epic}: {p}" for p in probs]
@@ -1961,23 +2033,12 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if kind in ("RES", "ARCH", "DEV", "OPS", "SHIP") and c.get("created_by") and c["created_by"] not in WORK_CREATORS:
             found.append(f"{tid}: [{kind}] 由 {c.get('created_by')} 建立；工作卡只由 orchestrator 規劃建立"
                          "（devops 僅依失敗處理建修正卡），其他角色將需求交 orchestrator 拆卡")
-        want = CARDS[kind]
-        # PR cards move to the reviewer while in the review column; [RES] honors declarative mode rules.
-        if kind == "RES":
-            allowed_asg = list(mode_cfg.get("res_assignees") or [want["assignee"]])
-            allowed_ws = list(mode_cfg.get("res_workspaces") or [want["workspace"]])
-            if c["assignee"] not in allowed_asg:
-                found.append(f"{tid}: [RES] assignee 應為 {'/'.join(allowed_asg)}，現在是 {c['assignee']}")
-            if (c["workspace_kind"] or "scratch") not in allowed_ws:
-                found.append(f"{tid}: [RES] workspace 應為 {'/'.join(allowed_ws)}，現在是 {c['workspace_kind']}")
-        else:
-            if c["assignee"] != want["assignee"] and not (kind in ("DEV", "OPS") and c["assignee"] == "reviewer"):
-                found.append(f"{tid}: [{kind}] assignee 應為 {want['assignee']}，現在是 {c['assignee']}")
-            if (c["workspace_kind"] or "scratch") != want["workspace"]:
-                found.append(f"{tid}: [{kind}] workspace 應為 {want['workspace']}，現在是 {c['workspace_kind']}")
+        # PR cards move to the reviewer while in the review column; executors follow paired declarative policy.
+        found.extend(_card_executor_problems(tid, kind, c["assignee"], c["workspace_kind"] or "scratch", mode_cfg))
         if kind in ("DEV", "OPS"):
-            if not bool(mode_cfg.get("allow_dev_cards", True)):
-                found.append(f"{tid}: 本 EPIC 為 Mode: {epic_mode}（不開放改程式補丁），禁止建立 [{kind}] 卡；如需改碼請另開 Mode: deliver EPIC")
+            if not allow_write:
+                limit_label = "Allow-Write: false" if allow_write_override is False else f"Mode: {epic_mode}"
+                found.append(f"{tid}: 本 EPIC 為 {limit_label}（不開放改程式補丁），禁止建立 [{kind}] 卡；如需改碼請另開允許寫入的 EPIC")
             contract = c.get("completion_contract") or "local-only"
             # Hermes pins OWNER/REPO to the exact PR URL once the card publishes its PR.
             ok_yes = contract == e["repo"] or contract.startswith(f"https://github.com/{e['repo']}/pull/")
@@ -2036,9 +2097,10 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         if kind not in ("EPIC", "ADV", "ADJ") and tid not in feeds:
             found.append(f"{tid}: 沒有接到 EPIC 的 parent 鏈，EPIC 驗收不會等它")
     work = "\n".join(f"{c['title']}\n{c['body'] or ''}" for t, c in cards.items() if t != epic)
-    for ac in acs:
-        if len(cards) > 1 and not re.search(rf"\b{ac}\b", work):
-            found.append(f"{epic}: {ac} 沒有任何卡片負責（卡片 body 要寫明覆蓋哪些 AC）")
+    if len(cards) > 1 and not in_discovery_phase:
+        for ac in acs:
+            if not re.search(rf"\b{ac}\b", work):
+                found.append(f"{epic}: {ac} 沒有任何卡片負責（卡片 body 要寫明覆蓋哪些 AC）")
     return found
 
 
@@ -2442,12 +2504,8 @@ def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
 
 
 def _epic_header_problems(body: str | None) -> list[str]:
-    probs: list[str] = []
-    ep_mode, bad_mode = scope_lib.parse_epic_mode(body, policy_lib.valid_modes(POLICY))
-    if bad_mode:
-        allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
-        probs.append(f"Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
-    ep_pipe = pipeline_lib.parse_epic_pipeline(body, POLICY, epic_mode=ep_mode)
+    epic_mode, _, _, _, probs = _epic_authorization_state(body)
+    ep_pipe = pipeline_lib.parse_epic_pipeline(body, POLICY, epic_mode=epic_mode)
     probs.extend(ep_pipe["problems"])
     return probs
 
@@ -6828,6 +6886,21 @@ def _resolve_check_card_arch_parents(board_arg: str, parent_ids: list[str]) -> l
     return out
 
 
+def _card_epic_auth_for_check(board_arg: str | None, body: str | None) -> tuple[str, dict[str, Any], bool | None, bool]:
+    """Best-effort lookup of referenced EPIC authorization boundaries for `devflow check card`."""
+    epic_mode, mode_cfg, allow_write_override, allow_write = "deliver", policy_lib.mode_config(POLICY, "deliver"), None, True
+    if board_arg and (em := EPIC_REF.search(body or "")):
+        db = BOARDS / board_arg / "kanban.db"
+        if db.is_file():
+            with suppress(sqlite3.Error):
+                rows = board_rows(board_arg, "SELECT body FROM tasks WHERE id = ?", (em.group(1),))
+                if rows and rows[0].get("body") is not None:
+                    epic_mode, mode_cfg, allow_write_override, allow_write, _ = _epic_authorization_state(
+                        rows[0]["body"]
+                    )
+    return epic_mode, mode_cfg, allow_write_override, allow_write
+
+
 def cmd_check_card(a) -> None:
     """Fail-fast card schema & body hygiene check before creating or editing a Kanban card."""
     body = Path(a.body_file).read_text(encoding="utf-8") if a.body_file else (a.body if a.body is not None else sys.stdin.read())
@@ -6842,14 +6915,14 @@ def cmd_check_card(a) -> None:
     if kind not in CARDS:
         findings.append(f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]")
     else:
-        want = CARDS[kind]
-        if a.assignee and a.assignee != want["assignee"] and not (kind in ("DEV", "OPS") and a.assignee == "reviewer"):
-            findings.append(f"[{kind}] assignee 應為 {want['assignee']}，收到 {a.assignee}")
-        if a.workspace and a.workspace != want["workspace"]:
-            findings.append(f"[{kind}] workspace 應為 {want['workspace']}，收到 {a.workspace}")
+        epic_mode, mode_cfg, allow_write_override, allow_write = _card_epic_auth_for_check(board_arg, body)
+        findings.extend(_card_executor_problems("", kind, a.assignee, a.workspace, mode_cfg))
         if kind == "EPIC":
             findings.extend(_epic_header_problems(body))
         if kind in ("DEV", "OPS"):
+            if not allow_write:
+                limit_label = "Allow-Write: false" if allow_write_override is False else f"Mode: {epic_mode}"
+                findings.append(f"本 EPIC 為 {limit_label}（不開放改程式補丁），禁止建立 [{kind}] 卡")
             if why := done_problem(a.title, body):
                 findings.append(why)
             findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))

@@ -27,25 +27,57 @@ DEFAULT_TEST_PATHS: list[str] = [
     ".devflow/verify.sh",
 ]
 
+DEFAULT_CARD_EXECUTORS: dict[str, list[dict[str, str]]] = {
+    "RES": [
+        {"assignee": "researcher", "workspace": "scratch"},
+        {"assignee": "devops", "workspace": "dir"},
+        {"assignee": "reviewer", "workspace": "dir"},
+    ],
+}
+
 DEFAULT_MODES: dict[str, dict[str, Any]] = {
     "deliver": {
+        "allow_write": True,
         "require_scenarios": True,
         "require_ship": True,
         "allow_dev_cards": True,
-        "res_assignees": ["researcher"],
-        "res_workspaces": ["scratch"],
+        "delivery_card_kinds": ["DEV", "OPS", "SHIP"],
+        "card_executors": {
+            "RES": [
+                {"assignee": "researcher", "workspace": "scratch"},
+                {"assignee": "devops", "workspace": "dir"},
+            ]
+        },
+        "res_assignees": ["researcher", "devops"],
+        "res_workspaces": ["scratch", "dir"],
     },
     "investigate": {
+        "allow_write": False,
         "require_scenarios": False,
         "require_ship": False,
         "allow_dev_cards": False,
+        "delivery_card_kinds": ["RES"],
+        "card_executors": {
+            "RES": [
+                {"assignee": "researcher", "workspace": "scratch"},
+                {"assignee": "devops", "workspace": "dir"},
+            ]
+        },
         "res_assignees": ["researcher", "devops"],
         "res_workspaces": ["scratch", "dir"],
     },
     "review": {
+        "allow_write": False,
         "require_scenarios": False,
         "require_ship": False,
         "allow_dev_cards": False,
+        "delivery_card_kinds": ["RES", "SHIP"],
+        "card_executors": {
+            "RES": [
+                {"assignee": "researcher", "workspace": "scratch"},
+                {"assignee": "reviewer", "workspace": "dir"},
+            ]
+        },
         "res_assignees": ["researcher", "reviewer"],
         "res_workspaces": ["scratch", "dir"],
     },
@@ -126,6 +158,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "require_allowed_scope": True,
     "max_role_prompt_chars": 12000,
     "default_test_paths": list(DEFAULT_TEST_PATHS),
+    "card_executors": {k: [dict(item) for item in v] for k, v in DEFAULT_CARD_EXECUTORS.items()},
     "modes": {k: dict(v) for k, v in DEFAULT_MODES.items()},
     "pipelines": {k: dict(v) for k, v in DEFAULT_PIPELINES.items()},
     "handoff_schemas": {k: dict(v) for k, v in DEFAULT_HANDOFF_SCHEMAS.items()},
@@ -261,12 +294,234 @@ def valid_modes(policy: dict[str, Any] | None = None) -> frozenset[str]:
 
 
 def mode_config(policy: dict[str, Any] | None, mode: str) -> dict[str, Any]:
-    """Resolve declarative workflow rules for `mode` (`deliver` | `investigate` | `review`)."""
+    """Resolve declarative workflow boundaries for `mode` (`deliver` | `investigate` | `review`)."""
     key = (mode or "deliver").strip().lower()
     modes = (policy or {}).get("modes")
     base = DEFAULT_MODES.get(key) or DEFAULT_MODES["deliver"]
     override = modes.get(key) if isinstance(modes, dict) and isinstance(modes.get(key), dict) else {}
     return {**base, **override}
+
+
+def _executor_pairs(raw: Any) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if not isinstance(raw, list):
+        return pairs
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        asg = str(item.get("assignee") or "").strip()
+        ws = str(item.get("workspace") or "").strip()
+        if asg and ws and (asg, ws) not in pairs:
+            pairs.append((asg, ws))
+    return pairs
+
+
+def allowed_executors_for_card(
+    policy: dict[str, Any] | None,
+    mode_cfg: dict[str, Any] | None,
+    kind: str,
+    default_assignee: str,
+    default_workspace: str,
+) -> list[tuple[str, str]]:
+    """Return allowed `(assignee, workspace)` executor pairs for card `kind`."""
+    k = (kind or "").strip().upper()
+    m_exec = (mode_cfg or {}).get("card_executors")
+    if isinstance(m_exec, dict) and k in m_exec:
+        if pairs := _executor_pairs(m_exec.get(k)):
+            return pairs
+    if k == "RES" and mode_cfg:
+        raw_asg = [str(x).strip() for x in (mode_cfg.get("res_assignees") or []) if str(x).strip()]
+        raw_ws = [str(x).strip() for x in (mode_cfg.get("res_workspaces") or []) if str(x).strip()]
+        if "card_executors" not in mode_cfg and (raw_asg or raw_ws):
+            asgs = raw_asg or [default_assignee]
+            wss = raw_ws or [default_workspace]
+            return [(a, w) for a in asgs for w in wss]
+    p_exec = (policy or {}).get("card_executors")
+    if isinstance(p_exec, dict) and k in p_exec:
+        if pairs := _executor_pairs(p_exec.get(k)):
+            return pairs
+    return [(default_assignee, default_workspace)]
+
+
+def delivery_card_kinds(mode_cfg: dict[str, Any] | None) -> frozenset[str]:
+    """Card kinds that enter delivery commitment (triggering full AC coverage checks)."""
+    raw = (mode_cfg or {}).get("delivery_card_kinds")
+    if isinstance(raw, list):
+        kinds = frozenset(str(x).strip().upper() for x in raw if str(x).strip())
+        if kinds:
+            return kinds
+    return frozenset({"DEV", "OPS", "SHIP"})
+
+
+def obsolete_hooks(roles: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Return normalized `{event, command}` pairs declared under `roles.json` `obsolete_hooks`."""
+    out: list[dict[str, str]] = []
+    for item in (roles or {}).get("obsolete_hooks") or []:
+        if not isinstance(item, dict):
+            continue
+        event = str(item.get("event") or "").strip()
+        command = str(item.get("command") or "").strip()
+        if event and command:
+            out.append({"event": event, "command": command})
+    return out
+
+
+def _strip_hooks_yaml_fallback(text: str, targets: set[tuple[str, str]]) -> tuple[str, int]:
+    """Deterministic stdlib fallback for stripping obsolete `hooks.<event>` entries when `ruamel.yaml` is absent."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    removed = 0
+    in_hooks = False
+    cur_event: str | None = None
+    event_indent = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if stripped.startswith("#") or not stripped.strip():
+            out.append(line)
+            i += 1
+            continue
+        if indent == 0:
+            in_hooks = stripped.rstrip("\r\n") == "hooks:"
+            cur_event = None
+            out.append(line)
+            i += 1
+            continue
+        if in_hooks and indent > 0 and not stripped.startswith("-") and ":" in stripped and (
+            cur_event is None or indent <= event_indent
+        ):
+            cur_event = stripped.split(":", 1)[0].strip()
+            event_indent = indent
+            out.append(line)
+            i += 1
+            continue
+        if in_hooks and cur_event and indent > event_indent and stripped.startswith("- "):
+            item_indent = indent
+            block = [line]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                nxt_s = nxt.lstrip(" ")
+                nxt_i = len(nxt) - len(nxt_s)
+                if not nxt_s.strip():
+                    block.append(nxt)
+                    j += 1
+                    continue
+                if nxt_i <= item_indent:
+                    break
+                block.append(nxt)
+                j += 1
+            cmd = ""
+            first_rest = stripped[2:].strip()
+            if first_rest.startswith("command:"):
+                cmd = _unquote_env(first_rest.partition(":")[2])
+            else:
+                for b in block[1:]:
+                    bs = b.lstrip(" ")
+                    if bs.startswith("command:"):
+                        cmd = _unquote_env(bs.partition(":")[2])
+                        break
+            if (cur_event, cmd) in targets:
+                removed += 1
+            else:
+                out.extend(block)
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "".join(out), removed
+
+
+def retire_obsolete_hooks(
+    home: Path,
+    hooks_spec: list[dict[str, str]],
+    *,
+    yaml_cls: Any = None,
+    backup_fn: Any = None,
+    log_fn: Any = None,
+) -> int:
+    """Idempotently remove stale hooks from `config.yaml` and `shell-hooks-allowlist.json`."""
+    targets = {(str(h.get("event") or "").strip(), str(h.get("command") or "").strip()) for h in hooks_spec}
+    targets = {(e, c) for e, c in targets if e and c}
+    if not targets:
+        return 0
+    if yaml_cls is None:
+        try:
+            from ruamel.yaml import YAML as _YamlCls  # type: ignore[import-not-found]
+            yaml_cls = _YamlCls
+        except ImportError:
+            yaml_cls = None
+    removed_total = 0
+    cfg_path = home / "config.yaml"
+    if cfg_path.is_file():
+        cfg_removed = 0
+        new_cfg_text: str | None = None
+        if yaml_cls is not None:
+            yaml = yaml_cls()
+            if hasattr(yaml, "preserve_quotes"):
+                yaml.preserve_quotes = True
+            data = yaml.load(cfg_path.read_text(encoding="utf-8")) or {}
+            hooks = data.get("hooks") if isinstance(data, dict) else None
+            if isinstance(hooks, dict):
+                for event, cmd in sorted(targets):
+                    items = hooks.get(event)
+                    if not isinstance(items, list):
+                        continue
+                    kept = [
+                        it for it in items
+                        if not (isinstance(it, dict) and str(it.get("command") or "").strip() == cmd)
+                    ]
+                    diff = len(items) - len(kept)
+                    if diff:
+                        cfg_removed += diff
+                        if kept:
+                            hooks[event] = kept
+                        else:
+                            hooks.pop(event, None)
+                if cfg_removed and not hooks:
+                    data.pop("hooks", None)
+                if cfg_removed:
+                    if backup_fn is not None:
+                        backup_fn(cfg_path)
+                    with cfg_path.open("w", encoding="utf-8") as fh:
+                        yaml.dump(data, fh)
+        else:
+            raw_text = cfg_path.read_text(encoding="utf-8")
+            new_cfg_text, cfg_removed = _strip_hooks_yaml_fallback(raw_text, targets)
+            if cfg_removed:
+                if backup_fn is not None:
+                    backup_fn(cfg_path)
+                cfg_path.write_text(new_cfg_text, encoding="utf-8")
+        if cfg_removed and log_fn is not None:
+            log_fn(f"retired {cfg_removed} obsolete hook(s) from {cfg_path}")
+        removed_total += cfg_removed
+
+    allow_path = home / "shell-hooks-allowlist.json"
+    if allow_path.is_file():
+        try:
+            raw_allow = json.loads(allow_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw_allow = None
+        if isinstance(raw_allow, dict) and isinstance(raw_allow.get("approvals"), list):
+            kept_allow = [
+                it for it in raw_allow["approvals"]
+                if not (
+                    isinstance(it, dict)
+                    and (str(it.get("event") or "").strip(), str(it.get("command") or "").strip()) in targets
+                )
+            ]
+            allow_removed = len(raw_allow["approvals"]) - len(kept_allow)
+            if allow_removed:
+                if backup_fn is not None:
+                    backup_fn(allow_path)
+                raw_allow["approvals"] = kept_allow
+                allow_path.write_text(json.dumps(raw_allow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                if log_fn is not None:
+                    log_fn(f"retired {allow_removed} obsolete hook approval(s) from {allow_path}")
+                removed_total += allow_removed
+    return removed_total
 
 
 def repo_deploys(repo_cfg: dict[str, str]) -> bool:

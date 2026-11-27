@@ -82,12 +82,19 @@ class WorkflowModes(unittest.TestCase):
         self.assertFalse(any("沒有任何情境" in f for f in found), found)
         self.assertFalse(any("assignee 應為" in f or "workspace 應為" in f for f in found), found)
 
-    def test_deliver_default_keeps_the_full_rules(self) -> None:
-        found = self.rules(self.cards(None))
-        self.assertTrue(any("沒有任何情境" in f for f in found), found)
-        self.assertTrue(any("assignee 應為 researcher" in f for f in found), found)
-        self.assertTrue(any("workspace 應為 scratch" in f for f in found), found)
-        self.assertTrue(any("assignee 應為 researcher" in f for f in self.rules(self.cards("deliver"))))
+    def test_deliver_default_allows_paired_devops_res_in_discovery_and_rejects_mismatches(self) -> None:
+        # Pure discovery phase with paired (devops, dir) [RES] skips premature scenarios / SHIP.
+        self.assertEqual(self.rules(self.cards(None, res_assignee="devops", res_ws="dir")), [])
+        self.assertEqual(self.rules(self.cards("deliver", res_assignee="researcher", res_ws="scratch")), [])
+        # Mismatched executor pairings fail closed.
+        bad_res_dir = self.rules(self.cards(None, res_assignee="researcher", res_ws="dir"))
+        self.assertTrue(any("workspace 應為" in f for f in bad_res_dir), bad_res_dir)
+        bad_devops_scratch = self.rules(self.cards(None, res_assignee="devops", res_ws="scratch"))
+        self.assertTrue(any("workspace 應為" in f for f in bad_devops_scratch), bad_devops_scratch)
+        # Once a delivery card ([DEV]) exists, scenarios and [SHIP] are required immediately.
+        with_dev_missing = self.rules(self.cards(None, res_assignee="devops", res_ws="dir", with_dev=True))
+        self.assertTrue(any("沒有任何情境" in f for f in with_dev_missing), with_dev_missing)
+        self.assertTrue(any("[SHIP]" in f for f in with_dev_missing), with_dev_missing)
 
     def test_investigate_and_review_refuse_patch_cards(self) -> None:
         for mode in ("investigate", "review"):

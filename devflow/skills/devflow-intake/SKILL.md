@@ -16,7 +16,7 @@ metadata:
 ## 1. 收需求 → 建 EPIC
 觸發：要求開發、修 bug、線上查真因、獨立審查、接入 repo、部署（單純問答或查進度不建卡）。語音委派時不能直接問使用者：需要回答就不建卡，回傳最多 2 題簡短問題與建議選項；已寫「已語音確認」就跳過確認。
 1. **確認 repo**：`devflow repo list`；未接入用 `devflow repo add OWNER/REPO`（新專案加 `--create`，不部署加 `--no-runner`）。
-2. **選定模式 `Mode:`**：`deliver`（預設，寫程式／改設定／部署）、`investigate`（線上查真因、唯讀取證，不改碼）、`review`（對既有 PR 做獨立審查與有條件合併）。
+2. **確認授權邊界**：預設開放 `orchestrator` 依實況動態拆解 DAG（可先查碼／查線上再決定改碼）；若使用者明確要求「只查不改／只審不改碼」，加 `Allow-Write: false`（或相容 `Mode: investigate` / `review`；預設可寫 `Mode: deliver`）。
 3. **釐清三件事**：要達成什麼、怎樣算完成、有沒有不能碰的東西。一次最多問 2 題，只問會改變做法的；合理預設記進 `## 使用者決定`。使用者說「grill me」才用 `grilling`。
 4. **寫白話驗收 AC**：編號 `AC-1`、`AC-2`…，後接類型 `[ui]`／`[api]`／`[cli]`／`[lib]`／`[manual]`；只寫非工程師可觀察的結果，不替使用者加稽核、白名單、專屬帳號、自訂審查等機制。
 5. **檢查 AC（D0）**：`printf '%s\n' '<AC 行>' | /opt/data/devflow/bin/devflow check ac --said '<使用者原話>'`（`0` 通過；`1` 改寫或追問；`2` API 不可用，照樣建卡）。
@@ -26,7 +26,7 @@ metadata:
    kanban_create(
      board=slug, assignee="orchestrator", workspace_kind="dir",
      title="[EPIC] <一句白話目標>", idempotency_key="epic:<slug>:<關鍵字>",
-     body="Mode: <deliver|investigate|review>\n## 目標\n<1-2 句白話>\n\n## 驗收\n- AC-1 [ui] ...\n\n## 不能碰\n<選填：禁止碰的目錄或行為>\n\n## 使用者原話\n<使用者原話與明確決定>")
+     body="Mode: <deliver|investigate|review>（或寫 Allow-Write: false）\n## 目標\n<1-2 句白話>\n\n## 驗收\n- AC-1 [ui] ...\n\n## 不能碰\n<選填：禁止碰的目錄或行為>\n\n## 使用者原話\n<使用者原話與明確決定>")
    ```
 8. **回覆**：一句話「已建立 t_xxxx，orchestrator 接手了，需要你決定時我會問你。」
 

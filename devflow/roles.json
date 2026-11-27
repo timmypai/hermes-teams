@@ -32,25 +32,56 @@
       ".devflow/ui/**",
       ".devflow/verify.sh"
     ],
+    "card_executors": {
+      "RES": [
+        {"assignee": "researcher", "workspace": "scratch"},
+        {"assignee": "devops", "workspace": "dir"},
+        {"assignee": "reviewer", "workspace": "dir"}
+      ]
+    },
     "modes": {
       "deliver": {
+        "allow_write": true,
         "require_scenarios": true,
         "require_ship": true,
         "allow_dev_cards": true,
-        "res_assignees": ["researcher"],
-        "res_workspaces": ["scratch"]
+        "delivery_card_kinds": ["DEV", "OPS", "SHIP"],
+        "card_executors": {
+          "RES": [
+            {"assignee": "researcher", "workspace": "scratch"},
+            {"assignee": "devops", "workspace": "dir"}
+          ]
+        },
+        "res_assignees": ["researcher", "devops"],
+        "res_workspaces": ["scratch", "dir"]
       },
       "investigate": {
+        "allow_write": false,
         "require_scenarios": false,
         "require_ship": false,
         "allow_dev_cards": false,
+        "delivery_card_kinds": ["RES"],
+        "card_executors": {
+          "RES": [
+            {"assignee": "researcher", "workspace": "scratch"},
+            {"assignee": "devops", "workspace": "dir"}
+          ]
+        },
         "res_assignees": ["researcher", "devops"],
         "res_workspaces": ["scratch", "dir"]
       },
       "review": {
+        "allow_write": false,
         "require_scenarios": false,
         "require_ship": false,
         "allow_dev_cards": false,
+        "delivery_card_kinds": ["RES", "SHIP"],
+        "card_executors": {
+          "RES": [
+            {"assignee": "researcher", "workspace": "scratch"},
+            {"assignee": "reviewer", "workspace": "dir"}
+          ]
+        },
         "res_assignees": ["researcher", "reviewer"],
         "res_workspaces": ["scratch", "dir"]
       }
@@ -181,6 +212,9 @@
               "pstack/skills/principle-fix-root-causes", "pstack/skills/principle-test-behavior-not-implementation"]
   },
   "obsolete_cron_names": ["seven-bot-v1-project-supervision"],
+  "obsolete_hooks": [
+    {"event": "pre_tool_call", "command": "/opt/data/devflow/bin/devflow stage-card"}
+  ],
   "roles": {
     "default": {
       "title": "Hermes",

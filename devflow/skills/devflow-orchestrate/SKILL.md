@@ -21,15 +21,14 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
  {"op": "assign", "task": "t_x", "to": "developer"}, {"op": "resume", "task": "t_x", "note": "..."}]
 ```
 
-## A. 規劃
-1. `devflow repo sync <slug>`，讀 README、`.devflow/`、`.github/workflows/`，確認 EPIC 的 `Mode:`（沒寫就是 `deliver`）與選填 `Pipeline:`／`Start-At:`／`Stop-After:`（例如只想寫碼到 CI 為止可設 `Stop-After: ci`，合法略過 `[SHIP]`；之後用 `devflow epic advance` 接續）。一旦 EPIC 已授權進入該階段，直接規劃並推進，不重問使用者是否只做本機修補。
-2. **依模式規劃**
-   - **`investigate`（線上查真因）**：不寫 Given/When/Then 情境、不建 `[SHIP]`、**禁止開 `[DEV]`／`[OPS]`**。先確認取證入口是否可達（repo 有無唯讀診斷腳本或 workflow）；有就建 `[RES]` 指派具該入口權限的 `devops`（`dir`）或 `researcher`（`scratch`）；完全沒有入口就直接 `kanban_block(kind="capability")` 說明缺哪個入口，不空轉。
-   - **`review`（獨立審查既有 PR）**：不假造情境；安排審查與條件式 `[SHIP]`；禁止開 `[DEV]`／`[OPS]`。
-   - **`deliver`（交付）**：
-     - 每條 AC 要有編號與類型；非 `[manual]` AC 要有 `<EPIC>/AC-n.Sm` 的 Given/When/Then 情境（只讀不寫的標 `[smoke]`）。**除非 repo 的 `.devflow/scenarios.json` 已經有本 EPIC 的情境，否則規劃當下就把情境寫進 EPIC**。改寫只能更精確地說使用者要的結果，嚴禁加稽核、白名單、前後快照、自訂審查等使用者沒要的門檻；「不要動其他服務」就是一條可觀察結果，不是一套隔離系統。
-     - 終點反推一次盤點：`devflow repo doctor <slug>`（`contract-files`／`port` 有缺口就排前置 `[OPS]` 與 `[SHIP]`；留意 `agents_md_warnings`）與 `gh secret list -R <OWNER/REPO>`（需要 UI 操作腳本就在初始 `[DEV]` 一併規劃，不留給 `[SHIP]` 事後補）。
-3. **切卡**：`[RES]` 只在有實際未知時建；`[ARCH]` 只在有跨模組或難回頭決策時建；每張 `[DEV]`／`[OPS]` 一個 PR、後面接一張 `[SHIP]`（`deliver` 且要部署）；依賴前一個 PR 程式碼的卡，parent 指向前一張 `[SHIP]`；互不相干的卡並行。每條 AC 至少一張卡負責。
+## A. 規劃（邊界內自主拆解 DAG，不寫死劇本）
+1. `devflow repo sync <slug>`，讀 README、`.devflow/`、`.github/workflows/`，確認 EPIC 授權邊界：`Allow-Write:`（與相容 `Mode:` `deliver`／`investigate`／`review`）及選填 `Start-At:`／`Stop-After:`。已授權推進的階段不再重問。
+2. **兩階段邊界（探索不綁死、承諾不漏項）**
+   - **只查不改上限（`Allow-Write: false`／`investigate`／`review`）**：禁止開 `[DEV]`/`[OPS]`；可開 `[RES]` 查碼（`researcher`, `scratch`）或唯讀 `oracle-debug`（`devops`, `dir`）、`review` 審查（`reviewer`, `dir`），無取證入口直接 `capability` 結案。
+   - **允許交付時（預設 / `deliver`）**：
+     - **先探索再決定**：有未知真因或需線上診斷時，先只開 `[RES]`（查碼派 `researcher`/`scratch`，需唯讀 `oracle-debug` 查線上容器快照或 logs 直接派 `devops`/`dir`，或兩者並行）或 `[ARCH]`（`architect`/`dir`）並連回 EPIC。**純探索階段不要預先亂猜 `Allowed-Scope` 或預建 `[DEV]`/`[SHIP]`**；等探索卡回傳實證回到你手上，再決定加查、問人或進交付。
+     - **進交付承諾一次檢齊**：一旦決定開出交付卡（`[DEV]`/`[OPS]`/`[SHIP]`），**必須在當下補齊全部非 `[manual]` AC 情境（`Given/When/Then`，除非 `.devflow/scenarios.json` 已有）並讓全部 AC 都有卡片覆蓋**。盤點 `devflow repo doctor <slug>` 與 `gh secret list`，每張改碼卡接對應 `[SHIP]`（除非 `Stop-After` 略過出貨）並設 parent 鏈。
+3. **動態演化與預算防失控**：探索完成喚醒 EPIC 時，若未覆蓋交付或有缺口不可直接結案，依證據繼續拆下一波或問人；全程受角色配對、`max_epic_cards` 與熔斷保護。
 4. **`[DEV]`／`[OPS]` 建卡規格**（建卡前可跑 `devflow check card --board <slug> --title "..." --assignee ... --workspace ... [--parent <ARCH_ID>] --body "..."`）：必設 `goal_mode=true`、`workspace_kind="worktree"`、`contract=yes` 時設 `completion_contract="OWNER/REPO"`，body ≤ 600 字；若上游有已完成 `[ARCH]`，`Allowed-Scope:` 必須完整涵蓋 `[ARCH]` metadata 的 `target_files`：
    ```
    ## 目標

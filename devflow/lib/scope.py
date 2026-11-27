@@ -10,6 +10,7 @@ OUT_OF_SCOPE_RE = re.compile(r"^\s*Out-of-Scope[：:]\s*(.+)$", re.M | re.I)
 NON_GOALS_RE = re.compile(r"^\s*Non-Goals[：:]\s*(.+)$", re.M | re.I)
 VERIFY_CMD_RE = re.compile(r"^\s*Verify[：:]\s*(.+)$", re.M | re.I)
 MODE_RE = re.compile(r"^\s*Mode[：:]\s*([a-zA-Z0-9_-]+)\s*$", re.M | re.I)
+ALLOW_WRITE_RE = re.compile(r"^\s*Allow-Write[：:]\s*([a-zA-Z0-9_-]+)\s*$", re.M | re.I)
 KANBAN_TASK_RE = re.compile(r"^\s*Kanban[：:]\s*(t_[0-9A-Za-z]+)\b", re.M | re.I)
 EPIC_SECTION_RE = re.compile(r"^##\s*(目標|驗收|使用者原話|使用者決定|不能碰)[ \t]*\n(.*?)(?=^## |\Z)", re.M | re.S)
 _PATH_TOKEN_RE = re.compile(r"`([^`\s]+)`|(?<![A-Za-z0-9_])((?:\.[A-Za-z0-9_-]+|[A-Za-z0-9_.-]+)/(?:[A-Za-z0-9_.*?/-]+))")
@@ -51,6 +52,19 @@ def parse_epic_mode(epic_body: str | None, valid_modes: set[str] | frozenset[str
     if raw not in allowed:
         return "deliver", raw
     return raw, None
+
+
+def parse_epic_allow_write(epic_body: str | None) -> tuple[bool | None, str | None]:
+    """Return `(allow_write_override, invalid_raw_or_none)` from an EPIC's optional `Allow-Write:` line."""
+    m = ALLOW_WRITE_RE.search(epic_body or "")
+    if not m:
+        return None, None
+    raw = m.group(1).strip().lower()
+    if raw in ("true", "yes", "on", "1"):
+        return True, None
+    if raw in ("false", "no", "off", "0"):
+        return False, None
+    return None, raw
 
 
 _ROOT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
