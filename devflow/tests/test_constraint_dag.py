@@ -378,6 +378,7 @@ class ConstraintDagBoundaries(unittest.TestCase):
         orig_route_q = self.df.route_questions
         orig_run = self.df.run
         orig_repair = self.df.repair_bodies
+        orig_readiness = self.df.readiness_rules
         self.addCleanup(setattr, self.df, "kanban", orig_kanban)
         self.addCleanup(setattr, self.df, "plan_cards", orig_plan_cards)
         self.addCleanup(setattr, self.df, "tick_prs", orig_tick_prs)
@@ -386,6 +387,7 @@ class ConstraintDagBoundaries(unittest.TestCase):
         self.addCleanup(setattr, self.df, "route_questions", orig_route_q)
         self.addCleanup(setattr, self.df, "run", orig_run)
         self.addCleanup(setattr, self.df, "repair_bodies", orig_repair)
+        self.addCleanup(setattr, self.df, "readiness_rules", orig_readiness)
 
         active_plan = cards_waking
         epic_list_view = {**ep_done_parent}
@@ -403,7 +405,20 @@ class ConstraintDagBoundaries(unittest.TestCase):
         def fake_run(cmd, **kw):
             if isinstance(cmd, list) and "create" in cmd:
                 created.append(cmd)
-                return types.SimpleNamespace(returncode=0, stdout=f"Created t_adj{len(created):05d}\n", stderr="")
+                adj_id = f"t_adj{len(created):05d}"
+                body_idx = cmd.index("--body") + 1
+                active_plan[adj_id] = {
+                    "id": adj_id,
+                    "title": f"[ADJ] 計畫規則修正 t_ep1",
+                    "status": "ready",
+                    "assignee": "orchestrator",
+                    "workspace_kind": "dir",
+                    "parents": [],
+                    "children": [],
+                    "goal_mode": False,
+                    "body": cmd[body_idx],
+                }
+                return types.SimpleNamespace(returncode=0, stdout=f"Created {adj_id}\n", stderr="")
             return orig_run(cmd, **kw)
 
         self.df.kanban = fake_kanban
@@ -413,6 +428,7 @@ class ConstraintDagBoundaries(unittest.TestCase):
         self.df.release_rate_limited_advisors = lambda *a: False
         self.df.route_questions = lambda *a: False
         self.df.repair_bodies = lambda *a: []
+        self.df.readiness_rules = lambda *a: []
         self.df.run = fake_run
 
         st: dict = {}
@@ -435,6 +451,113 @@ class ConstraintDagBoundaries(unittest.TestCase):
         self.assertFalse(self.df.tick_board("b", {}))
         self.assertEqual(len(created), 1)
         self.assertIn("[ADJ] 計畫規則修正 t_ep1", created[0])
+
+    def test_meta_adj_and_adv_cards_do_not_satisfy_ac_coverage_or_oscillate(self) -> None:
+        ep = self._epic("", with_scenarios=True)
+        dev_bundle = self._dev("t_dev1", acs="AC-1", with_ship=True)
+        ep["parents"] = ["t_ship1"]
+        adj_meta = {
+            "id": "t_adj1",
+            "title": "[ADJ] 計畫規則修正 t_ep1",
+            "status": "ready",
+            "assignee": "orchestrator",
+            "workspace_kind": "dir",
+            "parents": [],
+            "children": [],
+            "goal_mode": False,
+            "body": "EPIC: t_ep1\n\n## 目標\n修正\n\n## 待修正項目\n- t_ep1: AC-2 沒有任何卡片負責\n",
+        }
+        adv_meta = {
+            "id": "t_adv1",
+            "title": "[ADV] 計畫檢查 t_ep1",
+            "status": "ready",
+            "assignee": "default",
+            "workspace_kind": "dir",
+            "parents": [],
+            "children": [],
+            "goal_mode": False,
+            "body": "EPIC: t_ep1\n\n檢查 AC-2 是否確實覆蓋\n",
+        }
+        found = self.df.plan_rules("b", "t_ep1", {"t_ep1": ep, **dev_bundle, "t_adj1": adj_meta, "t_adv1": adv_meta})
+        self.assertTrue(any("AC-2 沒有任何卡片負責" in f for f in found), found)
+
+        # Simulate two consecutive tick_board ticks: Tick 1 creates [ADJ]; Tick 2 includes that [ADJ]
+        # (whose body quotes "AC-2 沒有任何卡片負責") and MUST NOT auto-archive it or create a 2nd [ADJ].
+        orig_kanban = self.df.kanban
+        orig_plan_cards = self.df.plan_cards
+        orig_tick_prs = self.df.tick_prs
+        orig_release_held = self.df.release_held
+        orig_release_adv = self.df.release_rate_limited_advisors
+        orig_route_q = self.df.route_questions
+        orig_run = self.df.run
+        orig_repair = self.df.repair_bodies
+        orig_readiness = self.df.readiness_rules
+        self.addCleanup(setattr, self.df, "kanban", orig_kanban)
+        self.addCleanup(setattr, self.df, "plan_cards", orig_plan_cards)
+        self.addCleanup(setattr, self.df, "tick_prs", orig_tick_prs)
+        self.addCleanup(setattr, self.df, "release_held", orig_release_held)
+        self.addCleanup(setattr, self.df, "release_rate_limited_advisors", orig_release_adv)
+        self.addCleanup(setattr, self.df, "route_questions", orig_route_q)
+        self.addCleanup(setattr, self.df, "run", orig_run)
+        self.addCleanup(setattr, self.df, "repair_bodies", orig_repair)
+        self.addCleanup(setattr, self.df, "readiness_rules", orig_readiness)
+
+        active_plan: dict[str, dict] = {"t_ep1": {**ep, "status": "todo"}, **dev_bundle}
+        created: list[list[str]] = []
+        archived: list[tuple[str, ...]] = []
+
+        def fake_kanban(board: str, cmd: str, *args: str) -> str:
+            if cmd == "list":
+                return json.dumps(list(active_plan.values()))
+            if cmd == "show":
+                tid = args[0]
+                t = active_plan[tid]
+                return json.dumps({"task": t, "parents": t.get("parents") or [], "comments": []})
+            if cmd == "archive":
+                archived.append(args)
+                for tid in args:
+                    if tid in active_plan:
+                        active_plan[tid]["status"] = "archived"
+            return ""
+
+        def fake_run(cmd, **kw):
+            if isinstance(cmd, list) and "create" in cmd:
+                created.append(cmd)
+                adj_id = f"t_adj{len(created):05d}"
+                body_idx = cmd.index("--body") + 1
+                active_plan[adj_id] = {
+                    "id": adj_id,
+                    "title": f"[ADJ] 計畫規則修正 t_ep1",
+                    "status": "ready",
+                    "assignee": "orchestrator",
+                    "workspace_kind": "dir",
+                    "parents": [],
+                    "children": [],
+                    "goal_mode": False,
+                    "body": cmd[body_idx],
+                }
+                return types.SimpleNamespace(returncode=0, stdout=f"Created {adj_id}\n", stderr="")
+            return orig_run(cmd, **kw)
+
+        self.df.kanban = fake_kanban
+        self.df.plan_cards = lambda board, eid: {k: v for k, v in active_plan.items() if v.get("status") != "archived"}
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+        self.df.repair_bodies = lambda *a: []
+        self.df.readiness_rules = lambda *a: []
+        self.df.run = fake_run
+
+        st: dict = {}
+        self.assertFalse(self.df.tick_board("b", st))
+        self.assertEqual(len(created), 1)
+        self.assertEqual(archived, [])
+
+        # Second tick with t_adj00001 live in active_plan: must stay open (0 archives, 0 duplicates).
+        self.assertFalse(self.df.tick_board("b", st))
+        self.assertEqual(archived, [])
+        self.assertEqual(len(created), 1)
 
 
 class ObsoleteHooksCleanup(unittest.TestCase):
