@@ -1,9 +1,9 @@
 """Structured handoff validation, ARCH target-file inheritance, and atomic Allowed-Scope merging."""
 from __future__ import annotations
 
-import fnmatch
 import re
 from collections import deque
+from pathlib import PurePosixPath
 from typing import Any
 
 from . import policy as policy_lib
@@ -302,150 +302,169 @@ def _parse_fnmatch_class(pat: str, i: int) -> tuple[tuple[str, Any], int]:
     return ("cls", (neg, frozenset(chars))), j + 1
 
 
-def _compile_glob_nfa(raw_pat: str) -> _CharNFA | None:
-    """Build a character NFA whose accepted language matches `scope_lib.match_glob`."""
+def _has_fnmatch_wild(pat: str) -> bool:
+    if "*" in pat or "?" in pat:
+        return True
+    i = 0
+    n = len(pat)
+    while i < n:
+        if pat[i] == "[":
+            matcher, next_i = _parse_fnmatch_class(pat, i)
+            if matcher[0] == "cls":
+                return True
+            i = next_i
+        else:
+            i += 1
+    return False
+
+
+def _compile_glob_nfas(raw_pat: str) -> tuple[_CharNFA, ...] | None:
+    """Compile `raw_pat` into a conjunction of character NFAs matching `scope_lib.match_glob`."""
     raw = (raw_pat or "").strip().strip("`'\"")
-    while raw.startswith("./"):
-        raw = raw[2:]
-    raw_stripped = raw.lstrip("/")
-    if not raw_stripped:
-        return None
-    trailing_slash = raw_stripped.endswith("/")
-    pat = _normalize_glob_token(raw_pat)
+    pat = raw.lstrip("./")
     if not pat:
         return None
-
-    nfa = _CharNFA()
-    if trailing_slash:
-        end = nfa.emit_literal(nfa.start, pat + "/")
-        end = nfa.emit_any_star(end)
+    if pat.endswith("/"):
+        nfa = _CharNFA()
+        end = nfa.emit_any_star(nfa.emit_literal(nfa.start, pat))
         nfa.add_eps(end, nfa.accept)
-        return nfa
+        return (nfa,)
 
     if "**" in pat:
         prefix, _, suffix = pat.partition("**")
         prefix = prefix.rstrip("/")
         suffix = suffix.lstrip("/")
-        if not suffix:
-            if not prefix:
-                end = nfa.emit_any_star(nfa.start)
-                nfa.add_eps(end, nfa.accept)
-                return nfa
-            pend = nfa.emit_literal(nfa.start, prefix)
-            nfa.add_eps(pend, nfa.accept)
-            slash = nfa.emit_literal(pend, "/")
-            tail = nfa.emit_any_star(slash)
-            nfa.add_eps(tail, nfa.accept)
-            return nfa
+        terms: list[_CharNFA] = []
+        if prefix:
+            np = _CharNFA()
+            pend = np.emit_literal(np.start, prefix)
+            np.add_eps(pend, np.accept)
+            np.add_eps(np.emit_any_star(np.emit_literal(pend, "/")), np.accept)
+            terms.append(np)
+        if suffix:
+            ns = _CharNFA()
+            mid = ns.emit_any_star(ns.start)
+            ns.add_eps(ns.emit_fnmatch(mid, suffix), ns.accept)
+            collapsed = re.sub(r"/+", "/", PurePosixPath(suffix).as_posix())
+            if collapsed != suffix or "**" in suffix:
+                mid2 = ns.emit_any_star(ns.start)
+                ns.add_eps(ns.emit_fnmatch(mid2, collapsed, allow_doublestar=True), ns.accept)
+            terms.append(ns)
+        if not terms:
+            na = _CharNFA()
+            na.add_eps(na.emit_any_star(na.start), na.accept)
+            terms.append(na)
+        return tuple(terms)
 
-        if prefix and scope_lib.match_glob(prefix, pat):
-            nfa.add_eps(nfa.emit_literal(nfa.start, prefix), nfa.accept)
-        head = nfa.emit_literal(nfa.start, prefix + "/") if prefix else nfa.start
-        mid = nfa.emit_any_star(head)
-        end = nfa.emit_fnmatch(mid, suffix, allow_doublestar=("**" in suffix))
-        nfa.add_eps(end, nfa.accept)
-        return nfa
-
-    # Single-stage glob or exact/directory prefix (`fnmatch(p, pat) or p == pat or p.startswith(pat + '/')`)
-    fend = nfa.emit_fnmatch(nfa.start, pat)
-    nfa.add_eps(fend, nfa.accept)
-    if not any(ch in pat for ch in ("*", "?", "[")):
+    nfa = _CharNFA()
+    nfa.add_eps(nfa.emit_fnmatch(nfa.start, pat), nfa.accept)
+    if not _has_fnmatch_wild(pat):
         pend = nfa.emit_literal(nfa.start, pat)
         nfa.add_eps(pend, nfa.accept)
-        sub = nfa.emit_any_star(nfa.emit_literal(pend, "/"))
-        nfa.add_eps(sub, nfa.accept)
-    return nfa
+        nfa.add_eps(nfa.emit_any_star(nfa.emit_literal(pend, "/")), nfa.accept)
+    return (nfa,)
 
 
-def _matchers_intersect(m1: tuple[str, Any], m2: tuple[str, Any]) -> bool:
+def _meet_matchers(m1: tuple[str, Any], m2: tuple[str, Any]) -> tuple[str, Any] | None:
     k1, v1 = m1
     k2, v2 = m2
-    if k1 == "any" or k2 == "any":
-        if k1 == "cls" and not v1[0] and not v1[1]:
-            return False
-        if k2 == "cls" and not v2[0] and not v2[1]:
-            return False
-        return True
+    if k1 == "any":
+        return None if (k2 == "cls" and not v2[0] and not v2[1]) else m2
+    if k2 == "any":
+        return None if (k1 == "cls" and not v1[0] and not v1[1]) else m1
     if k1 == "lit" and k2 == "lit":
-        return v1 == v2
+        return m1 if v1 == v2 else None
     if k1 == "lit":
         neg, chars = v2
-        return (v1 not in chars) if neg else (v1 in chars)
+        return m1 if ((v1 not in chars) if neg else (v1 in chars)) else None
     if k2 == "lit":
         neg, chars = v1
-        return (v2 not in chars) if neg else (v2 in chars)
+        return m2 if ((v2 not in chars) if neg else (v2 in chars)) else None
     neg1, s1 = v1
     neg2, s2 = v2
     if not neg1 and not neg2:
-        return bool(s1 & s2)
+        inter = s1 & s2
+        return ("cls", (False, inter)) if inter else None
     if not neg1 and neg2:
-        return bool(s1 - s2)
+        diff = s1 - s2
+        return ("cls", (False, diff)) if diff else None
     if neg1 and not neg2:
-        return bool(s2 - s1)
-    return any(chr(code) not in s1 and chr(code) not in s2 for code in range(32, 127))
+        diff = s2 - s1
+        return ("cls", (False, diff)) if diff else None
+    uni = s1 | s2
+    return ("cls", (True, uni)) if any(chr(code) not in uni for code in range(32, 127)) else None
 
 
-def _eps_closure(nfa: _CharNFA, starts: list[int]) -> set[int]:
-    seen = set(starts)
-    stack = list(starts)
-    while stack:
-        s = stack.pop()
-        for nxt in nfa.eps[s]:
-            if nxt not in seen:
-                seen.add(nxt)
-                stack.append(nxt)
-    return seen
+def _prepare_nfa(nfa: _CharNFA) -> tuple[list[bool], list[list[tuple[tuple[str, Any], int]]]]:
+    n = len(nfa.eps)
+    is_acc = [False] * n
+    eff: list[list[tuple[tuple[str, Any], int]]] = [[] for _ in range(n)]
+    for s in range(n):
+        seen = {s}
+        stack = [s]
+        while stack:
+            u = stack.pop()
+            for v in nfa.eps[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        is_acc[s] = nfa.accept in seen
+        seen_edges: set[tuple[tuple[str, Any], int]] = set()
+        for u in seen:
+            for m, d in nfa.step[u]:
+                edge = (m, d)
+                if edge not in seen_edges:
+                    seen_edges.add(edge)
+                    eff[s].append(edge)
+    return is_acc, eff
 
 
 def _globs_overlap(a: str, b: str) -> bool:
-    """Exact character-NFA intersection of `scope.match_glob` languages (zero false negatives)."""
-    pa = _normalize_glob_token(a)
-    pb = _normalize_glob_token(b)
+    """Exact character-NFA conjunction intersection of `scope.match_glob` languages (zero false negatives)."""
+    pa = (a or "").strip().strip("`'\"").lstrip("./")
+    pb = (b or "").strip().strip("`'\"").lstrip("./")
     if not pa or not pb:
         return False
-    if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
+    if pa == pb:
         return True
-    nfa_a = _compile_glob_nfa(a)
-    nfa_b = _compile_glob_nfa(b)
-    if nfa_a is None or nfa_b is None:
+    if (not _has_fnmatch_wild(pa) and scope_lib.match_glob(pa, pb)) or (
+        not _has_fnmatch_wild(pb) and scope_lib.match_glob(pb, pa)
+    ):
+        return True
+
+    na = _compile_glob_nfas(a)
+    nb = _compile_glob_nfas(b)
+    if na is None or nb is None:
         return False
-
-    init_a = _eps_closure(nfa_a, [nfa_a.start])
-    init_b = _eps_closure(nfa_b, [nfa_b.start])
-    if nfa_a.accept in init_a and nfa_b.accept in init_b:
+    nfas = na + nb
+    k = len(nfas)
+    prepped = [_prepare_nfa(x) for x in nfas]
+    start = tuple(x.start for x in nfas)
+    if all(prepped[i][0][start[i]] for i in range(k)):
         return True
 
-    visited: set[tuple[int, int]] = set()
-    queue: deque[tuple[int, int]] = deque()
-    for sa in init_a:
-        for sb in init_b:
-            pair = (sa, sb)
-            visited.add(pair)
-            queue.append(pair)
-
+    visited: set[tuple[int, ...]] = {start}
+    queue: deque[tuple[int, ...]] = deque([start])
     max_states = 50_000
     while queue:
-        sa, sb = queue.popleft()
-        steps_a = nfa_a.step[sa]
-        steps_b = nfa_b.step[sb]
-        if not steps_a or not steps_b:
-            continue
-        for ma, da in steps_a:
-            next_as = _eps_closure(nfa_a, [da])
-            for mb, db in steps_b:
-                if not _matchers_intersect(ma, mb):
-                    continue
-                next_bs = _eps_closure(nfa_b, [db])
-                if nfa_a.accept in next_as and nfa_b.accept in next_bs:
+        cur = queue.popleft()
+        dfs: list[tuple[int, tuple[str, Any], list[int]]] = [(0, ("any", None), [])]
+        while dfs:
+            idx, acc_m, dsts = dfs.pop()
+            if idx == k:
+                nxt = tuple(dsts)
+                if all(prepped[i][0][nxt[i]] for i in range(k)):
                     return True
-                for na in next_as:
-                    for nb in next_bs:
-                        pair = (na, nb)
-                        if pair not in visited:
-                            visited.add(pair)
-                            if len(visited) > max_states:
-                                return True
-                            queue.append(pair)
+                if nxt not in visited:
+                    visited.add(nxt)
+                    if len(visited) > max_states:
+                        return True
+                    queue.append(nxt)
+                continue
+            for m, d in prepped[idx][1][cur[idx]]:
+                nm = _meet_matchers(acc_m, m)
+                if nm is not None:
+                    dfs.append((idx + 1, nm, [*dsts, d]))
     return False
 
 

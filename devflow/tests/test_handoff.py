@@ -204,6 +204,7 @@ class AtomicScopeMerge(unittest.TestCase):
             (env_body, None, ["config/"]),
             ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `**/*.env`\n", ["config.v1"]),
             (base.replace("src/private/**", "src*/private.py"), None, ["src/a*"]),
+            (base.replace("src/private/**", "src/?x.py"), None, ["src/**src/a?.py"]),
         ):
             with self.assertRaises(ValueError, msg=f"{oos_body} / {epic_body} + {bad_add}"):
                 handoff_lib.merge_allowed_scope_into_body(oos_body, bad_add, epic_body=epic_body)
@@ -232,25 +233,36 @@ class AtomicScopeMerge(unittest.TestCase):
             ("src/foo.py", "src/foobar.py"),
             ("src/*_test.py", "src/*_prod.py"),
             ("src/*_test.py", "src/*.ts"),
+            ("src/**src/foo.py", "src/*bar.py"),
         ):
             self.assertFalse(handoff_lib._globs_overlap(a, b), (a, b))
             self.assertFalse(handoff_lib._globs_overlap(b, a), (b, a))
         # Wildcardless `src/secret.py` matches descendants `src/secret.py/...` under scope.match_glob -> sound True
         self.assertTrue(handoff_lib._globs_overlap("src/*_test.py", "src/secret.py"))
-        # Slash-spanning wildcards intersecting across segments (PR #41 regression)
-        self.assertTrue(handoff_lib._globs_overlap("src/a*", "src*/private.py"))
-        self.assertTrue(handoff_lib._globs_overlap("src*/private.py", "src/a*"))
+        # Slash-spanning & overlapping prefix/suffix `**` wildcards (PR #41 regressions)
+        for a, b in (
+            ("src/a*", "src*/private.py"),
+            ("src/**src/a?.py", "src/?x.py"),
+            ("src/**src", "src"),
+            (".env", "env"),
+            (".devflow/**", "devflow/a.py"),
+        ):
+            self.assertTrue(handoff_lib._globs_overlap(a, b), (a, b))
+            self.assertTrue(handoff_lib._globs_overlap(b, a), (b, a))
 
-        # Unconditional 0-false-negative property check across 42 globs x 45 paths
+        # Unconditional 0-false-negative property check across 51 globs x 53 paths
         globs = [
             "app/a.py", "app/b.py", "src/foo.py", "src/foobar.py", "src/secret.py",
             "src/*_test.py", "src/*_prod.py", "src/*.py", "src/*.ts", "src/*.rs",
             "src/private", "src/private/", "src/private/**", "src/private/*.py", "src/private/*.ts",
             "src/a*", "src*/private.py", "src/*/private.py",
+            "src/**src/a?.py", "src/?x.py", "src/**src", "src/**a.py", "src/**/a.py",
+            "src/**src/foo.py", "src/*bar.py",
             "app/[a-z]/*.py", "app/[a-z]*.py", "app/[a-z]", "app/secret/x.py", "app/secret/**", "app/public*.py",
             "**/*.env", "src/**/*.py", "tests/**/*.py", "config", "config.v1", "config/",
             "a/**/foo.py", "a/*/foo.py", "a/*/b/*.py", "docs/[!x]/*.md", "ops/?/cfg.yml",
-            "a[/-]b", "a/**/b/**/c.py",
+            "a[/-]b", "a/**/b/**/c.py", "a/**b/c", "a/**//b",
+            ".env", "env", ".devflow/**", "devflow/a.py",
             "*/*.py", "app/*/", "src/api/**", "src/a*.py", "seccomp*.json",
         ]
         paths = [
@@ -259,9 +271,11 @@ class AtomicScopeMerge(unittest.TestCase):
             "src/foo.py", "src/foobar.py", "src/a_test.py", "src/a_prod.py", "src/secret.py",
             "src/secret.py/a_test.py", "src/private", "src/private/a.py", "src/private/sub/b.ts",
             "src/app/private.py", "src/x/private.py",
+            "src/ax.py", "src/src/ax.py", "src", "src/a.py", "src/x/a.py", "src/bar.py/src/foo.py",
             "src/api/auth.py", "src/lib.rs", "config", "config/a.env", "config.v1", "config.v1/a.env",
             "a/foo.py", "a/b/foo.py", "a/b/c/foo.py", "a/x/b/y.py", "a/bar_foo.py",
-            "a/b", "a-b", "a/b/c.py", "a/x/b/y/c.py",
+            "a/b", "a-b", "a/b/c.py", "a/x/b/y/c.py", "a/b/c", "a/xb/c", "a/x/b",
+            ".env", "env", ".devflow/a.py", "devflow/a.py",
             "docs/y/a.md", "docs/x/a.md", "docs/x/y/a.md", "ops/z/cfg.yml", "ops/a/b/cfg.yml",
             "tests/unit/a.py", "src/nested/mod.py", "a.env", "x/y.py",
         ]
