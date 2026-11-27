@@ -460,7 +460,7 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             id = "domain-boundary"
             kind = "import_boundary"
             message = "domain must not import infra"
-            include = ["domain/**/*.py", "web/**/*.ts"]
+            include = ["domain/**/*.py", "web/**/*.ts", "web/**/*.tsx"]
             forbidden_modules = ["infra", "infra/"]
 
             [[fixture]]
@@ -499,22 +499,48 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             'const documentation = "import(\'infra/private\')";\n'
             "const singleq = 'require(\"infra/private\")';\n"
             "const tpl = `hello ${s}\nimport('infra/private')\nrequire('infra/x')`;\n"
-            'const member = obj.import("infra/not_real");\n',
+            'const member = obj.import("infra/not_real");\n'
+            "const re = /import\\('infra\\/fake'\\)/;\n"
+            "if (s) /import\\('infra\\/if_fake'\\)/;\n",
         )
         self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
         self.write("web/tpl_real.ts", "export const x = `${await import('infra/tpl_client')}`;\n")
+        self.write("web/div.ts", 'const ratio = 1 / 2; import x from "infra/x";\n')
+        self.write("web/div_expr.ts", 'const a = (1 + 2) / 3; const b = arr[0] / 2; const c = i++ / 2; import y from "infra/y";\n')
+        self.write("web/div_tpl.ts", 'const t = `${s}` / 2; import z from "infra/z";\n')
+        self.write("web/div_if.ts", 'if (s) /ok/g; import w from "infra/w";\n')
+        self.write("web/div_prop.ts", 'const d = cfg.default / 2; import p from "infra/p";\n')
+        self.write("web/div_jsx.tsx", 'const el = <div>a</div><div>b</div>; import j from "infra/jsx";\n')
         self.write("domain/broken.py", "def broken(:\n")
         code, out = self.check()
         self.assertEqual(code, 1, out)
         self.assertNotIn("web/ok.ts", out)
-        self.assertIn("web/dyn.ts:1 [domain-boundary]", out)
-        self.assertIn("web/tpl_real.ts:1 [domain-boundary]", out)
+        for bad_js in (
+            "web/dyn.ts",
+            "web/tpl_real.ts",
+            "web/div.ts",
+            "web/div_expr.ts",
+            "web/div_tpl.ts",
+            "web/div_if.ts",
+            "web/div_prop.ts",
+            "web/div_jsx.tsx",
+        ):
+            self.assertIn(f"{bad_js}:1 [domain-boundary]", out, bad_js)
         self.assertIn("domain/broken.py:1 [domain-boundary]", out)
         self.assertIn("SyntaxError", out)
 
         # Clean python + JS lets repo check pass, while PR gate still enforces diff_policy alias
-        self.write("web/dyn.ts", 'export const ok = 1;\n')
-        self.write("web/tpl_real.ts", 'export const ok = 2;\n')
+        for bad_js in (
+            "web/dyn.ts",
+            "web/tpl_real.ts",
+            "web/div.ts",
+            "web/div_expr.ts",
+            "web/div_tpl.ts",
+            "web/div_if.ts",
+            "web/div_prop.ts",
+            "web/div_jsx.tsx",
+        ):
+            self.write(bad_js, "export const ok = 1;\n")
         self.write("domain/broken.py", "X = 1\n")
         self.start("exit 0\n")
         code_ok, out_ok = self.check()

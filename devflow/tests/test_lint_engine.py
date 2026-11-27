@@ -178,7 +178,7 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         rules_dir.mkdir()
         (rules_dir / "imp.toml").write_text(
             'id = "imp"\nkind = "import_boundary"\nmessage = "no infra"\n'
-            'include = ["src/**/*.py", "web/**/*.ts"]\nforbidden_modules = ["infra", "infra/"]\n'
+            'include = ["src/**/*.py", "web/**/*.ts", "web/**/*.tsx"]\nforbidden_modules = ["infra", "infra/"]\n'
             '[[fixture]]\nexpect = "fail"\npath = "src/a.py"\ntext = "import infra\\n"\n'
             '[[fixture]]\nexpect = "pass"\npath = "src/a.py"\ntext = "import app\\n"\n',
             encoding="utf-8",
@@ -203,19 +203,35 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     "const tpl = `hello ${documentation}\nimport('infra/private')\nrequire('infra/x')`;\n"
                     'const member = loader.import("infra/not_module");\n'
                     "const re = /import\\('infra\\/fake'\\)/;\n"
+                    "if (member) /import\\('infra\\/cond_fake'\\)/;\n"
                     'const u = "https://x";\n'
                 ),
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
                 "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
                 "web/req.ts": "const r = require('infra/sync_client');\n",
+                "web/div.ts": 'const ratio = 1 / 2; import x from "infra/after_div";\n',
+                "web/div_expr.ts": 'const r = (1 + 2) / 3; const a = arr[0] / 2; const p = i++ / 2; import y from "infra/after_expr";\n',
+                "web/div_tpl.ts": "const t = `${x}` / 2; import z from \"infra/after_tpl\";\n",
+                "web/div_if.ts": 'if (ok) /ok/g; import w from "infra/after_if_regex";\n',
+                "web/div_prop.ts": 'const q = cfg.default / 2; import p from "infra/after_kw_prop";\n',
+                "web/div_jsx.tsx": 'const el = <div>a</div><div>b</div>; import j from "infra/after_jsx";\n',
                 "src/broken.py": "def bad(:\n",
             },
         )
         by_file = {h["file"]: h for h in hits}
         self.assertNotIn("web/clean.ts", by_file)
-        self.assertIn("web/dyn.ts", by_file)
-        self.assertIn("web/tpl_real.ts", by_file)
-        self.assertIn("web/req.ts", by_file)
+        for bad_js in (
+            "web/dyn.ts",
+            "web/tpl_real.ts",
+            "web/req.ts",
+            "web/div.ts",
+            "web/div_expr.ts",
+            "web/div_tpl.ts",
+            "web/div_if.ts",
+            "web/div_prop.ts",
+            "web/div_jsx.tsx",
+        ):
+            self.assertIn(bad_js, by_file, bad_js)
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
 
     def test_preflight_enforces_repo_diff_policy_rules(self) -> None:

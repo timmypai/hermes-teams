@@ -312,27 +312,95 @@ def _scan_template_tail(text: str, start: int, lineno: int, *, first: bool) -> t
     return ("".join(buf) if first else ""), i, lineno, False
 
 
-_REGEX_PREV_KW = frozenset({"return", "throw", "case", "else", "do", "yield", "await", "typeof", "void", "delete", "in", "of"})
+_REGEX_PREV_KW = frozenset({
+    "return", "throw", "case", "else", "do", "yield", "await",
+    "typeof", "void", "delete", "in", "of", "default",
+})
+_CTRL_KW = frozenset({"if", "while", "for", "with"})
+_REGEX_PREV_PUNCT = frozenset({"(", "[", "{", "}", ",", ";", "=", ":", "?"})
+_REGEX_PREV_OP = frozenset({
+    "=", "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
+    "&&=", "||=", "??=", "=>", "!", "~", "+", "-", "*", "%", "**", "&", "|", "^",
+    "&&", "||", "??", "==", "===", "!=", "!==", ">", "<=", ">=", "<<", ">>", ">>>",
+})
+_MULTI_OPS = (
+    ">>>=", "===", "!==", "**=", "<<=", ">>=", "&&=", "||=", "??=", "...",
+    ">>>", "=>", "++", "--", "==", "!=", "<=", ">=", "&&", "||", "??", "**", "<<", ">>",
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+)
+
+
+def _sig_tokens_tail(tokens: list[tuple[str, str, int]], limit: int = 3) -> list[tuple[str, str, int]]:
+    out: list[tuple[str, str, int]] = []
+    for tok in reversed(tokens):
+        if tok[0] != "NL":
+            out.append(tok)
+            if len(out) >= limit:
+                break
+    return out
 
 
 def _js_allows_regex(tokens: list[tuple[str, str, int]]) -> bool:
-    for kind, val, _ in reversed(tokens):
-        if kind == "NL":
-            continue
-        if kind == "OP":
-            return True
-        if kind == "PUNCT":
-            return val in ("(", ",", ";", "=", "{", "}")
-        if kind == "IDENT":
-            return val in _REGEX_PREV_KW
+    sig = _sig_tokens_tail(tokens, 2)
+    if not sig:
+        return True
+    kind, val, _ = sig[0]
+    if kind in ("TPL", "TPL_MID", "CTRL_CLOSE"):
+        return True
+    if kind == "OP":
+        return val in _REGEX_PREV_OP
+    if kind == "PUNCT":
+        return val in _REGEX_PREV_PUNCT
+    if kind == "IDENT":
+        if len(sig) >= 2 and sig[1] == ("PUNCT", ".", sig[1][2]):
+            return False
+        return val in _REGEX_PREV_KW
+    return False
+
+
+def _is_ctrl_paren_open(tokens: list[tuple[str, str, int]]) -> bool:
+    sig = _sig_tokens_tail(tokens, 3)
+    if not sig or sig[0][0] != "IDENT":
         return False
-    return True
+    if sig[0][1] in _CTRL_KW:
+        return not (len(sig) >= 2 and sig[1][0] == "PUNCT" and sig[1][1] == ".")
+    if sig[0][1] == "await" and len(sig) >= 2 and sig[1][0] == "IDENT" and sig[1][1] == "for":
+        return not (len(sig) >= 3 and sig[2][0] == "PUNCT" and sig[2][1] == ".")
+    return False
+
+
+def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
+    """Speculatively scan single-line `/pattern/flags`; return next index or None if unterminated."""
+    i = start + 1
+    n = len(text)
+    in_cls = False
+    while i < n:
+        rc = text[i]
+        if rc == "\\" and i + 1 < n:
+            if text[i + 1] in ("\n", "\r"):
+                return None
+            i += 2
+            continue
+        if rc in ("\n", "\r"):
+            return None
+        if rc == "[":
+            in_cls = True
+        elif rc == "]":
+            in_cls = False
+        elif rc == "/" and not in_cls:
+            i += 1
+            while i < n and text[i].isalpha():
+                i += 1
+            return i
+        i += 1
+    return None
 
 
 def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
     """Lex JS/TS outside comments, strings, regexes, and template text so literals never look like imports."""
     tokens: list[tuple[str, str, int]] = []
     tpl_braces: list[int] = []
+    paren_ctrl: list[bool] = []
     i = 0
     n = len(text)
     lineno = 1
@@ -365,30 +433,11 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
                     i += 1
                 continue
         if ch == "/" and _js_allows_regex(tokens):
-            start_line = lineno
-            i += 1
-            in_cls = False
-            while i < n:
-                rc = text[i]
-                if rc == "\\" and i + 1 < n:
-                    if text[i + 1] == "\n":
-                        break
-                    i += 2
-                    continue
-                if rc == "\n":
-                    break
-                if rc == "[":
-                    in_cls = True
-                elif rc == "]":
-                    in_cls = False
-                elif rc == "/" and not in_cls:
-                    i += 1
-                    while i < n and text[i].isalpha():
-                        i += 1
-                    break
-                i += 1
-            tokens.append(("OP", "/re/", start_line))
-            continue
+            end = _try_scan_js_regex(text, i, lineno)
+            if end is not None:
+                tokens.append(("REGEX", "/re/", lineno))
+                i = end
+                continue
         if ch in ("'", '"'):
             q = ch
             start_line = lineno
@@ -433,14 +482,60 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             if tpl_braces:
                 if tpl_braces[-1] == 0:
                     tpl_braces.pop()
-                    tokens.append(("PUNCT", "}", lineno))
+                    end_line = lineno
                     _, i, lineno, interp = _scan_template_tail(text, i + 1, lineno, first=False)
                     if interp:
                         tpl_braces.append(0)
+                        tokens.append(("TPL_MID", "}${", end_line))
+                    else:
+                        tokens.append(("TPL_END", "`", end_line))
                     continue
                 tpl_braces[-1] -= 1
             tokens.append(("PUNCT", "}", lineno))
             i += 1
+            continue
+        if ch == "(":
+            paren_ctrl.append(_is_ctrl_paren_open(tokens))
+            tokens.append(("PUNCT", "(", lineno))
+            i += 1
+            continue
+        if ch == ")":
+            is_ctrl = paren_ctrl.pop() if paren_ctrl else False
+            tokens.append(("CTRL_CLOSE" if is_ctrl else "PUNCT", ")", lineno))
+            i += 1
+            continue
+        if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
+            start = i
+            start_line = lineno
+            is_dec = True
+            if ch == ".":
+                i += 1
+                while i < n and (text[i].isdigit() or text[i] == "_"):
+                    i += 1
+            elif ch == "0" and i + 1 < n and text[i + 1] in ("x", "X", "b", "B", "o", "O"):
+                is_dec = False
+                i += 2
+                while i < n and text[i] in "0123456789abcdefABCDEF_":
+                    i += 1
+            else:
+                i += 1
+                while i < n and (text[i].isdigit() or text[i] == "_"):
+                    i += 1
+                if i < n and text[i] == ".":
+                    i += 1
+                    while i < n and (text[i].isdigit() or text[i] == "_"):
+                        i += 1
+            if is_dec and i < n and text[i] in ("e", "E"):
+                exp = i + 1
+                if exp < n and text[exp] in ("+", "-"):
+                    exp += 1
+                if exp < n and text[exp].isdigit():
+                    i = exp
+                    while i < n and (text[i].isdigit() or text[i] == "_"):
+                        i += 1
+            if i < n and text[i] == "n":
+                i += 1
+            tokens.append(("NUM", text[start:i], start_line))
             continue
         if ch.isalpha() or ch in ("_", "$"):
             start = i
@@ -450,7 +545,16 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
                 i += 1
             tokens.append(("IDENT", text[start:i], start_line))
             continue
-        if ch in (";", "(", ")", ".", "=", ","):
+        matched_op = ""
+        for mop in _MULTI_OPS:
+            if text.startswith(mop, i):
+                matched_op = mop
+                break
+        if matched_op:
+            tokens.append(("OP", matched_op, lineno))
+            i += len(matched_op)
+            continue
+        if ch in (";", "[", "]", ".", "=", ",", ":", "?"):
             tokens.append(("PUNCT", ch, lineno))
         else:
             tokens.append(("OP", ch, lineno))
@@ -481,8 +585,10 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                 stmt_start = True
             i += 1
             continue
-        if kind == "PUNCT" and val in ("(", ")"):
-            paren_depth += 1 if val == "(" else -1
+        if kind == "PUNCT" and val == "(":
+            paren_depth += 1
+        elif (kind == "PUNCT" and val == ")") or kind == "CTRL_CLOSE":
+            paren_depth -= 1
             if paren_depth < 0:
                 paren_depth = 0
         elif kind == "PUNCT" and val in ("{", "}"):
