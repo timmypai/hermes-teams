@@ -4498,7 +4498,7 @@ def cmd_tick(a) -> None:
     if not a.board:
         die("usage: devflow tick BOARD  (or --hook)")
     # One waiting tick per board; ticks of different boards wait for each other (they share tick.json).
-    # Skipping on the shared lock starved boards: a board whose own tick writes to it (devflow-smoke)
+    # Skipping on the shared lock starved boards: a board whose own tick writes to it (e.g. an active smoke board)
     # changed every time and always held the lock when the next board's hook fired (2026-11-18).
     mine = open(ROOT / "state" / f"tick-{a.board}.lock", "w")
     try:
