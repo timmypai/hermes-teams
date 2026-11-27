@@ -545,17 +545,198 @@ def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
     return None
 
 
-def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
-    """Lex JS/TS outside comments, strings, regexes, and template text so literals never look like imports."""
+_JSX_CLOSE_TAG_RE = re.compile(r"</\s*([A-Za-z_$][\w$.-]*)?\s*>")
+_JSX_CLOSE_TAG_AT_RE = re.compile(r"</([ \t\r\n]*)([A-Za-z_$][\w$.-]*)?([ \t\r\n]*)>")
+
+
+def _last_jsx_closes(text: str) -> dict[str, int]:
+    """Map each JSX tag name (`""` for fragments) to its latest closing tag offset, or empty if none."""
+    if "</" not in text:
+        return {}
+    out: dict[str, int] = {}
+    for m in _JSX_CLOSE_TAG_RE.finditer(text):
+        out[m.group(1) or ""] = m.end()
+    return out
+
+
+def _scan_jsx_attr_string(text: str, start: int, lineno: int) -> tuple[int, int] | None:
+    """Scan `'...'` or `"..."` inside a JSX attribute; return `(next_idx, next_line)` or None if unclosed."""
+    q = text[start]
+    i = start + 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "\n":
+                lineno += 1
+            i += 2
+            continue
+        if c == q:
+            return i + 1, lineno
+        if c == "\n":
+            lineno += 1
+        i += 1
+    return None
+
+
+def _scan_jsx_open_tag(
+    text: str,
+    lt_idx: int,
+    lineno: int,
+    jsx_closes: dict[str, int],
+) -> tuple[str, bool, int, int, list[tuple[str, str, int]]] | None:
+    """Scan `<Tag ...>` / `<Tag .../>` / `<>`; return `(tag, self_closing, next_i, next_line, prop_tokens)` or None."""
+    n = len(text)
+    p = lt_idx + 1
+    if p >= n:
+        return None
+    if text[p] == ">":
+        return "", False, p + 1, lineno, []
+    if not (text[p].isalpha() or text[p] in ("_", "$")):
+        return None
+    q = p + 1
+    while q < n and (text[q].isalnum() or text[q] in ("_", "$", ".", "-")):
+        q += 1
+    tag_name = text[p:q]
+    p = q
+    if p < n and not (text[p] in (" ", "\t", "\r", "\n", ">", "/", "<")):
+        return None
+
+    prop_tokens: list[tuple[str, str, int]] = []
+    angle = 0
+    while p < n:
+        ch = text[p]
+        if ch in (" ", "\t", "\r"):
+            p += 1
+            continue
+        if ch == "\n":
+            lineno += 1
+            p += 1
+            continue
+        if ch == "<":
+            angle += 1
+            p += 1
+            continue
+        if ch == ">":
+            if angle > 0:
+                angle -= 1
+                p += 1
+                continue
+            return tag_name, False, p + 1, lineno, prop_tokens
+        if ch in ("'", '"'):
+            s_res = _scan_jsx_attr_string(text, p, lineno)
+            if s_res is None:
+                return None
+            p, lineno = s_res
+            continue
+        if ch == "{":
+            attr_line = lineno
+            inner_toks, p, lineno, closed = _tokenize_js_span(
+                text, p + 1, lineno, stop_on_rbrace=True, jsx_closes=jsx_closes,
+            )
+            if not closed:
+                return None
+            prop_tokens.append(("PUNCT", "{", attr_line))
+            prop_tokens.extend(inner_toks)
+            prop_tokens.append(("PUNCT", "}", lineno))
+            continue
+        if angle > 0:
+            if ch == ";":
+                return None
+            p += 1
+            continue
+        if ch == "/":
+            if p + 1 < n and text[p + 1] == ">":
+                return tag_name, True, p + 2, lineno, prop_tokens
+            return None
+        if ch.isalnum() or ch in ("_", "$", "-", "=", ".", ":"):
+            p += 1
+            continue
+        return None
+    return None
+
+
+def _try_scan_jsx(
+    text: str,
+    start_lt: int,
+    lineno: int,
+    jsx_closes: dict[str, int],
+) -> tuple[list[tuple[str, str, int]], int, int] | None:
+    """Speculatively scan a JSX element or fragment so JSX child text apostrophes/quotes never start JS strings."""
+    head = _scan_jsx_open_tag(text, start_lt, lineno, jsx_closes)
+    if head is None:
+        return None
+    tag_name, self_closing, i, cur_line, toks_out = head
+    if self_closing:
+        return toks_out, i, cur_line
+    if jsx_closes.get(tag_name, -1) < i:
+        return None
+
+    stack = [tag_name]
+    n = len(text)
+    while stack and i < n:
+        ch = text[i]
+        if ch == "\n":
+            cur_line += 1
+            i += 1
+            continue
+        if ch == "{":
+            expr_line = cur_line
+            inner_toks, next_i, next_line, closed = _tokenize_js_span(
+                text, i + 1, cur_line, stop_on_rbrace=True, jsx_closes=jsx_closes,
+            )
+            if not closed:
+                return None
+            toks_out.append(("PUNCT", "{", expr_line))
+            toks_out.extend(inner_toks)
+            toks_out.append(("PUNCT", "}", next_line))
+            i, cur_line = next_i, next_line
+            continue
+        if ch == "<" and i + 1 < n:
+            if text.startswith("</", i):
+                m = _JSX_CLOSE_TAG_AT_RE.match(text, i)
+                if m and (m.group(2) or "") == stack[-1]:
+                    cur_line += text.count("\n", i, m.end())
+                    i = m.end()
+                    stack.pop()
+                    continue
+            elif text[i + 1] == ">" or text[i + 1].isalpha() or text[i + 1] in ("_", "$"):
+                child = _scan_jsx_open_tag(text, i, cur_line, jsx_closes)
+                if child is not None:
+                    ctag, cself, ci, cline, ctoks = child
+                    if cself:
+                        toks_out.extend(ctoks)
+                        i, cur_line = ci, cline
+                        continue
+                    if jsx_closes.get(ctag, -1) >= ci:
+                        toks_out.extend(ctoks)
+                        stack.append(ctag)
+                        i, cur_line = ci, cline
+                        continue
+        i += 1
+    if stack:
+        return None
+    return toks_out, i, cur_line
+
+
+def _tokenize_js_span(
+    text: str,
+    start: int = 0,
+    lineno: int = 1,
+    *,
+    stop_on_rbrace: bool = False,
+    jsx_closes: dict[str, int] | None = None,
+) -> tuple[list[tuple[str, str, int]], int, int, bool]:
+    """Tokenize JS/TS/JSX from `start`, optionally stopping on an unmatched `}` (for `{expr}` spans)."""
     tokens: list[tuple[str, str, int]] = []
     tpl_braces: list[int] = []
     paren_ctrl: list[bool] = []
     brace_kinds: list[str] = []
     expr_head_depths: list[tuple[int, int]] = []
     ternary_depths: list[tuple[int, int]] = []
-    i = 0
+    closes = _last_jsx_closes(text) if jsx_closes is None else jsx_closes
+    i = start
     n = len(text)
-    lineno = 1
     while i < n:
         ch = text[i]
         if ch in (" ", "\t", "\r"):
@@ -589,6 +770,14 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             if end is not None:
                 tokens.append(("REGEX", "/re/", lineno))
                 i = end
+                continue
+        if ch == "<" and _js_allows_regex(tokens):
+            jsx = _try_scan_jsx(text, i, lineno, closes)
+            if jsx is not None:
+                jtoks, jend, jline = jsx
+                tokens.extend(jtoks)
+                tokens.append(("JSX_CLOSE", ">", jline))
+                i, lineno = jend, jline
                 continue
         if ch in ("'", '"'):
             q = ch
@@ -645,6 +834,8 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
                         tokens.append(("TPL_END", "`", end_line))
                     continue
                 tpl_braces[-1] -= 1
+            if stop_on_rbrace and not brace_kinds:
+                return tokens, i + 1, lineno, True
             bkind = brace_kinds.pop() if brace_kinds else "block"
             _prune_depths(ternary_depths, expr_head_depths, len(paren_ctrl), len(brace_kinds), strict=True)
             tokens.append(("EXPR_RBRACE" if bkind != "block" else "PUNCT", "}", lineno))
@@ -686,7 +877,7 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             i += 1
             continue
         if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
-            start = i
+            start_num = i
             start_line = lineno
             is_dec = True
             if ch == ".":
@@ -716,15 +907,15 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
                         i += 1
             if i < n and text[i] == "n":
                 i += 1
-            tokens.append(("NUM", text[start:i], start_line))
+            tokens.append(("NUM", text[start_num:i], start_line))
             continue
         if ch.isalpha() or ch in ("_", "$"):
-            start = i
+            start_id = i
             start_line = lineno
             i += 1
             while i < n and (text[i].isalnum() or text[i] in ("_", "$")):
                 i += 1
-            ident = text[start:i]
+            ident = text[start_id:i]
             if ident in ("function", "class") and _is_fn_class_expr(tokens, ident, brace_kinds):
                 expr_head_depths.append((len(paren_ctrl), len(brace_kinds)))
             tokens.append(("IDENT", ident, start_line))
@@ -743,7 +934,12 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
         else:
             tokens.append(("OP", ch, lineno))
         i += 1
-    return tokens
+    return tokens, i, lineno, not stop_on_rbrace
+
+
+def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
+    """Lex JS/TS outside comments, strings, regexes, templates, and JSX text so literals never look like imports."""
+    return _tokenize_js_span(text)[0]
 
 
 def _extract_js_imports(text: str) -> list[tuple[int, str]]:

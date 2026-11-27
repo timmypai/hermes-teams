@@ -226,6 +226,9 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                 "web/div_prop.ts": 'const q = cfg.default / 2; import p from "infra/after_kw_prop";\n',
                 "web/div_jsx.tsx": 'const el = <div>a</div><div>b</div>; import j from "infra/after_jsx";\n',
                 "web/div_jsx_self.tsx": 'const el = <Box /> / 2; import j2 from "infra/after_jsx_self";\n',
+                "web/jsx_apostrophe.tsx": 'const el = <div>don\'t</div>; import x from "infra/after_jsx_apo";\n',
+                "web/jsx_quote.tsx": 'const el = <>Say "hi {await import("infra/inside_jsx")}</>; const r = await import("infra/after_jsx_q");\n',
+                "web/ts_cast_apo.ts": 'const s = <string>\'ok\'; const q = <T>(x: T) => x; import y from "infra/after_ts_cast";\n',
                 "src/broken.py": "def bad(:\n",
             },
         )
@@ -247,8 +250,12 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
             "web/div_prop.ts",
             "web/div_jsx.tsx",
             "web/div_jsx_self.tsx",
+            "web/jsx_apostrophe.tsx",
+            "web/jsx_quote.tsx",
+            "web/ts_cast_apo.ts",
         ):
             self.assertIn(bad_js, by_file, bad_js)
+        self.assertEqual(by_file["web/jsx_quote.tsx"]["match"], "infra/inside_jsx")
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
 
     def test_preflight_enforces_repo_diff_policy_rules(self) -> None:

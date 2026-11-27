@@ -519,6 +519,8 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         self.write("web/div_prop.ts", 'const d = cfg.default / 2; import p from "infra/p";\n')
         self.write("web/div_jsx.tsx", 'const el = <div>a</div><div>b</div>; import j from "infra/jsx";\n')
         self.write("web/div_jsx_self.tsx", 'const el = <Box /> / 2; import j2 from "infra/jsx2";\n')
+        self.write("web/jsx_apostrophe.tsx", 'const el = <div>don\'t</div>; import j3 from "infra/jsx_apo";\n')
+        self.write("web/jsx_quote.tsx", 'const el = <p>Say "hi</p>; const m = await import("infra/jsx_q");\n')
         self.write("domain/broken.py", "def broken(:\n")
         code, out = self.check()
         self.assertEqual(code, 1, out)
@@ -536,6 +538,8 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/div_prop.ts",
             "web/div_jsx.tsx",
             "web/div_jsx_self.tsx",
+            "web/jsx_apostrophe.tsx",
+            "web/jsx_quote.tsx",
         ):
             self.assertIn(f"{bad_js}:1 [domain-boundary]", out, bad_js)
         self.assertIn("web/div_block_obj.ts:2 [domain-boundary]", out)
@@ -557,6 +561,8 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/div_prop.ts",
             "web/div_jsx.tsx",
             "web/div_jsx_self.tsx",
+            "web/jsx_apostrophe.tsx",
+            "web/jsx_quote.tsx",
         ):
             self.write(bad_js, "export const ok = 1;\n")
         self.write("domain/broken.py", "X = 1\n")
