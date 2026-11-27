@@ -4,9 +4,11 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
+from . import lint_engine
 from .policy import (
     env_values,
     load_repo_config,
@@ -39,6 +41,24 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
 
 def _git_bytes(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo_dir), *args], capture_output=True)
+
+
+def _git_numstat(repo_dir: Path, base_ref: str) -> dict[str, int]:
+    """Return `{repo_rel_path: added_lines}` between `base_ref` and HEAD."""
+    p = _git_bytes(repo_dir, "diff", "--no-renames", "--numstat", "-z", f"{base_ref}...HEAD")
+    if p.returncode != 0:
+        p = _git_bytes(repo_dir, "diff", "--no-renames", "--numstat", "-z", base_ref, "HEAD")
+    if p.returncode != 0 or not p.stdout:
+        return {}
+    stats: dict[str, int] = {}
+    for raw_entry in p.stdout.split(b"\x00"):
+        if not raw_entry or b"\t" not in raw_entry:
+            continue
+        rec = os.fsdecode(raw_entry)
+        parts = rec.split("\t", 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            stats[lint_engine._strip_rel_prefix(parts[2])] = int(parts[0])
+    return stats
 
 
 def _parse_status_porcelain_z(raw: bytes) -> list[str]:
@@ -236,6 +256,34 @@ def run_preflight(
         checks["standard_delivery"] = "ok" if standard_delivery["ok"] else "fail"
     else:
         checks["standard_delivery"] = "ok"
+
+    # 4c. Declarative diff_policy / diff_budget rules under .devflow/rules/*.toml
+    rules_dir = repo_dir / ".devflow" / "rules"
+    if rules_dir.is_dir():
+        dp_rules: list[lint_engine.LintRule] = []
+        dp_findings: list[str] = []
+        for rp in sorted(rules_dir.glob("*.toml")):
+            try:
+                raw_toml = tomllib.loads(rp.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
+                dp_findings.append(f"規則檔 {rp.name} 無法解析：{err}")
+                continue
+            rkind = str(raw_toml.get("kind") or "regex").strip().lower()
+            if rkind not in lint_engine.DIFF_KINDS:
+                continue
+            try:
+                dp_rules.append(lint_engine.load_rule(rp))
+            except lint_engine.LintConfigError as err:
+                dp_findings.append(str(err))
+        if dp_rules:
+            numstat = _git_numstat(repo_dir, base_ref)
+            for hit in lint_engine.evaluate_diff_policy(
+                dp_rules, changed_files=[f["filename"] for f in files], numstat=numstat
+            ):
+                dp_findings.append(hit["detail"])
+        if dp_rules or dp_findings:
+            findings.extend(dp_findings)
+            checks["diff_policy"] = "fail" if dp_findings else "ok"
 
     # 5. PR title & body checks (fix -> Lesson, Covers -> valid scenario IDs)
     pr_findings: list[str] = []

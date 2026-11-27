@@ -85,6 +85,10 @@ DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, list[str]]] = {
         "required": ["pr_url", "head_sha", "tests"],
         "optional": ["published_pr", "changed_files", "followups"],
     },
+    "implement_local": {
+        "required": ["branch", "head_sha", "tests", "changed_files"],
+        "optional": ["base_ref", "summary", "followups"],
+    },
     "ship": {
         "required": ["merged_sha"],
         "optional": ["deployed_sha", "acceptance_report", "followups"],

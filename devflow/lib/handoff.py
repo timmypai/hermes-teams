@@ -4,12 +4,53 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from lib import policy as policy_lib
-from lib import scope as scope_lib
+from . import policy as policy_lib
+from . import scope as scope_lib
 
 _EPIC_ACCEPT_HEADING_RE = re.compile(r"^##\s*驗收[ \t]*$", re.M)
 _NEXT_HEADING_RE = re.compile(r"^##\s+\S", re.M)
 _BULLET_PREFIX_RE = re.compile(r"^\s*[-*]\s+")
+CARD_KIND_STEPS: dict[str, str] = {
+    "RES": "repro",
+    "ARCH": "design",
+    "DEV": "implement",
+    "OPS": "implement",
+    "SHIP": "ship",
+}
+
+
+def step_for_card_kind(kind: str) -> str | None:
+    """Map a card prefix (`RES`/`ARCH`/`DEV`/`OPS`/`SHIP`) to its handoff schema step name."""
+    return CARD_KIND_STEPS.get((kind or "").strip().upper())
+
+
+def validate_card_handoff(
+    kind: str,
+    metadata: Any,
+    policy: dict[str, Any] | None = None,
+    *,
+    step: str | None = None,
+) -> list[str]:
+    """Validate structured `metadata` for a completed or checkpointed card based on its card kind."""
+    upper = (kind or "").strip().upper()
+    step_override = (step or "").strip().lower()
+    if step_override == "implement_local":
+        if upper not in ("DEV", "OPS"):
+            return [f"[{upper or '?'}] 卡型不支援 `implement_local` 本機實作 checkpoint"]
+        return validate_handoff("implement_local", metadata, policy)
+    if upper == "ARCH":
+        if step_override and step_override != "design":
+            return [f"[ARCH] 不支援步驟 '{step_override}'（預期 design）"]
+        _, errs = validate_arch_handoff(metadata, policy)
+        return errs
+    default_step = step_for_card_kind(upper)
+    if step_override:
+        if not default_step or step_override != default_step:
+            return [f"[{upper or '?'}] 卡型預期步驟 '{default_step or 'none'}'，與指定 '{step_override}' 不符"]
+        return validate_handoff(default_step, metadata, policy)
+    if not default_step:
+        return []
+    return validate_handoff(default_step, metadata, policy)
 
 
 def _is_empty_handoff_value(value: Any) -> bool:
@@ -141,8 +182,31 @@ def missing_arch_scope_files(
     return missing
 
 
-def _wildcard_prefix(pat: str) -> str:
-    return pat.split("*", 1)[0].rstrip("/")
+def _glob_bounds(raw_pat: str) -> tuple[str, str | None]:
+    """Return `(literal_prefix, required_extension_or_none)` for paths matched by `scope.match_glob`."""
+    raw = (raw_pat or "").strip().strip("`'\"")
+    trailing_slash = raw.endswith("/")
+    pat = _normalize_glob_token(raw)
+    if not pat:
+        return "", None
+    if trailing_slash:
+        return pat + "/", None
+    wild_idxs = [pat.find(ch) for ch in ("*", "?", "[") if ch in pat]
+    if not wild_idxs:
+        # `scope.match_glob` matches both exact `pat` and every descendant `pat/...`.
+        return pat + "/", None
+    idx = min(wild_idxs)
+    leaf = pat.rsplit("/", 1)[-1] or "*"
+    return pat[:idx], _leaf_ext(leaf)
+
+
+def _leaf_ext(leaf: str) -> str | None:
+    if "." not in leaf or leaf in (".", ".."):
+        return None
+    ext = leaf.rsplit(".", 1)[-1].lower()
+    if not ext or any(ch in ext for ch in ("*", "?", "[")):
+        return None
+    return "." + ext
 
 
 def _globs_overlap(a: str, b: str) -> bool:
@@ -152,15 +216,13 @@ def _globs_overlap(a: str, b: str) -> bool:
         return False
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
-    a_is_wild = "*" in pa or a.strip().endswith("/")
-    b_is_wild = "*" in pb or b.strip().endswith("/")
-    a_pre = _wildcard_prefix(pa)
-    b_pre = _wildcard_prefix(pb)
-    if a_is_wild and a_pre and (pb == a_pre or pb.startswith(a_pre + "/")):
-        return True
-    if b_is_wild and b_pre and (pa == b_pre or pa.startswith(b_pre + "/")):
-        return True
-    return False
+    lit_a, ext_a = _glob_bounds(a)
+    lit_b, ext_b = _glob_bounds(b)
+    if not (lit_a.startswith(lit_b) or lit_b.startswith(lit_a)):
+        return False
+    if ext_a and ext_b and ext_a != ext_b:
+        return False
+    return True
 
 
 def merge_allowed_scope_into_body(

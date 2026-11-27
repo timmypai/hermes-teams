@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from lib import policy as policy_lib
+from . import policy as policy_lib
 
 PIPELINE_RE = re.compile(r"^\s*Pipeline[：:]\s*([A-Za-z0-9_-]+)\s*$", re.M | re.I)
 START_AT_RE = re.compile(r"^\s*Start-At[：:]\s*([A-Za-z0-9_-]+)\s*$", re.M | re.I)
@@ -216,6 +216,148 @@ def is_card_beyond_stop(
     if not step or step not in steps:
         return False
     return steps.index(step) > steps.index(stop_after)
+
+
+def card_step_span(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> tuple[int, int] | None:
+    """Return inclusive `(start_idx, end_idx)` in `spec['steps']` owned by `kind`.
+
+    A card type owns from its mapped step through any immediately following steps that have no
+    separate card entry in `step_cards` (for example, `DEV`/`OPS` at `implement` remain active
+    through `ci` and `review` before `SHIP` takes over at `ship`).
+    """
+    if not spec.get("valid", True):
+        return None
+    steps = list(spec.get("steps") or [])
+    start_step = card_step_for_kind(kind, spec, policy)
+    if not start_step or start_step not in steps:
+        return None
+    lo = steps.index(start_step)
+    pipe_cfg = policy_lib.pipelines_config(policy).get(spec.get("pipeline") or "") or {}
+    assigned_steps = {str(k).strip().lower() for k, v in (pipe_cfg.get("step_cards") or {}).items() if v}
+    hi = lo
+    while hi + 1 < len(steps) and steps[hi + 1] not in assigned_steps:
+        hi += 1
+    return lo, hi
+
+
+def is_card_before_start(
+    kind: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    """True when `spec` is valid and `kind`'s entire lifecycle span lies strictly before `spec['start_at']`."""
+    span = card_step_span(kind, spec, policy)
+    if span is None:
+        return False
+    steps = list(spec.get("steps") or [])
+    start_at = str(spec.get("start_at") or "").strip().lower()
+    if start_at not in steps:
+        return False
+    return span[1] < steps.index(start_at)
+
+
+def is_step_active(step: str, spec: dict[str, Any]) -> bool:
+    """True when `spec` is valid and `step` is inside the EPIC's active slice."""
+    if not spec.get("valid", True):
+        return False
+    target = (step or "").strip().lower()
+    return target in {str(s).strip().lower() for s in (spec.get("active_steps") or [])}
+
+
+def mark_epic_paused_at(
+    epic_body: str | None,
+    step: str,
+    policy: dict[str, Any] | None = None,
+    *,
+    epic_mode: str = "deliver",
+) -> tuple[str, dict[str, Any]]:
+    """Record idempotent `Paused-At: <step>` header on an EPIC body without duplicating headers."""
+    text = epic_body or ""
+    spec = parse_epic_pipeline(text, policy, epic_mode=epic_mode)
+    if not spec["valid"]:
+        raise ValueError("EPIC Pipeline 設定無效：" + "；".join(spec["problems"]))
+    target = (step or "").strip().lower()
+    if target not in spec["steps"]:
+        raise ValueError(f"Paused-At '{target}' 不在 {spec['pipeline']} 步驟中")
+
+    kept = [line for line in text.splitlines() if not PAUSED_AT_RE.match(line)]
+    insert_at = 0
+    for idx, line in enumerate(kept):
+        if _EXPLICIT_MODE_RE.match(line) or PIPELINE_RE.match(line) or START_AT_RE.match(line) or STOP_AFTER_RE.match(line):
+            insert_at = idx + 1
+        elif line.strip():
+            break
+    kept.insert(insert_at, f"Paused-At: {target}")
+    new_body = "\n".join(kept).rstrip() + "\n"
+    return new_body, parse_epic_pipeline(new_body, policy, epic_mode=epic_mode)
+
+
+def slice_stop_reached(
+    cards: dict[str, dict[str, Any]],
+    epic: str,
+    spec: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+    *,
+    step_evidence: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    """True when a partial pipeline (`stop_after != terminal`) has satisfied every card overlapping `active_steps`.
+
+    Cards whose span continues beyond `stop_after` (such as `[DEV]`/`[OPS]` across `implement -> ci -> review`
+    under `Stop-After: ci`) count as completed up to `stop_after` when they are already in `review` with
+    verified exact-head `step_evidence` for `stop_after`.
+    """
+    if not spec.get("valid"):
+        return False
+    steps = list(spec.get("steps") or [])
+    start_at = str(spec.get("start_at") or "").strip().lower()
+    stop_after = str(spec.get("stop_after") or "").strip().lower()
+    if not steps or start_at not in steps or stop_after not in steps or stop_after == steps[-1]:
+        return False
+    s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
+    ev_map = step_evidence or {}
+    has_cards = False
+    for cid, c in cards.items():
+        if cid == epic or c.get("status") == "archived":
+            continue
+        title = str(c.get("title") or "").lstrip()
+        kind = title[1:].split("]", 1)[0] if title.startswith("[") and "]" in title else ""
+        span = card_step_span(kind, spec, policy)
+        if span is None or span[1] < s_idx or span[0] > e_idx:
+            continue
+        has_cards = True
+        status = str(c.get("status") or "").strip().lower()
+        if status in ("done", "archived"):
+            continue
+        if span[0] <= e_idx < span[1]:
+            ev = ev_map.get(cid)
+            if (
+                stop_after == "ci"
+                and status == "review"
+                and isinstance(ev, dict)
+                and str(ev.get("step") or "").strip().lower() == "ci"
+                and ev.get("ok") is True
+                and bool(str(ev.get("head_sha") or "").strip())
+                and ev.get("pr_number") is not None
+            ):
+                continue
+            if (
+                stop_after == "implement"
+                and status == "blocked"
+                and str(c.get("block_kind") or "").strip().lower() == "dependency"
+                and isinstance(ev, dict)
+                and str(ev.get("step") or "").strip().lower() == "implement"
+                and ev.get("ok") is True
+                and ev.get("local_only") is True
+                and bool(str(ev.get("head_sha") or "").strip())
+                and bool(str(ev.get("branch") or "").strip())
+            ):
+                continue
+        return False
+    return has_cards
 
 
 def is_user_paused_card(task: dict[str, Any]) -> bool:

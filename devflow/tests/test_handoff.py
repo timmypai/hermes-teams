@@ -33,10 +33,35 @@ class HandoffValidation(unittest.TestCase):
             "repro": {"root_cause": "timeout on /v1/foo", "evidence": ["logs/1.txt"]},
             "design": {"decisions": ["split queue"], "target_files": ["app/q.py", "app/worker.py"]},
             "implement": {"pr_url": "https://github.com/o/r/pull/1", "head_sha": "a" * 40, "tests": "12 passed"},
+            "implement_local": {
+                "branch": "wt/t_dev1", "head_sha": "c" * 40, "tests": ["pytest -> pass"], "changed_files": ["app/q.py"],
+            },
             "ship": {"merged_sha": "b" * 40},
         }
         for step, meta in cases.items():
             self.assertEqual(handoff_lib.validate_handoff(step, meta, self.policy), [], step)
+
+    def test_implement_local_schema_and_step_override(self) -> None:
+        local_meta = {
+            "branch": "wt/t_dev1",
+            "head_sha": "c" * 40,
+            "tests": ["check.sh=pass"],
+            "changed_files": ["app/a.py"],
+        }
+        self.assertEqual(handoff_lib.validate_handoff("implement_local", local_meta, self.policy), [])
+        self.assertEqual(handoff_lib.validate_card_handoff("DEV", local_meta, self.policy, step="implement_local"), [])
+        self.assertEqual(handoff_lib.validate_card_handoff("OPS", local_meta, self.policy, step="implement_local"), [])
+        # Default DEV completion still requires PR metadata
+        default_errs = handoff_lib.validate_card_handoff("DEV", local_meta, self.policy)
+        self.assertTrue(any("pr_url" in e for e in default_errs), default_errs)
+        # Missing tests or changed_files fails implement_local
+        no_tests = handoff_lib.validate_handoff("implement_local", {**local_meta, "tests": []}, self.policy)
+        self.assertTrue(any("tests" in e for e in no_tests), no_tests)
+        no_files = handoff_lib.validate_handoff("implement_local", {**local_meta, "changed_files": []}, self.policy)
+        self.assertTrue(any("changed_files" in e for e in no_files), no_files)
+        # Other card kinds reject implement_local
+        self.assertTrue(handoff_lib.validate_card_handoff("RES", local_meta, self.policy, step="implement_local"))
+        self.assertTrue(handoff_lib.validate_card_handoff("SHIP", local_meta, self.policy, step="implement_local"))
 
     def test_missing_or_empty_required_fields_and_broad_target_files_fail(self) -> None:
         errs = handoff_lib.validate_handoff("design", {"decisions": ["x"], "target_files": []}, self.policy)
@@ -121,12 +146,58 @@ class AtomicScopeMerge(unittest.TestCase):
             "Out-of-Scope: secrets/**, infra/prod.yml\n"
             "EPIC: t_ep1\n"
         )
-        epic_body = "## 目標\nx\n## 不能碰\n- `deploy/**` 與 `auth/keys.json`\n"
-        for bad in (["*"], ["**/*"], ["."], ["secrets/api.key"], ["infra/**"], ["deploy/compose.yml"], ["auth/keys.json"]):
+        epic_body = "## 目標\nx\n## 不能碰\n- `deploy/**` 與 `auth/keys.json` 與 `**/*.env` 與 `**/seccomp*.json` 與 `*.yml` 與 `app/secret*.py`\n"
+        for bad in (
+            ["*"], ["**/*"], ["."], ["secrets/api.key"], ["infra/**"], ["deploy/compose.yml"], ["auth/keys.json"],
+            ["config"], ["config.v1"], ["config/"], ["config/**"], ["docker/**"], ["deploy/**"], ["app/secret_cfg.py"],
+        ):
             with self.assertRaises(ValueError, msg=str(bad)):
                 handoff_lib.merge_allowed_scope_into_body(body, bad, epic_body=epic_body)
+        # Disjoint extension-constrained wildcard passes despite **/*.env / *.yml
+        _, ok_py = handoff_lib.merge_allowed_scope_into_body(body, ["src/**/*.py"], epic_body=epic_body)
+        self.assertIn("src/**/*.py", ok_py)
+        # Disjoint concrete file / bare & dotted directories pass against non-leading-wildcard prohibitions
+        _, ok_dir = handoff_lib.merge_allowed_scope_into_body(
+            body, ["app/other.py", "config", "config.v1"], epic_body="## 目標\nx\n## 不能碰\n- `deploy/**` 與 `auth/keys.json` 與 `app/secret*.py`\n",
+        )
+        self.assertEqual(ok_dir, ["app/a.py", "app/other.py", "config", "config.v1"])
         with self.assertRaises(ValueError):
             handoff_lib.merge_allowed_scope_into_body(body, [])
+
+    def test_merge_matches_scope_match_glob_crossing_slash_semantics(self) -> None:
+        base = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: tests/**\nOut-of-Scope: src/private/**\nEPIC: t_ep1\n"
+        # `src/*.py` and bare/dotted directory prefixes overlap `scope.match_glob` and MUST be rejected.
+        env_body = "## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nOut-of-Scope: **/*.env\nEPIC: t_ep1\n"
+        for oos_body, epic_body, bad_add in (
+            (base, None, ["src/*.py"]),
+            (base.replace("src/private/**", "src/private/"), None, ["src/*.py"]),
+            (base.replace("src/private/**", "src/private"), None, ["src/*.py"]),
+            ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: tests/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `src/private/**`\n", ["src/*.py"]),
+            (base.replace("src/private/**", "src/api/**"), None, ["src/a*.py"]),
+            (env_body, None, ["config"]),
+            (env_body, None, ["config.v1"]),
+            (env_body, None, ["config/"]),
+            ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `**/*.env`\n", ["config.v1"]),
+        ):
+            with self.assertRaises(ValueError, msg=f"{oos_body} / {epic_body} + {bad_add}"):
+                handoff_lib.merge_allowed_scope_into_body(oos_body, bad_add, epic_body=epic_body)
+
+        # Genuinely disjoint prefixes/extensions or concrete dirs vs non-intersecting prefixes pass
+        _, ok1 = handoff_lib.merge_allowed_scope_into_body(base, ["tests/unit/*.py"], epic_body=None)
+        self.assertIn("tests/unit/*.py", ok1)
+        py_only_oos = base.replace("src/private/**", "src/private/*.py")
+        _, ok2 = handoff_lib.merge_allowed_scope_into_body(py_only_oos, ["src/private/*.ts"], epic_body=None)
+        self.assertIn("src/private/*.ts", ok2)
+        _, ok_ext = handoff_lib.merge_allowed_scope_into_body(
+            py_only_oos.replace("src/private/*.py", "src/*.py"), ["src/private/*.ts"], epic_body=None,
+        )
+        self.assertIn("src/private/*.ts", ok_ext)
+        _, ok3 = handoff_lib.merge_allowed_scope_into_body(base, ["src/public*.py"], epic_body=None)
+        self.assertIn("src/public*.py", ok3)
+        _, ok4 = handoff_lib.merge_allowed_scope_into_body(env_body, ["tests/**/*.py"], epic_body=None)
+        self.assertIn("tests/**/*.py", ok4)
+        _, ok5 = handoff_lib.merge_allowed_scope_into_body(base, ["config", "config.v1"], epic_body=None)
+        self.assertIn("config.v1", ok5)
 
 
 class BinDevflowHandoffIntegration(unittest.TestCase):
@@ -320,6 +391,128 @@ class BinDevflowHandoffIntegration(unittest.TestCase):
         edit_idx = next(i for i, (c, _) in enumerate(ops_log) if c == "edit")
         unblock_idx = next(i for i, (c, _) in enumerate(ops_log) if c == "unblock")
         self.assertLess(edit_idx, unblock_idx)
+
+        # Non-protected .devflow/verify.sh produces NO protected_warning; .github/workflows/ci.yml & .devflow/** DO preserve leading dot and warn
+        buf_v = io.StringIO()
+        with contextlib.redirect_stdout(buf_v):
+            self.df.cmd_scope_add(types.SimpleNamespace(slug="b", task="t_dev1", add=[".devflow/verify.sh"], note="verify"))
+        out_v = json.loads(buf_v.getvalue())
+        self.assertNotIn("protected_warning", out_v)
+
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            self.df.cmd_scope_add(types.SimpleNamespace(slug="b", task="t_dev1", add=[".github/workflows/ci.yml", ".devflow/**"], note="ci"))
+        out2 = json.loads(buf2.getvalue())
+        self.assertEqual(out2["protected_warning"], [".github/workflows/ci.yml", ".devflow/**"])
+
+    def test_ancestor_arch_chain_step_handoffs_and_cmd_check_handoff(self) -> None:
+        epic_body = (
+            "Mode: deliver\n## 目標\ng\n## 驗收\n- AC-1 [lib] x\n"
+            "  - S1 [smoke]\n    - Given a\n    - When b\n    - Then c\n"
+        )
+        cards = {
+            "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "status": "todo", "assignee": "orchestrator",
+                      "workspace_kind": "dir", "parents": ["t_ship1"], "children": [], "goal_mode": False,
+                      "body": epic_body},
+            "t_arch1": {"id": "t_arch1", "title": "[ARCH] 設計", "status": "done", "assignee": "architect",
+                        "workspace_kind": "dir", "parents": [], "children": ["t_res1"], "goal_mode": False,
+                        "body": "EPIC: t_ep1\n",
+                        "runs": [{"status": "done", "metadata": {
+                            "decisions": ["split a/b"],
+                            "target_files": ["app/a.py", "app/b.py"],
+                        }}]},
+            "t_res1": {"id": "t_res1", "title": "[RES] 追查", "status": "done", "assignee": "researcher",
+                       "workspace_kind": "scratch", "parents": ["t_arch1"], "children": ["t_dev1"], "goal_mode": False,
+                       "body": "EPIC: t_ep1\n",
+                       "runs": [{"status": "done", "metadata": {"root_cause": "race", "evidence": ["log1"]}}]},
+            "t_dev1": {"id": "t_dev1", "title": "[DEV] slice1", "status": "todo", "assignee": "developer",
+                       "workspace_kind": "worktree", "parents": ["t_res1"], "children": ["t_ship1"],
+                       "goal_mode": True, "completion_contract": REPO,
+                       "body": self._dev_body("app/a.py")},
+            "t_ship1": {"id": "t_ship1", "title": "[SHIP] 出貨1", "status": "done", "assignee": "devops",
+                        "workspace_kind": "dir", "parents": ["t_dev1"], "children": ["t_dev2", "t_ep1"],
+                        "goal_mode": False, "body": "EPIC: t_ep1\n", "runs": []},
+        }
+        # [ARCH] -> [RES] -> [DEV] catches missing app/b.py through ancestor traversal
+        found = self.df.plan_rules("b", "t_ep1", cards)
+        self.assertTrue(any("app/b.py" in f and "t_arch1" in f for f in found), found)
+
+        # check card --parent t_res1 also resolves ancestor [ARCH] t_arch1
+        self.df.kanban = lambda b, cmd, tid, *a: json.dumps({"task": cards[tid], "runs": cards[tid].get("runs", [])})
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.df.cmd_check_card(types.SimpleNamespace(
+                board="b", title="[DEV] 實作", body=self._dev_body("app/a.py"),
+                body_file=None, assignee="developer", workspace="worktree", parent=["t_res1"],
+            ))
+
+        # Slice-2 [DEV] downstream of [SHIP] must NOT falsely inherit slice-1 [ARCH] target_files
+        cards["t_dev1"]["body"] = self._dev_body("app/a.py, app/b.py")
+        cards["t_dev1"]["status"] = "done"
+        cards["t_dev1"]["runs"] = [{"status": "done", "metadata": {"pr_url": "https://g/1", "head_sha": "a" * 40, "tests": "ok"}}]
+        cards["t_dev2"] = {"id": "t_dev2", "title": "[DEV] slice2", "status": "todo", "assignee": "developer",
+                           "workspace_kind": "worktree", "parents": ["t_ship1"], "children": ["t_ship2"],
+                           "goal_mode": True, "completion_contract": REPO,
+                           "body": self._dev_body("other/x.py")}
+        cards["t_ship2"] = {"id": "t_ship2", "title": "[SHIP] 出貨2", "status": "todo", "assignee": "devops",
+                            "workspace_kind": "dir", "parents": ["t_dev2"], "children": ["t_ep1"],
+                            "goal_mode": False, "body": "EPIC: t_ep1\n"}
+        cards["t_ep1"]["parents"] = ["t_ship2"]
+        self.assertEqual(self.df.plan_rules("b", "t_ep1", cards), [])
+
+        # Empty, null, list, and non-object JSON string completed handoffs fail closed across RES/DEV/SHIP in plan_rules
+        for bad_meta in ({}, [], None, "[]", "null", "{bad", '"ok"', ""):
+            cards["t_dev1"]["status"] = "todo"
+            cards["t_ship1"]["status"] = "todo"
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_res1" in f and "交接 metadata" in f for f in bad_found), (bad_meta, bad_found))
+            # Also verify empty/non-dict completed metadata on DEV feeding open SHIP, and SHIP feeding open DEV2
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": {"root_cause": "race", "evidence": ["log1"]}}]
+            cards["t_dev1"]["body"] = self._dev_body("app/a.py, app/b.py")
+            cards["t_dev1"]["status"] = "done"
+            cards["t_dev1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            dev_bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_dev1" in f and "交接 metadata" in f for f in dev_bad_found), (bad_meta, dev_bad_found))
+
+            cards["t_dev1"]["runs"] = [{"status": "done", "metadata": {"pr_url": "https://g/1", "head_sha": "a" * 40, "tests": "ok"}}]
+            cards["t_ship1"]["status"] = "done"
+            cards["t_ship1"]["runs"] = [{"status": "done", "metadata": bad_meta}]
+            ship_bad_found = self.df.plan_rules("b", "t_ep1", cards)
+            self.assertTrue(any("t_ship1" in f and "交接 metadata" in f for f in ship_bad_found), (bad_meta, ship_bad_found))
+        cards["t_ship1"]["runs"] = []
+
+        # Verify SQLite task_runs reader preserves [], {}, null, '[]' identically
+        db = self.board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, block_kind TEXT, assignee TEXT);
+            CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, status TEXT, metadata TEXT);
+        """)
+        for raw_json in ("{}", "[]", "null", '"str"', "{bad"):
+            conn.execute("DELETE FROM task_runs")
+            conn.execute("INSERT INTO task_runs (task_id, status, metadata) VALUES ('t_res1', 'done', ?)", (raw_json,))
+            conn.commit()
+            cards_sql = json.loads(json.dumps(cards))
+            cards_sql["t_res1"]["runs"] = []
+            cards_sql["t_dev1"]["status"] = "todo"
+            cards_sql["t_dev1"]["runs"] = []
+            sql_found = self.df.plan_rules("b", "t_ep1", cards_sql)
+            self.assertTrue(any("t_res1" in f and "交接 metadata" in f for f in sql_found), (raw_json, sql_found))
+        conn.close()
+
+        # CLI `cmd_check_handoff` enforces schema strictly via --metadata or card runs
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.df.cmd_check_handoff(types.SimpleNamespace(
+                board="b", task="t_dev1", metadata='{"pr_url":"https://g/1","head_sha":"' + "a" * 40 + '","tests":"5 ok"}',
+                metadata_file=None,
+            ))
+        self.assertTrue(json.loads(buf.getvalue())["ok"])
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            cards["t_res1"]["runs"] = [{"status": "done", "metadata": {"root_cause": "partial"}}]
+            self.df.cmd_check_handoff(types.SimpleNamespace(
+                board="b", task="t_res1", metadata=None, metadata_file=None,
+            ))
 
 
 if __name__ == "__main__":
