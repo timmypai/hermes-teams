@@ -504,11 +504,16 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "if (s) /import\\('infra\\/if_fake'\\)/;\n"
             "if (s) {} /import\\('infra\\/block_fake'\\)/g;\n"
             "function fd() {} /import\\('infra\\/fd_fake'\\)/g;\n"
-            "class Cd {} /import\\('infra\\/cd_fake'\\)/g;\n",
+            "class Cd {} /import\\('infra\\/cd_fake'\\)/g;\n"
+            "const negRe = !/import\\('infra\\/neg_fake'\\)/.test(s);\n"
+            "for (const m of /import\\('infra\\/for_of_fake'\\)/g.exec(s) || []) {}\n",
         )
         self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
         self.write("web/tpl_real.ts", "export const x = `${await import('infra/tpl_client')}`;\n")
         self.write("web/div.ts", 'const ratio = 1 / 2; import x from "infra/x";\n')
+        self.write("web/div_of.ts", 'const of = 10; const r = of / 2; import x from "infra/of_div";\n')
+        self.write("web/div_ts_bang.ts", 'const ratio = value! / 2; import secret from "infra/private";\n')
+        self.write("web/div_ts_bang_tsx.tsx", 'const ratio = fn(value)! / 2; const ui = <Box>don\'t</Box>; import secret from "infra/tsx_bang";\n')
         self.write("web/div_obj.ts", 'const ratio = {} / 2; import x from "infra/obj_x";\n')
         self.write("web/div_obj_dyn.ts", 'const o = { m() {} } / 2; const m = await import("infra/obj_dyn");\n')
         self.write("web/div_fn_cls.ts", 'const f = function() {} / 2; const c = class {} / 2; import y from "infra/fn_cls";\n')
@@ -529,6 +534,9 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/div.ts",
+            "web/div_of.ts",
+            "web/div_ts_bang.ts",
+            "web/div_ts_bang_tsx.tsx",
             "web/div_obj.ts",
             "web/div_obj_dyn.ts",
             "web/div_fn_cls.ts",
@@ -551,6 +559,9 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/div.ts",
+            "web/div_of.ts",
+            "web/div_ts_bang.ts",
+            "web/div_ts_bang_tsx.tsx",
             "web/div_obj.ts",
             "web/div_obj_dyn.ts",
             "web/div_fn_cls.ts",

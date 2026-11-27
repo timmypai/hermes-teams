@@ -209,12 +209,18 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     "class Decl {} /import\\('infra\\/cls_fake'\\)/g;\n"
                     "{ const blk = 1; } /import\\('infra\\/stmt_fake'\\)/g;\n"
                     "switch (member) { case 1: { break; } /import\\('infra\\/sw_fake'\\)/g; }\n"
+                    "const negRe = !/import\\('infra\\/neg_fake'\\)/.test(u);\n"
+                    "const dblNeg = !!/import\\('infra\\/dblneg_fake'\\)/.test(u);\n"
+                    "for (const m of /import\\('infra\\/for_of_fake'\\)/g.exec(u) || []) {}\n"
                     'const u = "https://x";\n'
                 ),
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
                 "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
                 "web/req.ts": "const r = require('infra/sync_client');\n",
                 "web/div.ts": 'const ratio = 1 / 2; import x from "infra/after_div";\n',
+                "web/div_of.ts": 'const of = 10; const r = of / 2; import x from "infra/of_div";\n',
+                "web/div_ts_bang.ts": 'const ratio = value! / 2; import secret from "infra/private";\n',
+                "web/div_ts_bang_tsx.tsx": 'const ratio = fn(value)!! / 2; const ui = <Box v={arr[0]! / 2}>don\'t</Box>; import secret from "infra/tsx_bang";\n',
                 "web/div_obj.ts": 'const ratio = {} / 2; import x from "infra/after_obj";\n',
                 "web/div_obj_dyn.ts": 'const o = { k: 1, m() {} } / 2; const m = await import("infra/after_obj_dyn");\n',
                 "web/div_fn_cls.ts": 'const f = function() {} / 2; const c = class {} / 2; import y from "infra/after_fn_cls";\n',
@@ -239,6 +245,9 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
             "web/tpl_real.ts",
             "web/req.ts",
             "web/div.ts",
+            "web/div_of.ts",
+            "web/div_ts_bang.ts",
+            "web/div_ts_bang_tsx.tsx",
             "web/div_obj.ts",
             "web/div_obj_dyn.ts",
             "web/div_fn_cls.ts",
