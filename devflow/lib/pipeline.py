@@ -336,7 +336,10 @@ def slice_stop_reached(
             ev = ev_map.get(cid)
             if (
                 stop_after == "ci"
-                and status == "review"
+                and (
+                    status == "review"
+                    or (status == "blocked" and str(c.get("block_kind") or "").strip().lower() == "dependency")
+                )
                 and isinstance(ev, dict)
                 and str(ev.get("step") or "").strip().lower() == "ci"
                 and ev.get("ok") is True

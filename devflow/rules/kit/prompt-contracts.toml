@@ -1,0 +1,96 @@
+# Declarative prompt hygiene, schema-vs-doc, and kit self-consistency contracts (zero repo hardcoding).
+
+[hygiene]
+forbid_card_id_regex = '\bt_[0-9a-f]{8}\b'
+scan_globs = [
+  "README.md",
+  "bin/devflow",
+  "souls/*.md",
+  "skills/*/SKILL.md",
+  "rules/workflow/*.toml",
+]
+forbid_registered_slugs = true
+shared_lexer_files = [
+  "lib/lint_engine.py",
+  "templates/repo/.devflow/check.py",
+]
+shared_lexer_markers = [
+  "# --- BEGIN SHARED IMPORT LEXER ---",
+  "# --- END SHARED IMPORT LEXER ---",
+]
+shared_lexer_require_dir = "templates"
+
+[[forbid_in_role]]
+role = "developer"
+phrase = "Push to the main line"
+reason = "與 devflow 嚴禁直接 push 到 main（僅走 PR）直接衝突"
+
+[[forbid_in_role]]
+role = "developer"
+phrase = "Use the crapper tool"
+reason = "與 devflow 禁止在 developer 容器安裝執行 crapper 直接衝突"
+
+[[forbid_in_role]]
+role = "developer"
+phrase = "Use the dryer tool"
+reason = "與 devflow 禁止在 developer 容器安裝執行 dryer 直接衝突"
+
+[[forbid_in_role]]
+role = "developer"
+phrase = "Use the mutator tool"
+reason = "與 devflow 禁止在 developer 容器安裝執行 mutator 直接衝突"
+
+[[forbid_in_role]]
+role = "developer"
+phrase = "Redesign From First Principles"
+reason = "鼓勵從頭重寫設計，與 Allowed-Scope 最小改動原則直接衝突"
+
+[[forbid_in_glob]]
+glob = "skills/*/SKILL.md"
+regex = '禁止[^\n。；]{0,60}檔案路徑'
+detail = "含「禁止寫檔案路徑」與必填 Allowed-Scope 矛盾"
+
+[[require_in_file]]
+path = "skills/devflow-chat/SKILL.md"
+detail = "devflow-chat 為核准與對話指令單一權威，缺少必要規則"
+required = [
+  "devflow approve ",
+  "--request",
+  "嚴禁改查",
+  "絕不執行 `devflow approve`",
+  "devflow approve-plan ",
+  "絕不執行 `devflow approve-plan`",
+]
+
+[[require_in_file]]
+path = "skills/devflow-intake/SKILL.md"
+detail = "PR 層 [ADV] 應交 reviewer 單線退件，避免另開 [ADJ] 競爭"
+required = [
+  "嚴禁在 PR 層 `[ADV]` 另建 `[ADJ]`",
+]
+
+[[role_handoff_contract]]
+role = "researcher"
+step = "repro"
+files = ["souls/researcher.md", "skills/devflow-research/SKILL.md"]
+
+[[role_handoff_contract]]
+role = "architect"
+step = "design"
+files = ["souls/architect.md", "skills/devflow-architect/SKILL.md"]
+
+[[role_handoff_contract]]
+role = "developer"
+step = "implement"
+files = ["souls/developer.md", "skills/devflow-develop/SKILL.md"]
+
+[[role_handoff_contract]]
+role = "reviewer"
+step = "implement"
+files = ["souls/reviewer.md", "skills/devflow-review/SKILL.md"]
+
+[[role_handoff_contract]]
+role = "devops"
+step = "ship"
+files = ["souls/devops.md", "skills/devflow-devops/SKILL.md"]
+conditional_files = ["skills/devflow-devops/SKILL.md"]

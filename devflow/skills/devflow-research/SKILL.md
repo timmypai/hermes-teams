@@ -17,7 +17,7 @@ metadata:
 4. 結論取決於實際行為時，在 scratch 工作區寫最小 PoC 跑一次。數字要能解釋（`pstack:principle-explain-the-number`）。
 5. 交付 `kanban_complete`：
    - `summary`：結論 + 建議（1–3 句）。
-   - `metadata`：`recommendation`、`findings`（條列）、`sources`（URL）、`risks`、`unverified`（查不到的）。
+   - `metadata`：必填 **`root_cause`**（核心結論／根因摘要）與 **`evidence`**（一手來源 URL／實測結果／原始碼位置陣列）；選填 `recommendation`、`findings`（條列）、`sources`（URL）、`risks`、`unverified`（查不到的）、`affected_paths`、`non_goals`。
    - 長報告用 `artifacts` 附 Markdown 檔，不寫進產品 repo。
 
 不改產品 repo、不開 PR。查不到就寫未確認與最佳判斷，不 block。

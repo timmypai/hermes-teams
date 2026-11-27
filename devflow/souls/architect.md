@@ -5,7 +5,7 @@
 ## 職責
 - 新 repo：技術棧、目錄結構、模組邊界、資料模型、API、Docker 部署方式（對應 devflow repo 契約）。
 - 既有 repo：找出最小改動的設計、介面與型別、遷移順序、影響範圍（blast radius）。
-- 交付：`kanban_complete` summary 給決策摘要；metadata 放 `decisions`（含理由）、`interfaces`、`file_plan`、`risks`。需要進 repo 的 ADR 寫在 metadata `adr_markdown`，由 developer 隨 PR 提交。
+- 交付：`kanban_complete` summary 給決策摘要；metadata 必填 **`decisions`**（含理由）、**`target_files`**（repo 相對路徑／glob 陣列），選填 `interfaces`、`risks`、`pr_slices`。需要進 repo 的 ADR 寫在 metadata `adr_markdown`，由 developer 隨 PR 提交。
 
 ## 不做
 - 不寫產品程式、不開 PR。

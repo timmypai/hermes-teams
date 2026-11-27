@@ -1,7 +1,9 @@
 """Structured handoff validation, ARCH target-file inheritance, and atomic Allowed-Scope merging."""
 from __future__ import annotations
 
+import fnmatch
 import re
+from functools import lru_cache
 from typing import Any
 
 from . import policy as policy_lib
@@ -73,8 +75,27 @@ def validate_handoff(step: str, metadata: Any, policy: dict[str, Any] | None = N
         return [f"[{key}] handoff metadata 須為 JSON 物件，收到 {type(metadata).__name__}"]
 
     schema = schemas[key]
+    required = list(schema.get("required") or [])
+    when_clauses = schema.get("required_when") or []
+    if when_clauses:
+        matched_req: list[str] | None = None
+        default_req: list[str] | None = None
+        for clause in when_clauses:
+            if not isinstance(clause, dict):
+                continue
+            cond = clause.get("when")
+            if isinstance(cond, dict) and cond:
+                if all(k in metadata and metadata.get(k) == v for k, v in cond.items()):
+                    matched_req = list(clause.get("required") or [])
+                    break
+            elif clause.get("default") and default_req is None:
+                default_req = list(clause.get("required") or [])
+        for req in (matched_req if matched_req is not None else (default_req or [])):
+            if req not in required:
+                required.append(req)
+
     errs: list[str] = []
-    for req in schema.get("required") or []:
+    for req in required:
         if req not in metadata or _is_empty_handoff_value(metadata.get(req)):
             errs.append(f"[{key}] handoff metadata 缺少必填欄位 `{req}`")
 
@@ -182,47 +203,237 @@ def missing_arch_scope_files(
     return missing
 
 
-def _glob_bounds(raw_pat: str) -> tuple[str, str | None]:
-    """Return `(literal_prefix, required_extension_or_none)` for paths matched by `scope.match_glob`."""
+_TOKEN_KIND_STARSTAR = "STARSTAR"
+_TOKEN_KIND_TREE_DESC = "TREE_DESC"
+_TOKEN_KIND_WILD = "WILD"
+_TOKEN_KIND_LIT = "LIT"
+
+
+def _seg_lit_prefix(seg: str) -> str:
+    wilds = [seg.find(ch) for ch in ("*", "?", "[") if ch in seg]
+    return seg[: min(wilds)] if wilds else seg
+
+
+def _seg_lit_suffix(seg: str) -> str:
+    i = len(seg) - 1
+    while i >= 0:
+        ch = seg[i]
+        if ch in ("*", "?"):
+            break
+        if ch == "]":
+            if "[" in seg[:i]:
+                break
+        i -= 1
+    else:
+        return seg
+    return seg[i + 1 :]
+
+
+def _can_span_slash(seg: str) -> bool:
+    if "*" in seg or "?" in seg:
+        return True
+    i = 0
+    n = len(seg)
+    while i < n:
+        if seg[i] == "[":
+            j = i + 1
+            if j < n and seg[j] in ("!", "^"):
+                j += 1
+            if j < n and seg[j] == "]":
+                j += 1
+            while j < n and seg[j] != "]":
+                j += 1
+            if j < n and fnmatch.fnmatchcase("/", seg[i : j + 1]):
+                return True
+            i = j + 1 if j < n else i + 1
+        else:
+            i += 1
+    return False
+
+
+def _segs_can_overlap(sa: str, sb: str, k_a: str, k_b: str) -> bool:
+    if k_a == _TOKEN_KIND_LIT and k_b == _TOKEN_KIND_LIT:
+        return sa == sb
+    if k_a == _TOKEN_KIND_LIT:
+        return fnmatch.fnmatchcase(sa, sb)
+    if k_b == _TOKEN_KIND_LIT:
+        return fnmatch.fnmatchcase(sb, sa)
+    pa, pb = _seg_lit_prefix(sa), _seg_lit_prefix(sb)
+    if pa and pb and not (pa.startswith(pb) or pb.startswith(pa)):
+        return False
+    ea, eb = _seg_lit_suffix(sa), _seg_lit_suffix(sb)
+    if ea and eb and not (ea.endswith(eb) or eb.endswith(ea)):
+        return False
+    return True
+
+
+def _span_head_token(seg: str) -> str:
+    """Portion of a slash-spanning segment up to and including its first slash-spanning wildcard."""
+    i = 0
+    n = len(seg)
+    while i < n:
+        ch = seg[i]
+        if ch in ("*", "?"):
+            return seg[: i + 1] + "*"
+        if ch == "[":
+            j = i + 1
+            if j < n and seg[j] in ("!", "^"):
+                j += 1
+            if j < n and seg[j] == "]":
+                j += 1
+            while j < n and seg[j] != "]":
+                j += 1
+            if j < n and fnmatch.fnmatchcase("/", seg[i : j + 1]):
+                return seg[: j + 1] + "*"
+            i = j + 1 if j < n else i + 1
+            continue
+        i += 1
+    return seg
+
+
+def _span_tail_token(seg: str) -> str:
+    """Portion of a slash-spanning segment from its last slash-spanning wildcard to end."""
+    lit = _seg_lit_suffix(seg)
+    return "*" + lit if lit else "*"
+
+
+def _compile_overlap_spec(raw_pat: str) -> tuple[tuple[tuple[str, str], ...], bool, str]:
+    """Compile normalized pattern tokens, `is_tree`, and required trailing literal suffix."""
     raw = (raw_pat or "").strip().strip("`'\"")
     trailing_slash = raw.endswith("/")
     pat = _normalize_glob_token(raw)
     if not pat:
-        return "", None
+        return (), False, ""
+    has_wild = any(ch in pat for ch in ("*", "?", "["))
+    if "**" in pat:
+        prefix, _, suffix = pat.partition("**")
+        prefix = prefix.rstrip("/")
+        suffix = suffix.lstrip("/")
+        tokens: list[tuple[str, str]] = []
+        if prefix:
+            for seg in prefix.split("/"):
+                if not seg:
+                    continue
+                tokens.append((_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg))
+        tokens.append((_TOKEN_KIND_STARSTAR, "**"))
+        if not suffix:
+            return tuple(tokens), True, ""
+        suf_raw_trailing = suffix.endswith("/")
+        suf_segs = [s for s in suffix.rstrip("/").split("/") if s]
+        for idx, seg in enumerate(suf_segs):
+            # `scope.match_glob` checks `fnmatch(p, f"*{suffix}")`, so the first post-`**`
+            # segment may match the tail of a longer segment without a `/` boundary.
+            eff = ("*" + seg) if (idx == 0 and not seg.startswith("*")) else seg
+            if eff == "**":
+                tokens.append((_TOKEN_KIND_STARSTAR, "**"))
+            else:
+                tokens.append((_TOKEN_KIND_WILD if any(c in eff for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, eff))
+        if suf_raw_trailing:
+            tokens.append((_TOKEN_KIND_TREE_DESC, "/"))
+            return tuple(tokens), True, ""
+        return tuple(tokens), False, _seg_lit_suffix(suf_segs[-1]) if suf_segs else ""
+
     if trailing_slash:
-        return pat + "/", None
-    wild_idxs = [pat.find(ch) for ch in ("*", "?", "[") if ch in pat]
-    if not wild_idxs:
-        # `scope.match_glob` matches both exact `pat` and every descendant `pat/...`.
-        return pat + "/", None
-    idx = min(wild_idxs)
-    leaf = pat.rsplit("/", 1)[-1] or "*"
-    return pat[:idx], _leaf_ext(leaf)
+        tokens = [
+            (_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg)
+            for seg in pat.split("/") if seg
+        ]
+        tokens.append((_TOKEN_KIND_TREE_DESC, "/"))
+        return tuple(tokens), True, ""
 
+    if not has_wild:
+        tokens = [(_TOKEN_KIND_LIT, seg) for seg in pat.split("/") if seg]
+        tokens.append((_TOKEN_KIND_STARSTAR, "**"))
+        return tuple(tokens), True, ""
 
-def _leaf_ext(leaf: str) -> str | None:
-    if "." not in leaf or leaf in (".", ".."):
-        return None
-    ext = leaf.rsplit(".", 1)[-1].lower()
-    if not ext or any(ch in ext for ch in ("*", "?", "[")):
-        return None
-    return "." + ext
+    segs = [s for s in pat.split("/") if s]
+    tokens = [
+        (_TOKEN_KIND_WILD if any(c in seg for c in ("*", "?", "[")) else _TOKEN_KIND_LIT, seg)
+        for seg in segs
+    ]
+    end_lit = _seg_lit_suffix(segs[-1]) if segs else ""
+    return tuple(tokens), False, end_lit
 
 
 def _globs_overlap(a: str, b: str) -> bool:
+    """Segment-aware over-approximation of `scope.match_glob` intersection with zero false negatives."""
     pa = _normalize_glob_token(a)
     pb = _normalize_glob_token(b)
     if not pa or not pb:
         return False
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
-    lit_a, ext_a = _glob_bounds(a)
-    lit_b, ext_b = _glob_bounds(b)
-    if not (lit_a.startswith(lit_b) or lit_b.startswith(lit_a)):
+    toks_a, tree_a, end_a = _compile_overlap_spec(a)
+    toks_b, tree_b, end_b = _compile_overlap_spec(b)
+    if not toks_a or not toks_b:
         return False
-    if ext_a and ext_b and ext_a != ext_b:
+    if not tree_a and not tree_b and end_a and end_b:
+        if not (end_a.endswith(end_b) or end_b.endswith(end_a)):
+            return False
+
+    na, nb = len(toks_a), len(toks_b)
+
+    @lru_cache(maxsize=None)
+    def dp(ia: int, ib: int) -> bool:
+        if ia == na and ib == nb:
+            return True
+        if ia < na and toks_a[ia][0] == _TOKEN_KIND_STARSTAR:
+            if dp(ia + 1, ib) or (ib < nb and dp(ia, ib + 1)):
+                return True
+        if ib < nb and toks_b[ib][0] == _TOKEN_KIND_STARSTAR:
+            if dp(ia, ib + 1) or (ia < na and dp(ia + 1, ib)):
+                return True
+        if ia == na or ib == nb:
+            return False
+
+        ka, sa = toks_a[ia]
+        kb, sb = toks_b[ib]
+
+        if ka == _TOKEN_KIND_TREE_DESC:
+            # Trailing `/` requires >= 1 concrete segment on B (or absorption into B's wildcard tail).
+            if kb in (_TOKEN_KIND_TREE_DESC,):
+                return dp(ia + 1, ib + 1) or dp(ia + 1, ib) or dp(ia, ib + 1)
+            if dp(ia + 1, ib + 1) or dp(ia, ib + 1):
+                return True
+            if kb == _TOKEN_KIND_WILD and _can_span_slash(sb) and dp(ia + 1, ib):
+                return True
+            return False
+        if kb == _TOKEN_KIND_TREE_DESC:
+            if dp(ia + 1, ib + 1) or dp(ia + 1, ib):
+                return True
+            if ka == _TOKEN_KIND_WILD and _can_span_slash(sa) and dp(ia, ib + 1):
+                return True
+            return False
+
+        if _segs_can_overlap(sa, sb, ka, kb) and dp(ia + 1, ib + 1):
+            return True
+
+        # A slash-spanning segment on one side can absorb >= 1 segments on the other side.
+        if ka == _TOKEN_KIND_WILD and _can_span_slash(sa):
+            head_a = _span_head_token(sa)
+            tail_a = _span_tail_token(sa)
+            if _segs_can_overlap(head_a, sb, _TOKEN_KIND_WILD, kb):
+                for jb in range(ib + 1, nb):
+                    kjb, sjb = toks_b[jb]
+                    if kjb in (_TOKEN_KIND_STARSTAR, _TOKEN_KIND_TREE_DESC):
+                        if dp(ia + 1, jb) or dp(ia + 1, jb + 1):
+                            return True
+                    elif _segs_can_overlap(tail_a, sjb, _TOKEN_KIND_WILD, kjb) and dp(ia + 1, jb + 1):
+                        return True
+        if kb == _TOKEN_KIND_WILD and _can_span_slash(sb):
+            head_b = _span_head_token(sb)
+            tail_b = _span_tail_token(sb)
+            if _segs_can_overlap(sa, head_b, ka, _TOKEN_KIND_WILD):
+                for ja in range(ia + 1, na):
+                    kja, sja = toks_a[ja]
+                    if kja in (_TOKEN_KIND_STARSTAR, _TOKEN_KIND_TREE_DESC):
+                        if dp(ja, ib + 1) or dp(ja + 1, ib + 1):
+                            return True
+                    elif _segs_can_overlap(sja, tail_b, kja, _TOKEN_KIND_WILD) and dp(ja + 1, ib + 1):
+                        return True
         return False
-    return True
+
+    return dp(0, 0)
 
 
 def merge_allowed_scope_into_body(
@@ -287,8 +498,6 @@ def merge_allowed_scope_into_body(
             if _NEXT_HEADING_RE.match(lines[i]):
                 end_idx = i
                 break
-            if scope_lib.EPIC_REF if hasattr(scope_lib, "EPIC_REF") else False:  # pragma: no cover
-                pass
             if re.match(r"^\s*EPIC[：:]", lines[i], re.I) and epic_line_idx is None:
                 epic_line_idx = i
         insert_idx = epic_line_idx if epic_line_idx is not None else end_idx

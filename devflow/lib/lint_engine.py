@@ -306,6 +306,7 @@ def load_rules(rules_dir: Path | str) -> list[LintRule]:
     return [load_rule(p) for p in sorted(root.glob("*.toml"))]
 
 
+# --- BEGIN SHARED IMPORT LEXER ---
 def _resolve_py_relative_import(rel_path: str, module: str | None, level: int) -> str:
     if level <= 0:
         return module or ""
@@ -1156,6 +1157,18 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                     k = _next_sig(j + 1)
                     if k < n and toks[k][0] == "STR":
                         out.append((line, toks[k][1].strip()))
+                elif (
+                    val == "require"
+                    and j < n
+                    and ((toks[j][0] == "PUNCT" and toks[j][1] == ".") or (toks[j][0] == "OP" and toks[j][1] == "?."))
+                ):
+                    r_idx = _next_sig(j + 1)
+                    if r_idx < n and toks[r_idx][0] == "IDENT" and toks[r_idx][1] == "resolve":
+                        p_idx = _next_sig(r_idx + 1)
+                        if p_idx < n and toks[p_idx][0] == "PUNCT" and toks[p_idx][1] == "(":
+                            k = _next_sig(p_idx + 1)
+                            if k < n and toks[k][0] == "STR":
+                                out.append((line, toks[k][1].strip()))
                 elif val == "import" and stmt_start and j < n:
                     if toks[j][0] == "STR":
                         out.append((line, toks[j][1].strip()))
@@ -1243,6 +1256,7 @@ def _extract_python_imports(rel_path: str, text: str) -> tuple[list[tuple[int, s
                     if resolved:
                         out.append((node.lineno, resolved))
     return out, None
+# --- END SHARED IMPORT LEXER ---
 
 
 def _when_satisfied(clause: dict[str, Any], files: dict[str, str]) -> bool:

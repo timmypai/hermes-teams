@@ -812,6 +812,34 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         self.assertEqual(code_bad, 2, out_bad)
         self.assertIn("invalid glob pattern", out_bad)
 
+    def test_require_resolve_boundary_and_member_exemption(self) -> None:
+        self.write(
+            ".devflow/rules/reqres.toml",
+            """\
+            id = "reqres"
+            kind = "import_boundary"
+            message = "forbidden require.resolve"
+            include = ["web/**/*.js", "web/**/*.ts"]
+            forbidden_modules = ["infra"]
+
+            [[fixture]]
+            expect = "fail"
+            path = "web/bad.js"
+            text = 'const m = require.resolve("infra/db");'
+
+            [[fixture]]
+            expect = "pass"
+            path = "web/ok.ts"
+            text = 'const m = helper.require.resolve("infra/db");'
+            """,
+        )
+        self.write("web/bad.js", 'const db = require.resolve("infra/db");\n')
+        self.write("web/ok.ts", 'const a = obj.require.resolve("infra/db");\nconst s = "require.resolve(\'infra/db\')";\n')
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("web/bad.js:1 [reqres]", out)
+        self.assertNotIn("web/ok.ts", out)
+
 
 if __name__ == "__main__":
     unittest.main()
