@@ -214,24 +214,89 @@ def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
     return clean_imp == forb or clean_imp.startswith(forb + ".") or clean_imp.startswith(forb + "/")
 
 
+_JS_SIMPLE_ESCAPES = {
+    "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v",
+    "\\": "\\", "'": "'", '"': '"', "`": "`", "$": "$",
+}
+_JS_HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+_JS_LINE_BREAKS = frozenset(("\r", "\n", "\u2028", "\u2029"))
+
+
+def _decode_js_escape(text: str, bs_idx: int, lineno: int) -> tuple[str, int, int]:
+    n = len(text)
+    if bs_idx + 1 >= n:
+        return "", bs_idx + 1, lineno
+    nxt = text[bs_idx + 1]
+    if nxt == "\r":
+        step = 3 if (bs_idx + 2 < n and text[bs_idx + 2] == "\n") else 2
+        return "", bs_idx + step, lineno + 1
+    if nxt in ("\n", "\u2028", "\u2029"):
+        return "", bs_idx + 2, lineno + 1
+    if nxt in _JS_SIMPLE_ESCAPES:
+        return _JS_SIMPLE_ESCAPES[nxt], bs_idx + 2, lineno
+    if nxt == "x":
+        hx = text[bs_idx + 2 : bs_idx + 4]
+        if len(hx) == 2 and all(c in _JS_HEX_CHARS for c in hx):
+            return chr(int(hx, 16)), bs_idx + 4, lineno
+        return "\\x", bs_idx + 2, lineno
+    if nxt == "u":
+        if bs_idx + 2 < n and text[bs_idx + 2] == "{":
+            end = text.find("}", bs_idx + 3)
+            hx = text[bs_idx + 3 : end] if end != -1 else ""
+            if hx and all(c in _JS_HEX_CHARS for c in hx):
+                cp = int(hx, 16)
+                if 0xD800 <= cp <= 0xDFFF:
+                    return "\ufffd", end + 1, lineno
+                if cp <= 0x10FFFF:
+                    return chr(cp), end + 1, lineno
+            return "\\u", bs_idx + 2, lineno
+        hx = text[bs_idx + 2 : bs_idx + 6]
+        if len(hx) == 4 and all(c in _JS_HEX_CHARS for c in hx):
+            cp = int(hx, 16)
+            next_i = bs_idx + 6
+            if 0xD800 <= cp <= 0xDBFF and text[next_i : next_i + 2] == "\\u":
+                lo_hx = text[next_i + 2 : next_i + 6]
+                if len(lo_hx) == 4 and all(c in _JS_HEX_CHARS for c in lo_hx):
+                    lo = int(lo_hx, 16)
+                    if 0xDC00 <= lo <= 0xDFFF:
+                        return chr(0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)), next_i + 6, lineno
+            if 0xD800 <= cp <= 0xDFFF:
+                return "\ufffd", next_i, lineno
+            return chr(cp), next_i, lineno
+        return "\\u", bs_idx + 2, lineno
+    if nxt in "01234567":
+        j = bs_idx + 2
+        if nxt in "0123":
+            limit = min(n, bs_idx + 4)
+            while j < limit and text[j] in "01234567":
+                j += 1
+        elif j < n and text[j] in "01234567":
+            j += 1
+        return chr(int(text[bs_idx + 1 : j], 8)), j, lineno
+    return nxt, bs_idx + 2, lineno
+
+
 def _scan_template_tail(text: str, start: int, lineno: int, *, first: bool) -> tuple[str, int, int, bool]:
     buf: list[str] = []
     i, n = start, len(text)
     while i < n:
         ch = text[i]
         if ch == "\\" and i + 1 < n:
-            nxt = text[i + 1]
-            if nxt == "\n":
-                lineno += 1
-            elif first:
-                buf.append(nxt)
-            i += 2
+            dec, i, lineno = _decode_js_escape(text, i, lineno)
+            if first and dec:
+                buf.append(dec)
             continue
         if ch == "$" and i + 1 < n and text[i + 1] == "{":
             return "", i + 2, lineno, True
         if ch == "`":
             return ("".join(buf) if first else ""), i + 1, lineno, False
-        if ch == "\n":
+        if ch == "\r":
+            lineno += 1
+            i += 2 if (i + 1 < n and text[i + 1] == "\n") else 1
+            if first:
+                buf.append("\n")
+            continue
+        if ch in ("\n", "\u2028", "\u2029"):
             lineno += 1
         if first:
             buf.append(ch)
@@ -620,27 +685,33 @@ def _tokenize_js_span(
         if ch in (" ", "\t", "\r"):
             i += 1
             continue
-        if ch == "\n":
+        if ch in _JS_LINE_BREAKS:
             if not tokens or tokens[-1][0] != "NL":
                 tokens.append(("NL", "\n", lineno))
             lineno += 1
-            i += 1
+            i += 2 if (ch == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
             continue
         if ch == "/" and i + 1 < n:
             if text[i + 1] == "/":
                 i += 2
-                while i < n and text[i] != "\n":
+                while i < n and text[i] not in _JS_LINE_BREAKS:
                     i += 1
                 continue
             if text[i + 1] == "*":
+                cmt_line, had_nl = lineno, False
                 i += 2
                 while i < n:
                     if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
                         i += 2
                         break
-                    if text[i] == "\n":
+                    if text[i] in _JS_LINE_BREAKS:
+                        had_nl = True
                         lineno += 1
-                    i += 1
+                        i += 2 if (text[i] == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
+                    else:
+                        i += 1
+                if had_nl and (not tokens or tokens[-1][0] != "NL"):
+                    tokens.append(("NL", "\n", cmt_line))
                 continue
         in_for = bool(paren_ctrl and paren_ctrl[-1] == "for")
         if ch == "/" and _js_allows_regex(tokens, in_for_paren=in_for):
@@ -663,18 +734,16 @@ def _tokenize_js_span(
             while i < n:
                 c = text[i]
                 if c == "\\" and i + 1 < n:
-                    if text[i + 1] == "\n":
-                        lineno += 1
-                    else:
-                        buf.append(text[i + 1])
-                    i += 2
+                    dec, i, lineno = _decode_js_escape(text, i, lineno)
+                    if dec:
+                        buf.append(dec)
                     continue
                 if c == q:
                     i += 1
                     break
-                if c == "\n":
+                if c in _JS_LINE_BREAKS:
                     lineno += 1
-                    i += 1
+                    i += 2 if (c == "\r" and i + 1 < n and text[i + 1] == "\n") else 1
                     break
                 buf.append(c)
                 i += 1

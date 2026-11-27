@@ -506,10 +506,19 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "function fd() {} /import\\('infra\\/fd_fake'\\)/g;\n"
             "class Cd {} /import\\('infra\\/cd_fake'\\)/g;\n"
             "const negRe = !/import\\('infra\\/neg_fake'\\)/.test(s);\n"
-            "for (const m of /import\\('infra\\/for_of_fake'\\)/g.exec(s) || []) {}\n",
+            "for (const m of /import\\('infra\\/for_of_fake'\\)/g.exec(s) || []) {}\n"
+            '/* import { a } from "infra/mc_ignored";\nexport * from "infra/mc_ignored2"; */\n',
         )
         self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
         self.write("web/tpl_real.ts", "export const x = `${await import('infra/tpl_client')}`;\n")
+        self.write("web/mc_imp.ts", 'const n = 1 /*\n*/ import x from "infra/mc_imp";\n')
+        self.write("web/mc_exp.ts", 'const n = 1 /*\n*/ export { x } from "infra/mc_exp";\n')
+        self.write("web/esc_hex.ts", 'import x from "\\x69nfra/hex";\n')
+        self.write("web/esc_u4.ts", 'const m = await import("\\u0069nfra/u4");\n')
+        self.write("web/esc_ucp.ts", 'const r = require("\\u{69}nfra/ucp");\n')
+        self.write("web/esc_tpl.ts", 'const t = await import(`\\x69nfra/tpl_hex`);\n')
+        self.write("web/esc_oct.ts", 'import o from "\\151nfra/oct";\n')
+        self.write("web/esc_cont.ts", 'export * from "in\\\nfra/cont";\n')
         self.write("web/div.ts", 'const ratio = 1 / 2; import x from "infra/x";\n')
         self.write("web/div_of.ts", 'const of = 10; const r = of / 2; import x from "infra/of_div";\n')
         self.write("web/div_ts_bang.ts", 'const ratio = value! / 2; import secret from "infra/private";\n')
@@ -533,6 +542,12 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         for bad_js in (
             "web/dyn.ts",
             "web/tpl_real.ts",
+            "web/esc_hex.ts",
+            "web/esc_u4.ts",
+            "web/esc_ucp.ts",
+            "web/esc_tpl.ts",
+            "web/esc_oct.ts",
+            "web/esc_cont.ts",
             "web/div.ts",
             "web/div_of.ts",
             "web/div_ts_bang.ts",
@@ -550,6 +565,8 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/jsx_quote.tsx",
         ):
             self.assertIn(f"{bad_js}:1 [domain-boundary]", out, bad_js)
+        self.assertIn("web/mc_imp.ts:2 [domain-boundary]", out)
+        self.assertIn("web/mc_exp.ts:2 [domain-boundary]", out)
         self.assertIn("web/div_block_obj.ts:2 [domain-boundary]", out)
         self.assertIn("domain/broken.py:1 [domain-boundary]", out)
         self.assertIn("SyntaxError", out)
@@ -558,6 +575,14 @@ class ImportBoundaryAndDiffBudget(PrRepo):
         for bad_js in (
             "web/dyn.ts",
             "web/tpl_real.ts",
+            "web/mc_imp.ts",
+            "web/mc_exp.ts",
+            "web/esc_hex.ts",
+            "web/esc_u4.ts",
+            "web/esc_ucp.ts",
+            "web/esc_tpl.ts",
+            "web/esc_oct.ts",
+            "web/esc_cont.ts",
             "web/div.ts",
             "web/div_of.ts",
             "web/div_ts_bang.ts",

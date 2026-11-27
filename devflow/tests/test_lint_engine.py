@@ -212,11 +212,20 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     "const negRe = !/import\\('infra\\/neg_fake'\\)/.test(u);\n"
                     "const dblNeg = !!/import\\('infra\\/dblneg_fake'\\)/.test(u);\n"
                     "for (const m of /import\\('infra\\/for_of_fake'\\)/g.exec(u) || []) {}\n"
+                    '/* import { z } from "infra/commented";\nexport * from "infra/commented_exp"; */\n'
                     'const u = "https://x";\n'
                 ),
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
                 "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
                 "web/req.ts": "const r = require('infra/sync_client');\n",
+                "web/mc_imp.ts": 'const n = 1 /*\n*/ import x from "infra/mc_imp";\n',
+                "web/mc_exp.ts": 'const n = 1 /*\r\n*/ export { x } from "infra/mc_exp";\n',
+                "web/esc_hex.ts": 'import x from "\\x69nfra/hex";\n',
+                "web/esc_u4.ts": 'const m = await import("\\u0069nfra/u4");\n',
+                "web/esc_ucp.ts": 'const r = require("\\u{69}nfra/ucp");\n',
+                "web/esc_tpl.ts": 'const t = await import(`\\x69nfra/tpl_hex`);\n',
+                "web/esc_oct.ts": 'import o from "\\151nfra/oct";\n',
+                "web/esc_cont.ts": 'export * from "in\\\nfra/cont";\n',
                 "web/div.ts": 'const ratio = 1 / 2; import x from "infra/after_div";\n',
                 "web/div_of.ts": 'const of = 10; const r = of / 2; import x from "infra/of_div";\n',
                 "web/div_ts_bang.ts": 'const ratio = value! / 2; import secret from "infra/private";\n',
@@ -244,6 +253,14 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/req.ts",
+            "web/mc_imp.ts",
+            "web/mc_exp.ts",
+            "web/esc_hex.ts",
+            "web/esc_u4.ts",
+            "web/esc_ucp.ts",
+            "web/esc_tpl.ts",
+            "web/esc_oct.ts",
+            "web/esc_cont.ts",
             "web/div.ts",
             "web/div_of.ts",
             "web/div_ts_bang.ts",

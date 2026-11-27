@@ -165,21 +165,22 @@ def missing_arch_scope_files(
     return missing
 
 
-def _literal_prefix_before_wild(raw_pat: str) -> tuple[str, str, bool]:
-    """Return `(literal_prefix_before_first_wildcard, leaf_pattern, has_wildcards)` aligned to `scope.match_glob`."""
+def _glob_bounds(raw_pat: str) -> tuple[str, str | None]:
+    """Return `(literal_prefix, required_extension_or_none)` for paths matched by `scope.match_glob`."""
     raw = (raw_pat or "").strip().strip("`'\"")
     trailing_slash = raw.endswith("/")
     pat = _normalize_glob_token(raw)
     if not pat:
-        return "", "*", False
+        return "", None
     if trailing_slash:
-        return pat + "/", "*", True
+        return pat + "/", None
     wild_idxs = [pat.find(ch) for ch in ("*", "?", "[") if ch in pat]
     if not wild_idxs:
-        return pat, pat.rsplit("/", 1)[-1], False
+        # `scope.match_glob` matches both exact `pat` and every descendant `pat/...`.
+        return pat + "/", None
     idx = min(wild_idxs)
     leaf = pat.rsplit("/", 1)[-1] or "*"
-    return pat[:idx], leaf, True
+    return pat[:idx], _leaf_ext(leaf)
 
 
 def _leaf_ext(leaf: str) -> str | None:
@@ -198,35 +199,13 @@ def _globs_overlap(a: str, b: str) -> bool:
         return False
     if pa == pb or scope_lib.match_glob(pa, pb) or scope_lib.match_glob(pb, pa):
         return True
-
-    lit_a, leaf_a, wild_a = _literal_prefix_before_wild(a)
-    lit_b, leaf_b, wild_b = _literal_prefix_before_wild(b)
-    if wild_a and wild_b:
-        # `scope.match_glob` uses Python `fnmatch`, where `*`/`?`/`[...]` cross `/`:
-        # e.g. `src/*.py` matches `src/private/secret.py`.
-        if not (lit_a.startswith(lit_b) or lit_b.startswith(lit_a)):
-            return False
-        ext_a = _leaf_ext(leaf_a)
-        ext_b = _leaf_ext(leaf_b)
-        if ext_a and ext_b and ext_a != ext_b:
-            return False
-        return True
-
-    if wild_a != wild_b:
-        conc = pb if wild_a else pa
-        wild = pa if wild_a else pb
-        lit_w, leaf_w = (lit_a, leaf_a) if wild_a else (lit_b, leaf_b)
-        conc_leaf = leaf_b if wild_a else leaf_a
-        if _leaf_ext(conc_leaf) is not None:
-            return False
-        if lit_w and ((conc + "/").startswith(lit_w) or lit_w.startswith(conc + "/")):
-            ext_w = _leaf_ext(leaf_w) or ""
-            probes = (
-                f"{conc}/__p__{ext_w}",
-                f"{lit_w.rstrip('/')}/__p__{ext_w}" if lit_w.endswith("/") else f"{lit_w}__p__{ext_w}",
-            )
-            return any(scope_lib.match_glob(p, conc) and scope_lib.match_glob(p, wild) for p in probes)
-    return False
+    lit_a, ext_a = _glob_bounds(a)
+    lit_b, ext_b = _glob_bounds(b)
+    if not (lit_a.startswith(lit_b) or lit_b.startswith(lit_a)):
+        return False
+    if ext_a and ext_b and ext_a != ext_b:
+        return False
+    return True
 
 
 def merge_allowed_scope_into_body(
