@@ -425,18 +425,21 @@ def _scan_template_tail(text: str, start: int, lineno: int, *, first: bool) -> t
 
 _REGEX_PREV_KW = frozenset({
     "return", "throw", "case", "else", "do", "yield", "await",
-    "typeof", "void", "delete", "in", "default",
+    "typeof", "void", "delete", "in", "instanceof", "new",
+    "extends", "break", "continue", "debugger", "default",
 })
 _BRACE_EXPR_KW = frozenset({
     "return", "throw", "yield", "await", "typeof", "void", "delete", "in",
+    "instanceof", "new",
 })
 _CTRL_KW = frozenset({"if", "while", "with"})
 _REGEX_PREV_PUNCT = frozenset({"(", "[", "{", "}", ",", ";", "=", ":", "?"})
 _EXPR_PREV_PUNCT = frozenset({"(", "[", ",", "=", ":", "?"})
 _REGEX_PREV_OP = frozenset({
     "=", "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
-    "&&=", "||=", "??=", "=>", "!", "~", "+", "-", "*", "%", "**", "&", "|", "^",
-    "&&", "||", "??", "==", "===", "!=", "!==", ">", "<=", ">=", "<<", ">>", ">>>",
+    "&&=", "||=", "??=", "=>", "!", "~", "+", "-", "*", "/", "%", "**", "&", "|", "^",
+    "&&", "||", "??", "==", "===", "!=", "!==", "<", ">", "<=", ">=", "<<", ">>", ">>>",
+    "...",
 })
 _MULTI_OPS = (
     ">>>=", "===", "!==", "**=", "<<=", ">>=", "&&=", "||=", "??=", "...",
@@ -454,6 +457,10 @@ def _sig_tokens_tail(tokens: list[tuple[str, str, int]], limit: int = 3) -> list
             if len(out) >= limit:
                 break
     return out
+
+
+def _is_member_dot(tok: tuple[str, str, int]) -> bool:
+    return (tok[0] == "PUNCT" and tok[1] == ".") or (tok[0] == "OP" and tok[1] == "?.")
 
 
 def _is_jsx_close_gt(tokens: list[tuple[str, str, int]]) -> bool:
@@ -489,7 +496,7 @@ def _js_allows_regex(tokens: list[tuple[str, str, int]], *, in_for_paren: bool =
     if kind == "PUNCT":
         return val in _REGEX_PREV_PUNCT
     if kind == "IDENT":
-        if len(sig) >= 2 and sig[1] == ("PUNCT", ".", sig[1][2]):
+        if len(sig) >= 2 and _is_member_dot(sig[1]):
             return False
         if val == "of":
             return in_for_paren
@@ -502,12 +509,12 @@ def _ctrl_paren_kind(tokens: list[tuple[str, str, int]]) -> str:
     sig = _sig_tokens_tail(tokens, 3)
     if not sig or sig[0][0] != "IDENT":
         return ""
-    if sig[0][1] == "for" and not (len(sig) >= 2 and sig[1][0] == "PUNCT" and sig[1][1] == "."):
+    if sig[0][1] == "for" and not (len(sig) >= 2 and _is_member_dot(sig[1])):
         return "for"
-    if sig[0][1] in _CTRL_KW and not (len(sig) >= 2 and sig[1][0] == "PUNCT" and sig[1][1] == "."):
+    if sig[0][1] in _CTRL_KW and not (len(sig) >= 2 and _is_member_dot(sig[1])):
         return "ctrl"
     if sig[0][1] == "await" and len(sig) >= 2 and sig[1][0] == "IDENT" and sig[1][1] == "for":
-        if not (len(sig) >= 3 and sig[2][0] == "PUNCT" and sig[2][1] == "."):
+        if not (len(sig) >= 3 and _is_member_dot(sig[2])):
             return "for"
     return ""
 
@@ -529,7 +536,7 @@ def _is_expr_prefix_tok(
             return False
         return pv in _EXPR_PREV_PUNCT
     if pk == "IDENT":
-        if idx + 1 < len(sig) and sig[idx + 1] == ("PUNCT", ".", sig[idx + 1][2]):
+        if idx + 1 < len(sig) and _is_member_dot(sig[idx + 1]):
             return False
         if pv == "of":
             return in_for_paren
@@ -553,7 +560,7 @@ def _is_fn_class_expr(
         return False
     idx = 0
     if kw == "function" and sig[0][0] == "IDENT" and sig[0][1] == "async":
-        if not (len(sig) >= 2 and sig[1] == ("PUNCT", ".", sig[1][2])):
+        if not (len(sig) >= 2 and _is_member_dot(sig[1])):
             idx = 1
     if idx >= len(sig):
         return False
@@ -761,6 +768,24 @@ def _scan_jsx_open_tag(
             prop_tokens.extend(inner_toks)
             prop_tokens.append(("PUNCT", "}", lineno))
             continue
+        if ch == "/" and p + 1 < n:
+            if text[p + 1] == "/":
+                p += 2
+                while p < n and text[p] not in _JS_LINE_BREAKS:
+                    p += 1
+                continue
+            if text[p + 1] == "*":
+                p += 2
+                while p < n:
+                    if text[p] == "*" and p + 1 < n and text[p + 1] == "/":
+                        p += 2
+                        break
+                    if text[p] in _JS_LINE_BREAKS:
+                        lineno += 1
+                        p += 2 if (text[p] == "\r" and p + 1 < n and text[p + 1] == "\n") else 1
+                    else:
+                        p += 1
+                continue
         if angle > 0:
             if ch == ";":
                 return None
@@ -987,12 +1012,19 @@ def _tokenize_js_span(
             i += 1
             continue
         if ch == "?":
-            if i + 1 < n and text[i + 1] == ".":
-                tokens.append(("PUNCT", "?", lineno))
+            if text.startswith("??=", i):
+                tokens.append(("OP", "??=", lineno))
+                i += 3
+            elif text.startswith("??", i):
+                tokens.append(("OP", "??", lineno))
+                i += 2
+            elif text.startswith("?.", i) and not (i + 2 < n and text[i + 2].isdigit()):
+                tokens.append(("OP", "?.", lineno))
+                i += 2
             else:
                 ternary_depths.append((len(paren_ctrl), len(brace_kinds)))
                 tokens.append(("PUNCT", "?", lineno))
-            i += 1
+                i += 1
             continue
         if ch == ":":
             depth = (len(paren_ctrl), len(brace_kinds))
@@ -1101,7 +1133,7 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
     while i < n:
         kind, val, line = toks[i]
         if kind == "NL":
-            if paren_depth == 0 and brace_depth == 0 and prev_val != ".":
+            if paren_depth == 0 and brace_depth == 0 and prev_val not in (".", "?."):
                 stmt_start = True
             i += 1
             continue
@@ -1116,7 +1148,7 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
             if brace_depth < 0:
                 brace_depth = 0
 
-        is_member = prev_kind == "PUNCT" and prev_val == "."
+        is_member = _is_member_dot((prev_kind, prev_val, 0))
         if kind == "IDENT" and not is_member:
             if val in ("import", "require"):
                 j = _next_sig(i + 1)

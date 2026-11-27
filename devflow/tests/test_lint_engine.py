@@ -221,6 +221,26 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     "const re = /import\\('infra\\/re_cr'\\)/g\r"
                     '/*\u2028import x from "infra/cmt_ls";\r*/\r'
                 ),
+                "web/clean_ops.ts": (
+                    'const x = 1 < /import("infra")/.source.length;\n'
+                    'const x2 = 1</import("infra")/.source.length;\n'
+                    'const y = 1 / /import("infra")/.source.length;\n'
+                    'const y2 = 1 / 2 / /import("infra")/.source.length;\n'
+                    'const z = 1 > /import("infra")/.source.length;\n'
+                    'const sp = [.../import("infra")/.source];\n'
+                    'const nu = a ?? /import("infra")/.source; a ??= /import("infra")/;\n'
+                    'const nb = a ?? b\nlabel: /import("infra")/.test(x);\n'
+                    'const ins = a instanceof /import("infra")/; const nw = new /import("infra")/;\n'
+                    'const opt = obj?.import("infra/not_module");\n'
+                ),
+                "web/after_lt_re.ts": 'const x = 1 < /import("infra\\/ok")/.source.length; import a from "infra/after_lt_re";\n',
+                "web/after_div_re.ts": 'const y = 1 / /import("infra\\/ok")/.source.length; import b from "infra/after_div_re";\n',
+                "web/after_div_obj.ts": 'const o1 = 1 / {} / 2; import c from "infra/after_div_obj";\n',
+                "web/after_lt_obj.ts": 'const o2 = 1 < {} / 2; import d from "infra/after_lt_obj";\n',
+                "web/after_ts_gen.ts": 'const g = fn<T>(x) / 2; import e from "infra/after_ts_gen";\n',
+                "web/after_opt_kw.ts": 'const q = cfg?.default / 2; import f from "infra/after_opt_kw";\n',
+                "web/after_ter_dec.ts": 'const t = ok ? .5 : {} / 2; import g2 from "infra/after_ter_dec";\n',
+                "web/after_jsx_cmt.tsx": 'const el = <Box /* cmt */ >don\'t</Box>; const m = await import("infra/after_jsx_cmt"); const r = 1 / 2;\n',
                 "web/bom.ts": '\ufeffimport x from "infra/bom";\n',
                 "web/hashbang.js": '#!/usr/bin/env node\nimport x from "infra/hashbang";\n',
                 "web/bom_hashbang.js": '\ufeff#!/usr/bin/env node\r\nimport x from "infra/bom_hb";\r\n',
@@ -266,7 +286,16 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         by_file = {h["file"]: h for h in hits}
         self.assertNotIn("web/clean.ts", by_file)
         self.assertNotIn("web/clean_ws.js", by_file)
+        self.assertNotIn("web/clean_ops.ts", by_file)
         for bad_js in (
+            "web/after_lt_re.ts",
+            "web/after_div_re.ts",
+            "web/after_div_obj.ts",
+            "web/after_lt_obj.ts",
+            "web/after_ts_gen.ts",
+            "web/after_opt_kw.ts",
+            "web/after_ter_dec.ts",
+            "web/after_jsx_cmt.tsx",
             "web/bom.ts",
             "web/hashbang.js",
             "web/bom_hashbang.js",
