@@ -2104,8 +2104,13 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                          "根因在 Hermes 時照 README「Hermes 原生限制與對應」處理，不建修 Hermes 或共用設施的卡")
         if kind not in ("EPIC", "ADV", "ADJ") and tid not in feeds:
             found.append(f"{tid}: 沒有接到 EPIC 的 parent 鏈，EPIC 驗收不會等它")
-    work = "\n".join(f"{c['title']}\n{c['body'] or ''}" for t, c in cards.items() if t != epic)
-    if len(cards) > 1 and not in_discovery_phase:
+    work_cards = [
+        c for t, c in cards.items()
+        if t != epic and c.get("status") != "archived"
+        and card_type(c["title"]) not in ("EPIC", "ADJ", "ADV")
+    ]
+    work = "\n".join(f"{c['title']}\n{c['body'] or ''}" for c in work_cards)
+    if work_cards and not in_discovery_phase:
         for ac in acs:
             if not re.search(rf"\b{ac}\b", work):
                 found.append(f"{epic}: {ac} 沒有任何卡片負責（卡片 body 要寫明覆蓋哪些 AC）")
