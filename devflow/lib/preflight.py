@@ -157,9 +157,13 @@ def configured_test_commands(
 
 
 def _load_repo_baseline(repo_dir: Path) -> Counter[tuple[str, str, str]]:
-    """Load optional `.devflow/baseline.json` using `(rule, path, line_text)` keys."""
-    baseline_path = repo_dir / ".devflow" / "baseline.json"
-    if not baseline_path.is_file():
+    """Load optional `.devflow/rules/baseline.json` (canonical `check.py` path) or `.devflow/baseline.json`."""
+    candidates = (
+        repo_dir / ".devflow" / "rules" / "baseline.json",
+        repo_dir / ".devflow" / "baseline.json",
+    )
+    baseline_path = next((p for p in candidates if p.is_file()), None)
+    if baseline_path is None:
         return Counter()
     try:
         data = json.loads(baseline_path.read_text(encoding="utf-8"))
