@@ -204,17 +204,28 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
                     'const member = loader.import("infra/not_module");\n'
                     "const re = /import\\('infra\\/fake'\\)/;\n"
                     "if (member) /import\\('infra\\/cond_fake'\\)/;\n"
+                    "if (member) {} /import\\('infra\\/block_fake'\\)/g;\n"
+                    "function decl() {} /import\\('infra\\/decl_fake'\\)/g;\n"
+                    "class Decl {} /import\\('infra\\/cls_fake'\\)/g;\n"
+                    "{ const blk = 1; } /import\\('infra\\/stmt_fake'\\)/g;\n"
+                    "switch (member) { case 1: { break; } /import\\('infra\\/sw_fake'\\)/g; }\n"
                     'const u = "https://x";\n'
                 ),
                 "web/dyn.ts": 'const mod = await import("infra/secret");\n',
                 "web/tpl_real.ts": "const x = `${await import('infra/tpl_secret')}`;\n",
                 "web/req.ts": "const r = require('infra/sync_client');\n",
                 "web/div.ts": 'const ratio = 1 / 2; import x from "infra/after_div";\n',
+                "web/div_obj.ts": 'const ratio = {} / 2; import x from "infra/after_obj";\n',
+                "web/div_obj_dyn.ts": 'const o = { k: 1, m() {} } / 2; const m = await import("infra/after_obj_dyn");\n',
+                "web/div_fn_cls.ts": 'const f = function() {} / 2; const c = class {} / 2; import y from "infra/after_fn_cls";\n',
+                "web/div_block_obj.ts": 'if (ok) { const r = {} / 2; }\nimport b from "infra/after_block_obj";\n',
+                "web/div_ternary_obj.ts": 'const q = ok ? 1 : {} / 2; import t from "infra/after_ternary_obj";\n',
                 "web/div_expr.ts": 'const r = (1 + 2) / 3; const a = arr[0] / 2; const p = i++ / 2; import y from "infra/after_expr";\n',
                 "web/div_tpl.ts": "const t = `${x}` / 2; import z from \"infra/after_tpl\";\n",
                 "web/div_if.ts": 'if (ok) /ok/g; import w from "infra/after_if_regex";\n',
                 "web/div_prop.ts": 'const q = cfg.default / 2; import p from "infra/after_kw_prop";\n',
                 "web/div_jsx.tsx": 'const el = <div>a</div><div>b</div>; import j from "infra/after_jsx";\n',
+                "web/div_jsx_self.tsx": 'const el = <Box /> / 2; import j2 from "infra/after_jsx_self";\n',
                 "src/broken.py": "def bad(:\n",
             },
         )
@@ -225,11 +236,17 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
             "web/tpl_real.ts",
             "web/req.ts",
             "web/div.ts",
+            "web/div_obj.ts",
+            "web/div_obj_dyn.ts",
+            "web/div_fn_cls.ts",
+            "web/div_block_obj.ts",
+            "web/div_ternary_obj.ts",
             "web/div_expr.ts",
             "web/div_tpl.ts",
             "web/div_if.ts",
             "web/div_prop.ts",
             "web/div_jsx.tsx",
+            "web/div_jsx_self.tsx",
         ):
             self.assertIn(bad_js, by_file, bad_js)
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")

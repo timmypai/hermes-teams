@@ -501,16 +501,24 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "const tpl = `hello ${s}\nimport('infra/private')\nrequire('infra/x')`;\n"
             'const member = obj.import("infra/not_real");\n'
             "const re = /import\\('infra\\/fake'\\)/;\n"
-            "if (s) /import\\('infra\\/if_fake'\\)/;\n",
+            "if (s) /import\\('infra\\/if_fake'\\)/;\n"
+            "if (s) {} /import\\('infra\\/block_fake'\\)/g;\n"
+            "function fd() {} /import\\('infra\\/fd_fake'\\)/g;\n"
+            "class Cd {} /import\\('infra\\/cd_fake'\\)/g;\n",
         )
         self.write("web/dyn.ts", 'export async function load() { return import("infra/client"); }\n')
         self.write("web/tpl_real.ts", "export const x = `${await import('infra/tpl_client')}`;\n")
         self.write("web/div.ts", 'const ratio = 1 / 2; import x from "infra/x";\n')
+        self.write("web/div_obj.ts", 'const ratio = {} / 2; import x from "infra/obj_x";\n')
+        self.write("web/div_obj_dyn.ts", 'const o = { m() {} } / 2; const m = await import("infra/obj_dyn");\n')
+        self.write("web/div_fn_cls.ts", 'const f = function() {} / 2; const c = class {} / 2; import y from "infra/fn_cls";\n')
+        self.write("web/div_block_obj.ts", 'if (s) { const r = {} / 2; }\nimport b from "infra/block_obj";\n')
         self.write("web/div_expr.ts", 'const a = (1 + 2) / 3; const b = arr[0] / 2; const c = i++ / 2; import y from "infra/y";\n')
         self.write("web/div_tpl.ts", 'const t = `${s}` / 2; import z from "infra/z";\n')
         self.write("web/div_if.ts", 'if (s) /ok/g; import w from "infra/w";\n')
         self.write("web/div_prop.ts", 'const d = cfg.default / 2; import p from "infra/p";\n')
         self.write("web/div_jsx.tsx", 'const el = <div>a</div><div>b</div>; import j from "infra/jsx";\n')
+        self.write("web/div_jsx_self.tsx", 'const el = <Box /> / 2; import j2 from "infra/jsx2";\n')
         self.write("domain/broken.py", "def broken(:\n")
         code, out = self.check()
         self.assertEqual(code, 1, out)
@@ -519,13 +527,18 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/div.ts",
+            "web/div_obj.ts",
+            "web/div_obj_dyn.ts",
+            "web/div_fn_cls.ts",
             "web/div_expr.ts",
             "web/div_tpl.ts",
             "web/div_if.ts",
             "web/div_prop.ts",
             "web/div_jsx.tsx",
+            "web/div_jsx_self.tsx",
         ):
             self.assertIn(f"{bad_js}:1 [domain-boundary]", out, bad_js)
+        self.assertIn("web/div_block_obj.ts:2 [domain-boundary]", out)
         self.assertIn("domain/broken.py:1 [domain-boundary]", out)
         self.assertIn("SyntaxError", out)
 
@@ -534,11 +547,16 @@ class ImportBoundaryAndDiffBudget(PrRepo):
             "web/dyn.ts",
             "web/tpl_real.ts",
             "web/div.ts",
+            "web/div_obj.ts",
+            "web/div_obj_dyn.ts",
+            "web/div_fn_cls.ts",
+            "web/div_block_obj.ts",
             "web/div_expr.ts",
             "web/div_tpl.ts",
             "web/div_if.ts",
             "web/div_prop.ts",
             "web/div_jsx.tsx",
+            "web/div_jsx_self.tsx",
         ):
             self.write(bad_js, "export const ok = 1;\n")
         self.write("domain/broken.py", "X = 1\n")

@@ -316,8 +316,12 @@ _REGEX_PREV_KW = frozenset({
     "return", "throw", "case", "else", "do", "yield", "await",
     "typeof", "void", "delete", "in", "of", "default",
 })
+_BRACE_EXPR_KW = frozenset({
+    "return", "throw", "yield", "await", "typeof", "void", "delete", "in", "of",
+})
 _CTRL_KW = frozenset({"if", "while", "for", "with"})
 _REGEX_PREV_PUNCT = frozenset({"(", "[", "{", "}", ",", ";", "=", ":", "?"})
+_EXPR_PREV_PUNCT = frozenset({"(", "[", ",", "=", ":", "?"})
 _REGEX_PREV_OP = frozenset({
     "=", "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", ">>>=",
     "&&=", "||=", "??=", "=>", "!", "~", "+", "-", "*", "%", "**", "&", "|", "^",
@@ -340,14 +344,35 @@ def _sig_tokens_tail(tokens: list[tuple[str, str, int]], limit: int = 3) -> list
     return out
 
 
+def _is_jsx_close_gt(tokens: list[tuple[str, str, int]]) -> bool:
+    """Return True when a trailing `>` token closes `<Tag />` or `</Tag>` JSX syntax."""
+    sig = _sig_tokens_tail(tokens, 8)
+    if len(sig) < 2 or sig[0][0] != "OP" or sig[0][1] != ">":
+        return False
+    if sig[1][0] == "OP" and sig[1][1] == "/":
+        return True
+    i = 1
+    while i < len(sig):
+        k, v, _ = sig[i]
+        if k == "IDENT" or (k == "PUNCT" and v == "."):
+            i += 1
+            continue
+        if k == "OP" and v == "/" and i > 1 and i + 1 < len(sig):
+            return sig[i + 1][0] == "OP" and sig[i + 1][1] == "<"
+        return False
+    return False
+
+
 def _js_allows_regex(tokens: list[tuple[str, str, int]]) -> bool:
     sig = _sig_tokens_tail(tokens, 2)
     if not sig:
         return True
     kind, val, _ = sig[0]
-    if kind in ("TPL", "TPL_MID", "CTRL_CLOSE"):
+    if kind in ("TPL", "TPL_MID", "CTRL_CLOSE", "LABEL_COLON"):
         return True
     if kind == "OP":
+        if val == ">" and _is_jsx_close_gt(tokens):
+            return False
         return val in _REGEX_PREV_OP
     if kind == "PUNCT":
         return val in _REGEX_PREV_PUNCT
@@ -367,6 +392,86 @@ def _is_ctrl_paren_open(tokens: list[tuple[str, str, int]]) -> bool:
     if sig[0][1] == "await" and len(sig) >= 2 and sig[1][0] == "IDENT" and sig[1][1] == "for":
         return not (len(sig) >= 3 and sig[2][0] == "PUNCT" and sig[2][1] == ".")
     return False
+
+
+def _is_expr_prefix_tok(sig: list[tuple[str, str, int]], idx: int, brace_kinds: list[str]) -> bool:
+    pk, pv, _ = sig[idx]
+    if pk in ("TPL", "TPL_MID"):
+        return True
+    if pk == "OP":
+        return pv != "=>" and pv in _REGEX_PREV_OP
+    if pk == "PUNCT":
+        if brace_kinds and brace_kinds[-1] == "obj" and pv in ("{", ","):
+            return False
+        return pv in _EXPR_PREV_PUNCT
+    if pk == "IDENT":
+        if idx + 1 < len(sig) and sig[idx + 1] == ("PUNCT", ".", sig[idx + 1][2]):
+            return False
+        if pv == "default":
+            is_exp = idx + 1 < len(sig) and sig[idx + 1][0] == "IDENT" and sig[idx + 1][1] == "export"
+            return is_exp
+        return pv in _BRACE_EXPR_KW
+    return False
+
+
+def _is_fn_class_expr(tokens: list[tuple[str, str, int]], kw: str, brace_kinds: list[str]) -> bool:
+    """Return True when `function`/`class` begins an expression rather than a statement declaration."""
+    sig = _sig_tokens_tail(tokens, 4)
+    if not sig:
+        return False
+    idx = 0
+    if kw == "function" and sig[0][0] == "IDENT" and sig[0][1] == "async":
+        if not (len(sig) >= 2 and sig[1] == ("PUNCT", ".", sig[1][2])):
+            idx = 1
+    if idx >= len(sig):
+        return False
+    pk, pv, _ = sig[idx]
+    if pk == "IDENT" and pv == "default" and idx + 1 < len(sig) and sig[idx + 1][0] == "IDENT" and sig[idx + 1][1] == "export":
+        return False
+    return _is_expr_prefix_tok(sig, idx, brace_kinds)
+
+
+def _brace_open_kind(
+    tokens: list[tuple[str, str, int]],
+    brace_kinds: list[str],
+    expr_head_depths: list[tuple[int, int]],
+    paren_len: int,
+) -> str:
+    """Classify `{` as `'fn_expr'`, `'obj'`, or `'block'` so closing `}` preserves division vs regex."""
+    depth = (paren_len, len(brace_kinds))
+    sig = _sig_tokens_tail(tokens, 2)
+    if expr_head_depths and expr_head_depths[-1] == depth:
+        is_expr_or_label = bool(
+            sig and (sig[0][0] == "LABEL_COLON" or _is_expr_prefix_tok(sig, 0, []))
+        )
+        if not is_expr_or_label:
+            expr_head_depths.pop()
+            return "fn_expr"
+    if not sig:
+        return "block"
+    pk, pv, _ = sig[0]
+    if pk == "PUNCT" and pv in _EXPR_PREV_PUNCT:
+        return "obj"
+    if _is_expr_prefix_tok(sig, 0, []):
+        return "obj"
+    return "block"
+
+
+def _prune_depths(
+    ternary_depths: list[tuple[int, int]],
+    expr_head_depths: list[tuple[int, int]],
+    paren_len: int,
+    brace_len: int,
+    *,
+    strict: bool,
+) -> None:
+    for stack in (ternary_depths, expr_head_depths):
+        while stack:
+            dp, db = stack[-1]
+            drop = (dp >= paren_len and db >= brace_len) if not strict else (dp > paren_len or db > brace_len)
+            if not drop:
+                break
+            stack.pop()
 
 
 def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
@@ -401,6 +506,9 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
     tokens: list[tuple[str, str, int]] = []
     tpl_braces: list[int] = []
     paren_ctrl: list[bool] = []
+    brace_kinds: list[str] = []
+    expr_head_depths: list[tuple[int, int]] = []
+    ternary_depths: list[tuple[int, int]] = []
     i = 0
     n = len(text)
     lineno = 1
@@ -475,6 +583,8 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
         if ch == "{":
             if tpl_braces:
                 tpl_braces[-1] += 1
+            bkind = _brace_open_kind(tokens, brace_kinds, expr_head_depths, len(paren_ctrl))
+            brace_kinds.append(bkind)
             tokens.append(("PUNCT", "{", lineno))
             i += 1
             continue
@@ -491,7 +601,9 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
                         tokens.append(("TPL_END", "`", end_line))
                     continue
                 tpl_braces[-1] -= 1
-            tokens.append(("PUNCT", "}", lineno))
+            bkind = brace_kinds.pop() if brace_kinds else "block"
+            _prune_depths(ternary_depths, expr_head_depths, len(paren_ctrl), len(brace_kinds), strict=True)
+            tokens.append(("EXPR_RBRACE" if bkind != "block" else "PUNCT", "}", lineno))
             i += 1
             continue
         if ch == "(":
@@ -501,7 +613,32 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             continue
         if ch == ")":
             is_ctrl = paren_ctrl.pop() if paren_ctrl else False
+            _prune_depths(ternary_depths, expr_head_depths, len(paren_ctrl), len(brace_kinds), strict=True)
             tokens.append(("CTRL_CLOSE" if is_ctrl else "PUNCT", ")", lineno))
+            i += 1
+            continue
+        if ch == "?":
+            if i + 1 < n and text[i + 1] == ".":
+                tokens.append(("PUNCT", "?", lineno))
+            else:
+                ternary_depths.append((len(paren_ctrl), len(brace_kinds)))
+                tokens.append(("PUNCT", "?", lineno))
+            i += 1
+            continue
+        if ch == ":":
+            depth = (len(paren_ctrl), len(brace_kinds))
+            if ternary_depths and ternary_depths[-1] == depth:
+                ternary_depths.pop()
+                tokens.append(("PUNCT", ":", lineno))
+            elif brace_kinds and brace_kinds[-1] == "obj":
+                tokens.append(("PUNCT", ":", lineno))
+            else:
+                tokens.append(("LABEL_COLON", ":", lineno))
+            i += 1
+            continue
+        if ch == ";":
+            _prune_depths(ternary_depths, expr_head_depths, len(paren_ctrl), len(brace_kinds), strict=False)
+            tokens.append(("PUNCT", ";", lineno))
             i += 1
             continue
         if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
@@ -543,7 +680,10 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             i += 1
             while i < n and (text[i].isalnum() or text[i] in ("_", "$")):
                 i += 1
-            tokens.append(("IDENT", text[start:i], start_line))
+            ident = text[start:i]
+            if ident in ("function", "class") and _is_fn_class_expr(tokens, ident, brace_kinds):
+                expr_head_depths.append((len(paren_ctrl), len(brace_kinds)))
+            tokens.append(("IDENT", ident, start_line))
             continue
         matched_op = ""
         for mop in _MULTI_OPS:
@@ -554,7 +694,7 @@ def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
             tokens.append(("OP", matched_op, lineno))
             i += len(matched_op)
             continue
-        if ch in (";", "[", "]", ".", "=", ",", ":", "?"):
+        if ch in ("[", "]", ".", "=", ","):
             tokens.append(("PUNCT", ch, lineno))
         else:
             tokens.append(("OP", ch, lineno))
@@ -591,8 +731,8 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
             paren_depth -= 1
             if paren_depth < 0:
                 paren_depth = 0
-        elif kind == "PUNCT" and val in ("{", "}"):
-            brace_depth += 1 if val == "{" else -1
+        elif (kind == "PUNCT" and val in ("{", "}")) or kind == "EXPR_RBRACE":
+            brace_depth += 1 if kind == "PUNCT" and val == "{" else -1
             if brace_depth < 0:
                 brace_depth = 0
 
