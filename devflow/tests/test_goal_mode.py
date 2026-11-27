@@ -309,6 +309,43 @@ class Plan(unittest.TestCase):
             self.creators[DEV] = allowed
             self.assertEqual(self.findings("工作卡只由 orchestrator"), [])
 
+    def test_developer_codex_prompt_and_skills_cover_goal_mode_and_scope_overrides(self):
+        agents_md = (KIT / "codex" / "AGENTS.md").read_text(encoding="utf-8")
+        for token in (
+            "goal_mode",
+            "goal judge",
+            "continuation turn",
+            "嚴禁改叫 `kanban_complete`",
+            "exact head SHA",
+            "重構僅限本卡目標與 `Allowed-Scope` 內",
+            "Allowed-Scope",
+            "followups",
+        ):
+            self.assertIn(token, agents_md)
+
+        develop_skill = (KIT / "skills" / "devflow-develop" / "SKILL.md").read_text(encoding="utf-8")
+        for token in (
+            "goal_mode",
+            "goal judge",
+            "continuation turn",
+            "嚴禁改呼叫 `kanban_complete`",
+            "exact head SHA",
+            "重構僅限本卡目標與 `Allowed-Scope` 內",
+            "Allowed-Scope",
+        ):
+            self.assertIn(token, develop_skill)
+
+        devops_skill = (KIT / "skills" / "devflow-devops" / "SKILL.md").read_text(encoding="utf-8")
+        fix_row = next(line for line in devops_skill.splitlines() if "程式碼、測試或部署程式問題" in line)
+        for token in ("goal_mode=true", "## 本卡完成", "Allowed-Scope:", "kanban_comment"):
+            self.assertIn(token, fix_row)
+
+        orchestrate_skill = (KIT / "skills" / "devflow-orchestrate" / "SKILL.md").read_text(encoding="utf-8")
+        cli_src = (KIT / "bin" / "devflow").read_text(encoding="utf-8")
+        self.assertNotIn("goal_mode 建卡後改不了", cli_src)
+        self.assertNotIn("`goal_mode` 建卡後改不了", orchestrate_skill)
+        self.assertIn("待處理卡可由 devflow tick 原地補開", cli_src)
+
 
 if __name__ == "__main__":
     unittest.main()
