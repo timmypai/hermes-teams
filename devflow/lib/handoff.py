@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from collections import deque
 from pathlib import PurePosixPath
 from typing import Any
@@ -275,12 +276,58 @@ class _CharNFA:
         return cur
 
 
+_MAX_CODEPOINT = sys.maxunicode
+
+
+def _normalize_intervals(intervals: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    if not intervals:
+        return ()
+    ordered = sorted(intervals)
+    out = [ordered[0]]
+    for lo, hi in ordered[1:]:
+        plo, phi = out[-1]
+        if lo <= phi + 1:
+            out[-1] = (plo, max(phi, hi))
+        else:
+            out.append((lo, hi))
+    return tuple(out)
+
+
+def _complement_intervals(intervals: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    out: list[tuple[int, int]] = []
+    cur = 0
+    for lo, hi in intervals:
+        if cur < lo:
+            out.append((cur, lo - 1))
+        cur = hi + 1
+    if cur <= _MAX_CODEPOINT:
+        out.append((cur, _MAX_CODEPOINT))
+    return tuple(out)
+
+
+def _intersect_intervals(
+    iv1: tuple[tuple[int, int], ...],
+    iv2: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    out: list[tuple[int, int]] = []
+    i, j = 0, 0
+    while i < len(iv1) and j < len(iv2):
+        lo = max(iv1[i][0], iv2[j][0])
+        hi = min(iv1[i][1], iv2[j][1])
+        if lo <= hi:
+            out.append((lo, hi))
+        if iv1[i][1] < iv2[j][1]:
+            i += 1
+        else:
+            j += 1
+    return tuple(out)
+
+
 def _parse_fnmatch_class(pat: str, i: int) -> tuple[tuple[str, Any], int]:
-    """Parse Python `fnmatch`-style `[...]` character class at `i` (or literal `[` if unclosed)."""
+    """Parse Python `fnmatch`-style `[...]` character class at `i` with exact range semantics."""
     n = len(pat)
     j = i + 1
-    neg = j < n and pat[j] == "!"
-    if neg:
+    if j < n and pat[j] == "!":
         j += 1
     if j < n and pat[j] == "]":
         j += 1
@@ -288,18 +335,55 @@ def _parse_fnmatch_class(pat: str, i: int) -> tuple[tuple[str, Any], int]:
         j += 1
     if j >= n:
         return ("lit", "["), i + 1
-    stuff = pat[(i + 2 if neg else i + 1) : j]
-    chars: set[str] = set()
-    k = 0
-    m = len(stuff)
-    while k < m:
-        if k + 2 < m and stuff[k + 1] == "-" and ord(stuff[k]) <= ord(stuff[k + 2]):
-            chars.update(chr(code) for code in range(ord(stuff[k]), ord(stuff[k + 2]) + 1))
-            k += 3
+
+    s = i + 1
+    stuff = pat[s:j]
+    neg = stuff.startswith("!")
+    if "-" not in stuff:
+        body = stuff[1:] if neg else stuff
+        iv = _normalize_intervals([(ord(c), ord(c)) for c in body])
+    else:
+        chunks: list[str] = []
+        pos = s
+        k = s + 2 if pat[s] == "!" else s + 1
+        while True:
+            k = pat.find("-", k, j)
+            if k < 0:
+                break
+            chunks.append(pat[pos:k])
+            pos = k + 1
+            k = k + 3
+        chunk = pat[pos:j]
+        if chunk:
+            chunks.append(chunk)
         else:
-            chars.add(stuff[k])
-            k += 1
-    return ("cls", (neg, frozenset(chars))), j + 1
+            chunks[-1] += "-"
+        # Match fnmatch._translate: strip descending ranges right-to-left.
+        for idx in range(len(chunks) - 1, 0, -1):
+            if chunks[idx - 1] and chunks[idx] and chunks[idx - 1][-1] > chunks[idx][0]:
+                chunks[idx - 1] = chunks[idx - 1][:-1] + chunks[idx][1:]
+                del chunks[idx]
+        if neg and chunks and chunks[0].startswith("!"):
+            chunks[0] = chunks[0][1:]
+        raw_iv: list[tuple[int, int]] = []
+        if len(chunks) == 1:
+            for c in chunks[0]:
+                raw_iv.append((ord(c), ord(c)))
+        else:
+            for m, ch in enumerate(chunks):
+                lo_i = 1 if m > 0 else 0
+                hi_i = len(ch) - 1 if m < len(chunks) - 1 else len(ch)
+                for c in ch[lo_i:hi_i]:
+                    raw_iv.append((ord(c), ord(c)))
+                if m < len(chunks) - 1 and ch and chunks[m + 1]:
+                    raw_iv.append((ord(ch[-1]), ord(chunks[m + 1][0])))
+        iv = _normalize_intervals(raw_iv)
+
+    if neg:
+        iv = _complement_intervals(iv)
+    if iv == ((0, _MAX_CODEPOINT),):
+        return ("any", None), j + 1
+    return ("cls", iv), j + 1
 
 
 def _has_fnmatch_wild(pat: str) -> bool:
@@ -310,7 +394,7 @@ def _has_fnmatch_wild(pat: str) -> bool:
     while i < n:
         if pat[i] == "[":
             matcher, next_i = _parse_fnmatch_class(pat, i)
-            if matcher[0] == "cls":
+            if matcher[0] != "lit":
                 return True
             i = next_i
         else:
@@ -369,30 +453,19 @@ def _meet_matchers(m1: tuple[str, Any], m2: tuple[str, Any]) -> tuple[str, Any] 
     k1, v1 = m1
     k2, v2 = m2
     if k1 == "any":
-        return None if (k2 == "cls" and not v2[0] and not v2[1]) else m2
+        return None if (k2 == "cls" and not v2) else m2
     if k2 == "any":
-        return None if (k1 == "cls" and not v1[0] and not v1[1]) else m1
+        return None if (k1 == "cls" and not v1) else m1
     if k1 == "lit" and k2 == "lit":
         return m1 if v1 == v2 else None
     if k1 == "lit":
-        neg, chars = v2
-        return m1 if ((v1 not in chars) if neg else (v1 in chars)) else None
+        o = ord(v1)
+        return m1 if any(lo <= o <= hi for lo, hi in v2) else None
     if k2 == "lit":
-        neg, chars = v1
-        return m2 if ((v2 not in chars) if neg else (v2 in chars)) else None
-    neg1, s1 = v1
-    neg2, s2 = v2
-    if not neg1 and not neg2:
-        inter = s1 & s2
-        return ("cls", (False, inter)) if inter else None
-    if not neg1 and neg2:
-        diff = s1 - s2
-        return ("cls", (False, diff)) if diff else None
-    if neg1 and not neg2:
-        diff = s2 - s1
-        return ("cls", (False, diff)) if diff else None
-    uni = s1 | s2
-    return ("cls", (True, uni)) if any(chr(code) not in uni for code in range(32, 127)) else None
+        o = ord(v2)
+        return m2 if any(lo <= o <= hi for lo, hi in v1) else None
+    inter = _intersect_intervals(v1, v2)
+    return ("cls", inter) if inter else None
 
 
 def _prepare_nfa(nfa: _CharNFA) -> tuple[list[bool], list[list[tuple[tuple[str, Any], int]]]]:

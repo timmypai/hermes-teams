@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -205,6 +206,8 @@ class AtomicScopeMerge(unittest.TestCase):
             ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `**/*.env`\n", ["config.v1"]),
             (base.replace("src/private/**", "src*/private.py"), None, ["src/a*"]),
             (base.replace("src/private/**", "src/?x.py"), None, ["src/**src/a?.py"]),
+            (base.replace("src/private/**", "app/[z].py"), None, ["app/[!z-a].py"]),
+            (base.replace("src/private/**", "app/[! -~].py"), None, ["app/[! -~]*.py"]),
         ):
             with self.assertRaises(ValueError, msg=f"{oos_body} / {epic_body} + {bad_add}"):
                 handoff_lib.merge_allowed_scope_into_body(oos_body, bad_add, epic_body=epic_body)
@@ -234,23 +237,35 @@ class AtomicScopeMerge(unittest.TestCase):
             ("src/*_test.py", "src/*_prod.py"),
             ("src/*_test.py", "src/*.ts"),
             ("src/**src/foo.py", "src/*bar.py"),
+            ("app/[z-a].py", "app/[z].py"),
         ):
             self.assertFalse(handoff_lib._globs_overlap(a, b), (a, b))
             self.assertFalse(handoff_lib._globs_overlap(b, a), (b, a))
         # Wildcardless `src/secret.py` matches descendants `src/secret.py/...` under scope.match_glob -> sound True
         self.assertTrue(handoff_lib._globs_overlap("src/*_test.py", "src/secret.py"))
-        # Slash-spanning & overlapping prefix/suffix `**` wildcards (PR #41 regressions)
+        # Slash-spanning, prefix/suffix `**`, descending/empty class & Unicode complement (PR #41 regressions)
         for a, b in (
             ("src/a*", "src*/private.py"),
             ("src/**src/a?.py", "src/?x.py"),
             ("src/**src", "src"),
             (".env", "env"),
             (".devflow/**", "devflow/a.py"),
+            ("app/[!z-a].py", "app/[z].py"),
+            ("app/[! -~].py", "app/[! -~]*.py"),
         ):
             self.assertTrue(handoff_lib._globs_overlap(a, b), (a, b))
             self.assertTrue(handoff_lib._globs_overlap(b, a), (b, a))
 
-        # Unconditional 0-false-negative property check across 51 globs x 53 paths
+        # Character-class interval parser parity against Python stdlib `fnmatch.fnmatchcase`
+        sample_chars = [chr(c) for c in range(32, 127)] + ["中", "é", "\n"]
+        for cls_pat in ("[z-a]", "[!z-a]", "[z-ax]", "[!z-az-a]", "[a-z-0]", "[!--]", "[!]]", "[! -~]", "[z-a-b]", "[^a]", "[!^a]", "[]a]"):
+            matcher, next_i = handoff_lib._parse_fnmatch_class(cls_pat, 0)
+            self.assertEqual(next_i, len(cls_pat), cls_pat)
+            for ch in sample_chars:
+                got = True if matcher[0] == "any" else any(lo <= ord(ch) <= hi for lo, hi in matcher[1])
+                self.assertEqual(got, fnmatch.fnmatchcase(ch, cls_pat), (cls_pat, ch, matcher))
+
+        # Unconditional 0-false-negative property check across 57 globs x 56 paths
         globs = [
             "app/a.py", "app/b.py", "src/foo.py", "src/foobar.py", "src/secret.py",
             "src/*_test.py", "src/*_prod.py", "src/*.py", "src/*.ts", "src/*.rs",
@@ -259,6 +274,7 @@ class AtomicScopeMerge(unittest.TestCase):
             "src/**src/a?.py", "src/?x.py", "src/**src", "src/**a.py", "src/**/a.py",
             "src/**src/foo.py", "src/*bar.py",
             "app/[a-z]/*.py", "app/[a-z]*.py", "app/[a-z]", "app/secret/x.py", "app/secret/**", "app/public*.py",
+            "app/[!z-a].py", "app/[z].py", "app/[z-a].py", "app/[z-ax].py", "app/[! -~].py", "app/[! -~]*.py",
             "**/*.env", "src/**/*.py", "tests/**/*.py", "config", "config.v1", "config/",
             "a/**/foo.py", "a/*/foo.py", "a/*/b/*.py", "docs/[!x]/*.md", "ops/?/cfg.yml",
             "a[/-]b", "a/**/b/**/c.py", "a/**b/c", "a/**//b",
@@ -268,6 +284,7 @@ class AtomicScopeMerge(unittest.TestCase):
         paths = [
             "app/a.py", "app/b.py", "app/x/m.py", "app/1/m.py", "app/secret/x.py", "app/secret/x.py/a.py",
             "app/secret/a.py", "app/public_api.py", "app/a", "app/a/b.py",
+            "app/z.py", "app/x.py", "app/中.py",
             "src/foo.py", "src/foobar.py", "src/a_test.py", "src/a_prod.py", "src/secret.py",
             "src/secret.py/a_test.py", "src/private", "src/private/a.py", "src/private/sub/b.ts",
             "src/app/private.py", "src/x/private.py",
