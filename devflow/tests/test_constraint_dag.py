@@ -359,6 +359,83 @@ class ConstraintDagBoundaries(unittest.TestCase):
         self.assertEqual(code_ep_bad, 1, res_ep_bad)
         self.assertTrue(any("Allow-Write" in f for f in res_ep_bad["findings"]), res_ep_bad)
 
+    def test_tick_board_skips_competing_plan_adj_when_waking_epic_parents_are_all_done(self) -> None:
+        ep_done_parent = self._epic("", with_scenarios=False)
+        res_done = self._res("t_res1", assignee="devops", ws="dir", status="done",
+                             body="## 目標\n已取證\n覆蓋：AC-1\nEPIC: t_ep1\n")
+        ep_done_parent["parents"] = ["t_res1"]
+        cards_waking = {"t_ep1": ep_done_parent, "t_res1": res_done}
+
+        # Direct plan_rules still strictly catches missing AC coverage once discovery ended.
+        direct = self.df.plan_rules("b", "t_ep1", cards_waking)
+        self.assertTrue(any("AC-2 沒有任何卡片負責" in f for f in direct), direct)
+
+        orig_kanban = self.df.kanban
+        orig_plan_cards = self.df.plan_cards
+        orig_tick_prs = self.df.tick_prs
+        orig_release_held = self.df.release_held
+        orig_release_adv = self.df.release_rate_limited_advisors
+        orig_route_q = self.df.route_questions
+        orig_run = self.df.run
+        orig_repair = self.df.repair_bodies
+        self.addCleanup(setattr, self.df, "kanban", orig_kanban)
+        self.addCleanup(setattr, self.df, "plan_cards", orig_plan_cards)
+        self.addCleanup(setattr, self.df, "tick_prs", orig_tick_prs)
+        self.addCleanup(setattr, self.df, "release_held", orig_release_held)
+        self.addCleanup(setattr, self.df, "release_rate_limited_advisors", orig_release_adv)
+        self.addCleanup(setattr, self.df, "route_questions", orig_route_q)
+        self.addCleanup(setattr, self.df, "run", orig_run)
+        self.addCleanup(setattr, self.df, "repair_bodies", orig_repair)
+
+        active_plan = cards_waking
+        epic_list_view = {**ep_done_parent}
+        created: list[list[str]] = []
+
+        def fake_kanban(board: str, cmd: str, *args: str) -> str:
+            if cmd == "list":
+                return json.dumps([epic_list_view, *[c for k, c in active_plan.items() if k != "t_ep1"]])
+            if cmd == "show":
+                tid = args[0]
+                t = active_plan.get(tid) or epic_list_view
+                return json.dumps({"task": t, "parents": t.get("parents") or [], "comments": []})
+            return ""
+
+        def fake_run(cmd, **kw):
+            if isinstance(cmd, list) and "create" in cmd:
+                created.append(cmd)
+                return types.SimpleNamespace(returncode=0, stdout=f"Created t_adj{len(created):05d}\n", stderr="")
+            return orig_run(cmd, **kw)
+
+        self.df.kanban = fake_kanban
+        self.df.plan_cards = lambda board, eid: active_plan
+        self.df.tick_prs = lambda *a: False
+        self.df.release_held = lambda *a: None
+        self.df.release_rate_limited_advisors = lambda *a: False
+        self.df.route_questions = lambda *a: False
+        self.df.repair_bodies = lambda *a: []
+        self.df.run = fake_run
+
+        st: dict = {}
+        # 1. All parents done -> EPIC is waking up -> tick_board must NOT spawn a competing [ADJ].
+        self.assertFalse(self.df.tick_board("b", st))
+        self.assertEqual(created, [])
+
+        # 2. Stale list snapshot saw status='todo', but fresh_cards already transitioned EPIC to 'ready'
+        #    with an open parent -> tick_board must also skip spawning a competing [ADJ].
+        ep_live_ready = {**self._epic("", with_scenarios=True), "status": "ready", "parents": ["t_dev1"]}
+        dev_no_ship = self._dev("t_dev1", acs="AC-1, AC-2", with_ship=False)
+        active_plan = {"t_ep1": ep_live_ready, **dev_no_ship}
+        self.assertFalse(self.df.tick_board("b", {}))
+        self.assertEqual(created, [])
+
+        # 3. Positive control: sleeping EPIC (todo) with an open parent violating rules ([DEV] missing [SHIP])
+        #    still triggers check_plan and opens one [ADJ].
+        ep_sleeping_bad = {**self._epic("", with_scenarios=True), "status": "todo", "parents": ["t_dev1"]}
+        active_plan = {"t_ep1": ep_sleeping_bad, **dev_no_ship}
+        self.assertFalse(self.df.tick_board("b", {}))
+        self.assertEqual(len(created), 1)
+        self.assertIn("[ADJ] 計畫規則修正 t_ep1", created[0])
+
 
 class ObsoleteHooksCleanup(unittest.TestCase):
     def test_retire_obsolete_hooks_removes_stage_card_and_preserves_dispatch_tick(self) -> None:

@@ -3487,6 +3487,13 @@ def tick_board(board: str, st: dict) -> bool:
                 if _maybe_mark_slice_paused(board, tid, cards, ep_pipe, retry_out=pause_retry) and plans.get(tid) == pre_pause_fp:
                     plans[tid] = plan_fingerprint(tid, cards, repo, board=board)
                 retry = bool(pause_retry) or retry
+                epic_card = cards.get(tid) or {}
+                has_open_parent = any(
+                    (cards.get(pid) or {}).get("status") not in ("done", "archived")
+                    for pid in epic_card.get("parents") or []
+                )
+                if epic_card.get("status") not in ("todo", "blocked", "scheduled") or not has_open_parent:
+                    continue
                 if fixed := repair_bodies(board, tid, cards):
                     kanban(board, "comment", tid, f"devflow：已整理 {'、'.join(fixed)}（刪照抄的 EPIC AC、恢復 `{DONE_HEADING}` 固定文字、"
                                                   "補齊缺少的 `goal_mode`）")
