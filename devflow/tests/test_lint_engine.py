@@ -563,6 +563,33 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         self.assertEqual(rep_new["checks"].get("static_rules"), "fail")
         self.assertTrue(any("no-infra" in f and "web/ok.js:2" in f for f in rep_new["findings"]), rep_new["findings"])
 
+        # 6. Canonical `.devflow/rules/baseline.json` (written by check.py --write-baseline) is also honored
+        canon_baseline = repo / ".devflow" / "rules" / "baseline.json"
+        canon_baseline.write_text((repo / ".devflow" / "baseline.json").read_text(encoding="utf-8"), encoding="utf-8")
+        (repo / ".devflow" / "baseline.json").unlink()
+        (repo / "web" / "ok.js").write_text('const v = 3;\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "use canonical baseline path"], check=True)
+        base_3 = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "web" / "ok.js").write_text('const db = require.resolve("infra/db");\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baselined line under rules/"], check=True)
+        rep_canon = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_3, card_body=card, run_tests=True)
+        self.assertTrue(rep_canon["ok"], rep_canon)
+        self.assertEqual(rep_canon["checks"].get("static_rules"), "ok")
+
+        (repo / "web" / "ok.js").write_text(
+            'const db = require.resolve("infra/db");\nconst db2 = require.resolve("infra/cache");\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "new violation under rules/"], check=True)
+        rep_canon_new = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_3, card_body=card, run_tests=True)
+        self.assertFalse(rep_canon_new["ok"], rep_canon_new)
+        self.assertEqual(rep_canon_new["checks"].get("static_rules"), "fail")
+        self.assertTrue(any("no-infra" in f and "web/ok.js:2" in f for f in rep_canon_new["findings"]), rep_canon_new["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()
