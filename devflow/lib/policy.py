@@ -72,10 +72,13 @@ DEFAULT_PIPELINES: dict[str, dict[str, Any]] = {
     },
 }
 
-DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, list[str]]] = {
+DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, Any]] = {
     "repro": {
         "required": ["root_cause", "evidence"],
-        "optional": ["affected_paths", "non_goals", "open_questions"],
+        "optional": [
+            "affected_paths", "non_goals", "open_questions",
+            "recommendation", "findings", "sources", "risks", "unverified",
+        ],
     },
     "design": {
         "required": ["decisions", "target_files"],
@@ -90,8 +93,15 @@ DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, list[str]]] = {
         "optional": ["base_ref", "summary", "followups"],
     },
     "ship": {
-        "required": ["merged_sha"],
-        "optional": ["deployed_sha", "acceptance_report", "followups"],
+        "required": [],
+        "required_when": [
+            {"when": {"shipped": False}, "required": ["reason"]},
+            {"default": True, "required": ["merged_sha"]},
+        ],
+        "optional": [
+            "shipped", "reason", "merged_sha", "deployed_sha",
+            "deploy_run_url", "integration_run_url", "acceptance_report", "verify", "followups",
+        ],
     },
 }
 
@@ -326,16 +336,37 @@ def pipelines_config(policy: dict[str, Any] | None = None) -> dict[str, dict[str
     return out
 
 
-def handoff_schemas(policy: dict[str, Any] | None = None) -> dict[str, dict[str, list[str]]]:
+def _normalize_handoff_schema(spec: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "required": [str(x).strip() for x in (spec.get("required") or []) if str(x).strip()],
+        "optional": [str(x).strip() for x in (spec.get("optional") or []) if str(x).strip()],
+    }
+    raw_when = spec.get("required_when")
+    if isinstance(raw_when, list) and raw_when:
+        clauses: list[dict[str, Any]] = []
+        for item in raw_when:
+            if not isinstance(item, dict):
+                continue
+            clause: dict[str, Any] = {
+                "required": [str(x).strip() for x in (item.get("required") or []) if str(x).strip()]
+            }
+            if isinstance(item.get("when"), dict) and item["when"]:
+                clause["when"] = dict(item["when"])
+            if item.get("default"):
+                clause["default"] = True
+            clauses.append(clause)
+        if clauses:
+            out["required_when"] = clauses
+    return out
+
+
+def handoff_schemas(policy: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     """Return declarative handoff schemas keyed by pipeline step."""
-    out = {k: {sk: list(sv) for sk, sv in v.items()} for k, v in DEFAULT_HANDOFF_SCHEMAS.items()}
+    out = {k: _normalize_handoff_schema(v) for k, v in DEFAULT_HANDOFF_SCHEMAS.items()}
     raw = (policy or {}).get("handoff_schemas")
     if isinstance(raw, dict):
         for name, spec in raw.items():
             key = str(name or "").strip().lower()
             if key and isinstance(spec, dict):
-                out[key] = {
-                    "required": [str(x).strip() for x in (spec.get("required") or []) if str(x).strip()],
-                    "optional": [str(x).strip() for x in (spec.get("optional") or []) if str(x).strip()],
-                }
+                out[key] = _normalize_handoff_schema(spec)
     return out

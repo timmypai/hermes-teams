@@ -38,8 +38,10 @@ class KitPromptHygiene(unittest.TestCase):
             self.assertNotIn("ub-mode", spec.get("auto_load", []), role)
         self.assertIn("ub-mode", roles["obsolete_skills"]["codex"])
         codex = (KIT / "codex" / "AGENTS.md").read_text(encoding="utf-8")
-        for phrase, _ in prompt_audit.FORBIDDEN_DEVELOPER_PHRASES:
-            self.assertNotIn(phrase, codex)
+        contracts = prompt_audit.load_kit_contracts(KIT)
+        for entry in contracts.get("forbid_in_role") or []:
+            if entry.get("role") == "developer":
+                self.assertNotIn(entry["phrase"], codex)
 
     def test_on_demand_skills_exist_and_are_not_auto_loaded_by_workers(self) -> None:
         roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
@@ -84,6 +86,36 @@ class KitPromptHygiene(unittest.TestCase):
         self.assertIn("Push to the main line", joined)
         self.assertIn("禁止寫檔案路徑", joined)
         self.assertIn("超過上限 100", joined)
+
+    def test_audit_enforces_schema_doc_parity_lexer_parity_and_slug_hygiene(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="devflow-audit-contracts-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        kit = tmp / "kit"
+        shutil.copytree(KIT, kit, ignore=shutil.ignore_patterns("__pycache__", "vendor", "state"))
+
+        # Mutate schema-required fields in skill/soul docs -> audit fails closed
+        res_skill = kit / "skills" / "devflow-research" / "SKILL.md"
+        res_skill.write_text(res_skill.read_text(encoding="utf-8").replace("root_cause", "summary_only"), encoding="utf-8")
+        rev_soul = kit / "souls" / "reviewer.md"
+        rev_soul.write_text(rev_soul.read_text(encoding="utf-8").replace("`tests`、", ""), encoding="utf-8")
+        ops_skill = kit / "skills" / "devflow-devops" / "SKILL.md"
+        ops_skill.write_text(ops_skill.read_text(encoding="utf-8").replace('"reason"', '"note"').replace("reason", "note"), encoding="utf-8")
+
+        # Introduce 1-line drift in template check.py shared lexer + leaked card ID + dynamic repo slug
+        tpl_check = kit / "templates" / "repo" / ".devflow" / "check.py"
+        tpl_check.write_text(tpl_check.read_text(encoding="utf-8").replace('val in ("import", "require")', 'val in ("import",)'), encoding="utf-8")
+        devflow_bin = kit / "bin" / "devflow"
+        devflow_bin.write_text(devflow_bin.read_text(encoding="utf-8") + "\n# leaked t_deadbeef in sample-svc\n", encoding="utf-8")
+
+        rep = prompt_audit.audit_kit_prompts(kit, registered_slugs=["sample-svc"])
+        self.assertFalse(rep["ok"])
+        joined = "\n".join(rep["findings"])
+        self.assertIn("handoff_schemas.repro 必填欄位 `root_cause`", joined)
+        self.assertIn("handoff_schemas.implement 必填欄位 `tests`", joined)
+        self.assertIn("handoff_schemas.ship 條件必填欄位 `reason`", joined)
+        self.assertIn("共用 lexer 區塊不一致", joined)
+        self.assertIn("歷史看板卡號", joined)
+        self.assertIn("專案識別符 'sample-svc'", joined)
 
 
 class RepoAgentsConflictScan(unittest.TestCase):

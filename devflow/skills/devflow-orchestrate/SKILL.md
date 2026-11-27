@@ -52,6 +52,7 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
 7. `kanban_comment(EPIC, 計畫摘要：卡片清單、順序、AC 對應)`，再 `kanban_block(kind="dependency", reason="等待子卡完成：t_a, t_b…")`。
 
 ## B. 驗收（EPIC 被喚醒）
+- **分段暫停保護**：若 EPIC 設 `Stop-After` 且尚未到 `accept`（或含對應 `Paused-At:`），**嚴禁跑最終驗收或 `kanban_complete`**；若推進後有尚未建卡的後續步驟才補拆卡，否則維持 `kanban_block(kind="dependency", reason="Paused-At: ... 等待 devflow epic advance 推進")` 等待使用者推進。
 - **`investigate`**：核對子卡真實證據與限制；足夠就 `kanban_complete`，不足就誠實回報「未通過」或 `capability`，不拿舊場次或推測替代。
 - **`review`**：核對獨立審查的 exact-head GitHub review／merge 讀回證據（含 `user/login`、完整 head SHA、review 連結與實際結論，不採信未讀回的自稱），再據實 `kanban_complete` 或回報未通過。
 - **`deliver`**：一律跑 `devflow check acceptance`（不可跳過）：

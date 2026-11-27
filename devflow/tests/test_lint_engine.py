@@ -1,7 +1,9 @@
 """Unified zero-hardcode declarative TOML lint engine (`lib/lint_engine.py` + `rules/workflow/*.toml`)."""
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,8 @@ if str(KIT) not in sys.path:
     sys.path.insert(0, str(KIT))
 
 from lib import lint_engine  # noqa: E402
+from lib import policy as policy_lib  # noqa: E402
+from lib import preflight as preflight_lib  # noqa: E402
 
 
 class BuiltinWorkflowRules(unittest.TestCase):
@@ -351,11 +355,6 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         self.assertEqual(by_file["src/broken.py"]["match"], "SyntaxError")
 
     def test_preflight_enforces_repo_diff_policy_rules(self) -> None:
-        import json
-        import subprocess
-        from lib import policy as policy_lib  # noqa: E402
-        from lib import preflight as preflight_lib  # noqa: E402
-
         repo = Path(tempfile.mkdtemp(prefix="devflow-preflight-diff-"))
         self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
         for cmd in (
@@ -440,6 +439,129 @@ class ImportBoundaryAndDiffPolicy(unittest.TestCase):
         )
         with self.assertRaises(lint_engine.LintConfigError):
             lint_engine.load_rule(bad_rule)
+
+    def test_require_resolve_and_preflight_static_toml_rules_and_lexer_parity(self) -> None:
+        # 1. Byte-for-byte parity between lint_engine.py and template check.py shared lexer block
+        b_mark = "# --- BEGIN SHARED IMPORT LEXER ---"
+        e_mark = "# --- END SHARED IMPORT LEXER ---"
+        le_txt = (KIT / "lib" / "lint_engine.py").read_text(encoding="utf-8")
+        cp_txt = (KIT / "templates" / "repo" / ".devflow" / "check.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            le_txt[le_txt.index(b_mark) : le_txt.index(e_mark) + len(e_mark)],
+            cp_txt[cp_txt.index(b_mark) : cp_txt.index(e_mark) + len(e_mark)],
+        )
+
+        # 2. require.resolve(...) vs member access / string literal
+        d = Path(tempfile.mkdtemp(prefix="devflow-lint-reqres-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        rfile = d / "imp.toml"
+        rfile.write_text(
+            'id = "imp"\nkind = "import_boundary"\nmessage = "no infra"\n'
+            'include = ["web/**/*.js", "web/**/*.ts"]\nforbidden_modules = ["infra"]\n'
+            '[[fixture]]\nexpect = "fail"\npath = "web/bad.js"\ntext = \'const p = require.resolve("infra/db");\'\n'
+            '[[fixture]]\nexpect = "pass"\npath = "web/ok.js"\ntext = \'const p = obj.require.resolve("infra/db");\'\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(lint_engine.self_test_dir(d), [])
+        rule = lint_engine.load_rule(rfile)
+        hits = lint_engine.scan_files(
+            [rule],
+            {
+                "web/a.js": 'const x = require.resolve("infra/db");\nconst y = require?.resolve("infra/cache");\n',
+                "web/safe.ts": 'const a = obj.require.resolve("infra/db");\nconst s = "require.resolve(\'infra/db\')";\n',
+            },
+        )
+        self.assertEqual([(h["file"], h["line"]) for h in hits], [("web/a.js", 1), ("web/a.js", 2)], hits)
+
+        # 3. preflight runs static TOML rules when .devflow/check.sh is missing & scopes regex/import_boundary to touched files
+        repo = d / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", "-q"], cwd=repo, check=True)
+        for cfg_k, cfg_v in (("user.name", "Dev"), ("user.email", "dev@example.com")):
+            subprocess.run(["git", "-C", str(repo), "config", cfg_k, cfg_v], check=True)
+        (repo / ".devflow" / "rules").mkdir(parents=True)
+        (repo / ".devflow" / "config.env").write_text("DEVFLOW_DEPLOY=false\n", encoding="utf-8")
+        (repo / ".devflow" / "rules" / "no-infra.toml").write_text(
+            'id = "no-infra"\nkind = "import_boundary"\nmessage = "web must not import infra"\n'
+            'include = ["web/**/*.js"]\nforbidden_modules = ["infra"]\n'
+            '[[fixture]]\nexpect = "fail"\npath = "web/b.js"\ntext = \'require.resolve("infra/a")\'\n'
+            '[[fixture]]\nexpect = "pass"\npath = "web/ok.js"\ntext = \'require("ui/a")\'\n',
+            encoding="utf-8",
+        )
+        (repo / "web").mkdir()
+        (repo / "web" / "legacy.js").write_text('require.resolve("infra/legacy");\n', encoding="utf-8")
+        (repo / "web" / "ok.js").write_text('const v = 1;\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        # Touch only web/ok.js cleanly -> legacy.js untouched violation does NOT block unrelated PR
+        (repo / "web" / "ok.js").write_text('const v = 2;\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "clean change"], check=True)
+        roles = json.loads((KIT / "roles.json").read_text(encoding="utf-8"))
+        pol = policy_lib.load_policy(KIT, roles)
+        card = "## 目標\nx\n\n## 本卡完成\nok\n\n## 驗收\nAllowed-Scope: web/**\n"
+        rep_clean = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+        self.assertTrue(rep_clean["ok"], rep_clean)
+        self.assertEqual(rep_clean["checks"].get("static_rules"), "ok")
+
+        # Now add a forbidden require.resolve import in web/ok.js -> preflight fails closed
+        (repo / "web" / "ok.js").write_text('const db = require.resolve("infra/db");\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "bad import"], check=True)
+        rep_bad = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+        self.assertFalse(rep_bad["ok"], rep_bad)
+        self.assertEqual(rep_bad["checks"].get("static_rules"), "fail")
+        self.assertTrue(any("no-infra" in f and "web/ok.js" in f for f in rep_bad["findings"]), rep_bad["findings"])
+
+        # 4. Spoofed `.devflow/check.sh` mentioning `check.py` in comments or dead code must NOT bypass static_rules
+        for label, script_body in (
+            ("comment", "#!/bin/sh\n# TODO: invoke check.py\nexit 0\n"),
+            ("dead_branch", "#!/bin/sh\nif false; then python3 .devflow/check.py; fi\nexit 0\n"),
+        ):
+            chk = repo / ".devflow" / "check.sh"
+            chk.write_text(script_body, encoding="utf-8")
+            chk.chmod(0o755)
+            subprocess.run(["git", "-C", str(repo), "add", ".devflow/check.sh"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"spoof {label}"], check=True)
+            rep_spoof = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_sha, card_body=card, run_tests=True)
+            self.assertFalse(rep_spoof["ok"], (label, rep_spoof))
+            self.assertEqual(rep_spoof["checks"].get("static_rules"), "fail", (label, rep_spoof))
+            self.assertTrue(any("no-infra" in f and "web/ok.js" in f for f in rep_spoof["findings"]), (label, rep_spoof))
+
+        # 5. `.devflow/baseline.json` suppresses matching legacy line counts while catching new violations
+        (repo / "web" / "ok.js").write_text('const v = 2;\n', encoding="utf-8")
+        (repo / ".devflow" / "baseline.json").write_text(
+            json.dumps({
+                "version": 1,
+                "entries": [
+                    {"rule": "no-infra", "path": "web/ok.js", "text": 'const db = require.resolve("infra/db");'},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", ".devflow/baseline.json", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline legacy"], check=True)
+        base_2 = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+        (repo / "web" / "ok.js").write_text('const db = require.resolve("infra/db");\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baselined line"], check=True)
+        rep_base = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_2, card_body=card, run_tests=True)
+        self.assertTrue(rep_base["ok"], rep_base)
+        self.assertEqual(rep_base["checks"].get("static_rules"), "ok")
+
+        (repo / "web" / "ok.js").write_text(
+            'const db = require.resolve("infra/db");\nconst db2 = require.resolve("infra/cache");\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "web/ok.js"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "new violation"], check=True)
+        rep_new = preflight_lib.run_preflight(repo, policy=pol, base_ref=base_2, card_body=card, run_tests=True)
+        self.assertFalse(rep_new["ok"], rep_new)
+        self.assertEqual(rep_new["checks"].get("static_rules"), "fail")
+        self.assertTrue(any("no-infra" in f and "web/ok.js:2" in f for f in rep_new["findings"]), rep_new["findings"])
 
 
 if __name__ == "__main__":

@@ -38,12 +38,13 @@ Kanban: <task-id>"
 ```
 - `pr submit` 先跑完整 `preflight`（worktree 乾淨、範圍與檔數、保護檔、公版交付、`Covers:`／`Lesson:` 格式、`check.sh` 與針對性測試）；**任何一項失敗就不 push、不開 PR**，當場修完重跑。
 - 若所屬 EPIC 設 `Stop-After: implement`（尚未開放推分支開 PR）：commit 並測過後**不要 push、不開 PR、不 complete 也不 request_review**，改跑 `/opt/data/devflow/bin/devflow checkpoint <slug> <task-id> --dir .`，再用輸出的 `block_reason` 執行 `kanban_block(kind="dependency", reason=...)` 暫停等待 `devflow epic advance` 喚醒後接續 `devflow pr submit`。
+- 若所屬 EPIC 設 `Stop-After: ci`（已開放開 PR 與 CI，但尚未開放 review）：用 `devflow pr submit` 開 PR 後跑 `gh pr checks --watch`；CI 綠後**不要呼叫 `kanban_request_review`**，改執行 `/opt/data/devflow/bin/devflow checkpoint <slug> <task-id> --dir .` 驗證並寫入 exact-head CI checkpoint，再用輸出的 `block_reason` 呼叫 `kanban_block(kind="dependency", reason=...)` 等待 `devflow epic advance` 推進至 `review` 後才送審。
 - 推上後 `gh pr checks --watch`（期間偶爾 `kanban_heartbeat`）。整合層問題可用 `gh workflow run repro.yml --ref wt/<task-id> -f only="<情境id>" -f trace=true` 重現；送審前清掉除錯 log 與 `.devflow/repro.env`。
 - CI 綠後，有 `Covers:` 情境就再跑 `/opt/data/devflow/bin/devflow check acceptance <slug> <EPIC> --pr <PR號> --review --json`；確定性項目全過（API 暫時不可用的 exit 3 除外）才送審，不要把確定性不符丟給 reviewer 退件。
 - `ci.yml` 必須保留彙總 job `devflow-ci`，新 job 要加進它的 `needs`。
 
 ## 4. 送審交接
-作者**只用 `kanban_request_review`，絕不自己 `kanban_complete`**（自己 complete 的卡不能再回 review 欄，PR 就沒人審）：
+只有在 EPIC 流程已進入 `review`（`pr submit` 未提示 `next_action=wait_ci_then_checkpoint`）時才送審。作者**只用 `kanban_request_review`，絕不自己 `kanban_complete`**（自己 complete 的卡不能再回 review 欄，PR 就沒人審）：
 ```
 kanban_request_review(
   reviewer="reviewer",

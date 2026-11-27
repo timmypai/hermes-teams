@@ -10,6 +10,7 @@ import argparse
 import base64
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -1306,10 +1307,10 @@ def repo_deploys(board: str) -> bool:
 # kanban_request_review or kanban_complete: it reads `title\n\nbody` cut at 2000 characters and asks
 # "is this done?", without knowing which tool called. A completion condition that only exists after
 # the handoff (review requested, approved, merged, deployed) can never be shown, so the handoff is
-# refused every time (teams-transcription t_6d121ad4, 2026-11-18). Naming the handoff tool in the
+# refused every time (historical incident on an onboarded repo, 2026-11-18). Naming the handoff tool in the
 # text is refused too (judge probe 2026-11-19: 3/3 continue). The earlier "交 review 是完成後的下一步"
-# passed the judge but read to devops as "complete the card, the [SHIP] reviews" (t_48d094f6,
-# t_1463bbcb closed with no review); this text passed 3/3 and puts review on the card itself.
+# passed the judge but read to devops as "complete the card, the [SHIP] reviews" (later cards
+# closed with no review); this text passed 3/3 and puts review on the card itself.
 # Which tool hands off lives in the skills (devflow-develop §6), which the judge does not read.
 DONE_HEADING = "## 本卡完成"
 DONE_TEXT = "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。"
@@ -1688,7 +1689,6 @@ def _collect_slice_step_evidence(
         return {}, False
 
     s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
-    want_status = "blocked" if stop_after == "implement" else "review"
     candidates: list[tuple[str, dict]] = []
     for cid, c in sorted(cards.items()):
         if cid == epic or c.get("status") == "archived":
@@ -1697,10 +1697,22 @@ def _collect_slice_step_evidence(
         span = pipeline_lib.card_step_span(kind, ep_pipe, POLICY)
         if span is None or span[1] < s_idx or span[0] > e_idx:
             continue
-        if span[0] <= e_idx < span[1] and str(c.get("status") or "").strip().lower() == want_status:
-            if stop_after == "implement" and str(c.get("block_kind") or "").strip().lower() != "dependency":
-                continue
-            candidates.append((cid, c))
+        if span[0] <= e_idx < span[1]:
+            st_c = str(c.get("status") or "").strip().lower()
+            bk_c = str(c.get("block_kind") or "").strip().lower()
+            if stop_after == "implement":
+                if st_c == "blocked" and bk_c == "dependency":
+                    candidates.append((cid, c))
+            elif stop_after == "ci":
+                if st_c == "review" or (
+                    st_c == "blocked"
+                    and bk_c == "dependency"
+                    and (
+                        _card_has_ci_checkpoint_hold(board, epic, cid, card=c)[0]
+                        or _card_has_pipeline_stop_hold(board, epic, cid, card=c)
+                    )
+                ):
+                    candidates.append((cid, c))
     if not candidates:
         return {}, False
 
@@ -1754,10 +1766,22 @@ def _collect_slice_step_evidence(
     if not repo:
         return {}, True
 
+    checkpoints = load_implement_checkpoints()
     evidence: dict[str, dict[str, Any]] = {}
     needs_retry = False
     for cid, c in candidates:
         pr_num = _card_pr_for_slice(board, repo, cid, c)
+        if pr_num is None:
+            cp_rec = checkpoints.get(implement_checkpoint_key(board, cid))
+            if (
+                isinstance(cp_rec, dict)
+                and cp_rec.get("board") == board
+                and cp_rec.get("epic") == epic
+                and cp_rec.get("task") == cid
+                and str(cp_rec.get("step") or "").strip().lower() == "ci"
+                and isinstance(cp_rec.get("pr_number"), int)
+            ):
+                pr_num = cp_rec["pr_number"]
         if pr_num is None:
             needs_retry = True
             continue
@@ -2354,6 +2378,12 @@ def resume(board: str, task_id: str, note: str | None = None) -> str:
         return _resume_unlocked(board, task_id, note)
 
 
+def _wait_next_second() -> None:
+    """Sleep just past the next integer second so timestamp-based guards advance without fixed long sleeps."""
+    now = time.time()
+    time.sleep(min(1.05, max(0.05, math.floor(now) + 1.05 - now)))
+
+
 def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
     d = json.loads(kanban(board, "show", task_id, "--json"))
     if d["task"]["status"] == "triage":
@@ -2362,7 +2392,7 @@ def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
         # The note goes first: out of triage the card may wait in todo or be claimed at once.
         if note:
             kanban(board, "comment", task_id, note)
-            time.sleep(1.1)  # the guard needs the handoff strictly after the newest comment
+            _wait_next_second()  # the guard needs the handoff strictly after the newest comment
             note = None
         leave_triage(board, task_id)
         d = json.loads(kanban(board, "show", task_id, "--json"))
@@ -2384,7 +2414,7 @@ def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
     rework = to_review and handoff.get("implementer") == assignee
     if note:
         kanban(board, "comment", task_id, note)
-        time.sleep(1.1)  # the guard needs the handoff strictly after the newest comment
+        _wait_next_second()  # the guard needs the handoff strictly after the newest comment
     if status == "ready":
         kanban(board, "block", task_id, "devflow resume")
     kanban(board, "assign", task_id, "none")
@@ -2411,14 +2441,57 @@ def _resume_unlocked(board: str, task_id: str, note: str | None = None) -> str:
         raise
 
 
+def _epic_header_problems(body: str | None) -> list[str]:
+    probs: list[str] = []
+    ep_mode, bad_mode = scope_lib.parse_epic_mode(body, policy_lib.valid_modes(POLICY))
+    if bad_mode:
+        allowed_modes = " / ".join(sorted(policy_lib.valid_modes(POLICY)))
+        probs.append(f"Mode '{bad_mode}' 無效（允許：{allowed_modes}）")
+    ep_pipe = pipeline_lib.parse_epic_pipeline(body, POLICY, epic_mode=ep_mode)
+    probs.extend(ep_pipe["problems"])
+    return probs
+
+
+def _arch_parent_scope_problems(
+    board: str,
+    kind: str,
+    parent_ids: list[str],
+    allowed_scope: list[str] | None,
+    repo_cfg: dict[str, str],
+) -> list[str]:
+    req_scope = policy_lib.repo_require_allowed_scope(
+        repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
+    )
+    if not (req_scope and board and parent_ids):
+        return []
+    test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
+    findings: list[str] = []
+    for pid, arch_meta in _resolve_check_card_arch_parents(board, parent_ids):
+        arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
+        if handoff_errs:
+            findings.append(
+                f"[{kind}] 父卡 [ARCH] {pid} 缺少有效結構化交接（{'；'.join(handoff_errs)}），無法略過 Allowed-Scope 檢查"
+            )
+        elif allowed_scope:
+            if missing_arch := handoff_lib.missing_arch_scope_files(
+                arch_files, allowed_scope, test_paths=test_paths
+            ):
+                findings.append(
+                    f"[{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
+                    + ", ".join(missing_arch[:8])
+                )
+    return findings
+
+
 def _validate_edit_op(board: str, op: dict) -> list[str]:
-    """Fail-fast card schema guard for `devflow-ops` `edit` so malformed [DEV]/[OPS] edits are
+    """Fail-fast card schema guard for `devflow-ops` `edit` so malformed [DEV]/[OPS]/[EPIC] edits are
     rejected in place instead of spawning a follow-up [ADJ] on the next tick."""
     new_title = op.get("title")
     new_body = op.get("body")
     if new_title is None and new_body is None:
         return []
     cur_title, cur_body = "", ""
+    parent_ids: list[str] = []
     db = BOARDS / board / "kanban.db"
     if db.exists() and op.get("task"):
         with suppress(sqlite3.Error):
@@ -2426,6 +2499,10 @@ def _validate_edit_op(board: str, op: dict) -> list[str]:
             if rows:
                 cur_title = rows[0].get("title") or ""
                 cur_body = rows[0].get("body") or ""
+            tables = {r["name"] for r in board_rows(board, "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "task_links" in tables:
+                lrows = board_rows(board, "SELECT parent_id FROM task_links WHERE child_id = ?", (op["task"],))
+                parent_ids = [r["parent_id"] for r in lrows if r.get("parent_id")]
     eff_title = new_title if new_title is not None else cur_title
     eff_body = new_body if new_body is not None else cur_body
     if not eff_title:
@@ -2434,6 +2511,8 @@ def _validate_edit_op(board: str, op: dict) -> list[str]:
     if new_title is not None and kind not in CARDS:
         return [f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]"]
     errs: list[str] = []
+    if kind == "EPIC":
+        errs.extend(_epic_header_problems(eff_body))
     if kind in ("DEV", "OPS"):
         if why := done_problem(eff_title, eff_body):
             errs.append(why)
@@ -2443,6 +2522,8 @@ def _validate_edit_op(board: str, op: dict) -> list[str]:
         )
         contract = scope_lib.parse_card_contract(eff_body)
         errs.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
+        if req_scope and parent_ids:
+            errs.extend(_arch_parent_scope_problems(board, kind, parent_ids, contract["allowed_scope"], repo_cfg))
     if new_body is not None and (leaks := scope_lib.body_hygiene_leaks(eff_body)):
         errs.append(f"body 夾帶內部技術資訊（{'、'.join(leaks)}）")
     return errs
@@ -2785,6 +2866,7 @@ def _ship_has_plan_risk_hold_marker(board: str, epic: str, ship_id: str) -> bool
 
 PIPELINE_STOP_HOLD_PREFIX = "pipeline-stop-hold:"
 PIPELINE_IMPL_CHECKPOINT_PREFIX = "pipeline-implement-checkpoint:"
+PIPELINE_CI_CHECKPOINT_PREFIX = "pipeline-ci-checkpoint:"
 IMPLEMENT_CHECKPOINTS = ROOT / "state" / "implement-checkpoints.json"
 
 
@@ -2816,6 +2898,13 @@ def pipeline_impl_checkpoint_reason(epic: str, head_sha: str, branch: str) -> st
     )
 
 
+def pipeline_ci_checkpoint_reason(epic: str, pr_number: int, head_sha: str) -> str:
+    return (
+        f"{PIPELINE_CI_CHECKPOINT_PREFIX}{epic} pr=#{pr_number} head={head_sha[:12]}"
+        "（Stop-After=ci；等待 devflow epic advance 推進至 review）"
+    )
+
+
 def _card_block_reason(board: str, task_id: str, *, card: dict | None = None) -> str | None:
     db = BOARDS / board / "kanban.db"
     if db.exists():
@@ -2833,6 +2922,21 @@ def _card_block_reason(board: str, task_id: str, *, card: dict | None = None) ->
     return None
 
 
+def _card_has_prefixed_hold(
+    board: str,
+    marker_prefix: str,
+    epic: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> tuple[bool, str]:
+    reason = _card_block_reason(board, task_id, card=card) or ""
+    prefix = f"{marker_prefix}{epic}"
+    if reason == prefix or (reason.startswith(prefix) and len(reason) > len(prefix) and reason[len(prefix)].isspace()):
+        return True, reason
+    return False, ""
+
+
 def _card_has_implement_checkpoint_hold(
     board: str,
     epic: str,
@@ -2840,11 +2944,17 @@ def _card_has_implement_checkpoint_hold(
     *,
     card: dict | None = None,
 ) -> tuple[bool, str]:
-    reason = _card_block_reason(board, task_id, card=card) or ""
-    prefix = f"{PIPELINE_IMPL_CHECKPOINT_PREFIX}{epic}"
-    if reason == prefix or (reason.startswith(prefix) and len(reason) > len(prefix) and reason[len(prefix)].isspace()):
-        return True, reason
-    return False, ""
+    return _card_has_prefixed_hold(board, PIPELINE_IMPL_CHECKPOINT_PREFIX, epic, task_id, card=card)
+
+
+def _card_has_ci_checkpoint_hold(
+    board: str,
+    epic: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> tuple[bool, str]:
+    return _card_has_prefixed_hold(board, PIPELINE_CI_CHECKPOINT_PREFIX, epic, task_id, card=card)
 
 
 def pipeline_stop_hold_reason(epic: str, stop_after: str) -> str:
@@ -2876,8 +2986,74 @@ def _card_has_pipeline_stop_hold(
     return False
 
 
+def _card_is_held_from_review(
+    board: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> bool:
+    """True when `task_id`'s latest resume-relevant event came from the `review` lane."""
+    db = BOARDS / board / "kanban.db"
+    if db.exists():
+        try:
+            kinds = tuple(sorted(RESUME_EVENTS))
+            marks = ",".join("?" * len(kinds))
+            rows = board_rows(
+                board,
+                f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
+                (task_id, *kinds),
+            )
+            if rows:
+                ev = rows[0]
+                if ev.get("kind") == "unblocked":
+                    return False
+                raw_p = ev.get("payload")
+                if isinstance(raw_p, dict):
+                    payload = raw_p
+                else:
+                    try:
+                        parsed = json.loads(raw_p or "{}")
+                        payload = parsed if isinstance(parsed, dict) else {}
+                    except ValueError:
+                        payload = {}
+                return any(payload.get(k) == "review" for k in ("resume_status", "retry_status", "source_status"))
+        except sqlite3.Error:
+            pass
+    for ev in reversed((card or {}).get("events") or []):
+        if not isinstance(ev, dict):
+            continue
+        kind = str(ev.get("kind") or "").strip()
+        if kind == "unblocked":
+            return False
+        if kind not in RESUME_EVENTS:
+            continue
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return any(payload.get(k) == "review" for k in ("resume_status", "retry_status", "source_status"))
+    return False
+
+
+def _slice_has_open_active_cards(epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
+    steps = list(pipe_spec.get("steps") or [])
+    start_at = str(pipe_spec.get("start_at") or "").strip().lower()
+    stop_after = str(pipe_spec.get("stop_after") or "").strip().lower()
+    if not steps or start_at not in steps or stop_after not in steps:
+        return False
+    s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
+    for cid, c in cards.items():
+        if cid == epic or c.get("status") == "archived":
+            continue
+        kind = card_type(c.get("title") or "") or ""
+        span = pipeline_lib.card_step_span(kind, pipe_spec, POLICY)
+        if span is None or span[1] < s_idx or span[0] > e_idx:
+            continue
+        return True
+    return False
+
+
 def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
-    """Park runnable cards belonging strictly after `Stop-After` in `blocked (dependency)` until advance."""
+    """Park out-of-slice cards (and finished partial-slice EPICs / premature review cards) in `blocked (dependency)`."""
     if not pipe_spec.get("valid"):
         return False
     steps = pipe_spec.get("steps") or []
@@ -2885,15 +3061,42 @@ def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_
         return False
     retry = False
     reason = pipeline_stop_hold_reason(epic, pipe_spec["stop_after"])
+    review_active = pipeline_lib.is_step_active("review", pipe_spec)
+    accept_active = pipeline_lib.is_step_active("accept", pipe_spec)
+    slice_done_cached: bool | None = None
     for cid, c in cards.items():
+        st_c = str(c.get("status") or "").strip().lower()
         if cid == epic:
+            if len(cards) > 1 and st_c == "ready" and not accept_active:
+                should_hold = pipe_spec.get("paused_at") == pipe_spec.get("stop_after")
+                if not should_hold:
+                    if slice_done_cached is None:
+                        ev, need_r = _collect_slice_step_evidence(board, epic, cards, pipe_spec)
+                        if need_r:
+                            retry = True
+                        slice_done_cached = pipeline_lib.slice_stop_reached(
+                            cards, epic, pipe_spec, POLICY, step_evidence=ev
+                        )
+                    should_hold = slice_done_cached
+                if should_hold:
+                    ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, cid, reason)
+                    if failed:
+                        retry = True
+                    elif ok:
+                        c["status"] = "blocked"
+                        c["block_kind"] = "dependency"
             continue
         kind = card_type(c.get("title") or "") or ""
-        if not pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+        hold_child = (
+            pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY) and st_c in ("todo", "ready")
+        ) or (
+            kind in ("DEV", "OPS") and not review_active and st_c == "review"
+        )
+        if not hold_child:
             continue
-        if c.get("status") not in ("todo", "ready"):
-            continue
-        ok, failed = kanban_adapter.hold_task_dependency(run, HERMES_PY, BOARDS, board, cid, reason)
+        ok, failed = kanban_adapter.hold_task_dependency(
+            run, HERMES_PY, BOARDS, board, cid, reason, allow_review=(st_c == "review"),
+        )
         if failed:
             retry = True
         elif ok:
@@ -2903,33 +3106,59 @@ def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_
 
 
 def release_pipeline_stop_holds(board: str, epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
-    """Release cards held by `pipeline-stop-hold:` or `pipeline-implement-checkpoint:` once active slice advances."""
+    """Release cards held by stop-hold / checkpoint markers once active slice advances."""
     if not pipe_spec.get("valid"):
         return False
     retry = False
+    accept_active = pipeline_lib.is_step_active("accept", pipe_spec)
+    review_active = pipeline_lib.is_step_active("review", pipe_spec)
+    has_active_work = _slice_has_open_active_cards(epic, cards, pipe_spec)
     for cid, c in cards.items():
-        if cid == epic:
-            continue
-        kind = card_type(c.get("title") or "") or ""
         if c.get("status") != "blocked" or c.get("block_kind") != "dependency":
             continue
-        is_cp_hold, _ = _card_has_implement_checkpoint_hold(board, epic, cid, card=c)
-        if is_cp_hold:
-            if not pipeline_lib.is_step_active("ci", pipe_spec):
+        if cid == epic:
+            if not _card_has_pipeline_stop_hold(board, epic, epic, card=c):
+                continue
+            if not accept_active and (has_active_work or pipe_spec.get("paused_at") == pipe_spec.get("stop_after")):
                 continue
             resume_msg = (
-                f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，"
-                "解除本地實作暫停，請續以 devflow pr submit 推分支開 PR。"
+                f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。"
             )
         else:
-            if pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
-                continue
-            if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
-                continue
-            resume_msg = f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。"
+            kind = card_type(c.get("title") or "") or ""
+            is_impl_hold, _ = _card_has_implement_checkpoint_hold(board, epic, cid, card=c)
+            is_ci_hold, _ = _card_has_ci_checkpoint_hold(board, epic, cid, card=c)
+            if is_impl_hold:
+                if not pipeline_lib.is_step_active("ci", pipe_spec):
+                    continue
+                resume_msg = (
+                    f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，"
+                    "解除本機實作暫停，請續以 devflow pr submit 推分支開 PR。"
+                )
+            elif is_ci_hold:
+                if not review_active:
+                    continue
+                resume_msg = (
+                    f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，"
+                    "解除 CI checkpoint 暫停，請呼叫 kanban_request_review 送審。"
+                )
+            else:
+                if pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+                    continue
+                if kind in ("DEV", "OPS") and not review_active:
+                    # Only keep holding if it was parked from review lane (has stop-hold and active span straddles review).
+                    # Cards still in todo/ready are released once implement/ci is active.
+                    if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
+                        continue
+                    if _card_is_held_from_review(board, cid, card=c):
+                        continue
+                elif not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
+                    continue
+                resume_msg = f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。"
         try:
+            was_from_review = (cid != epic) and _card_is_held_from_review(board, cid, card=c)
             resume(board, cid, resume_msg)
-            c["status"] = "ready"
+            c["status"] = "review" if was_from_review else "ready"
             c["block_kind"] = None
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card release failure
             retry = True
@@ -3330,15 +3559,16 @@ def tick_board(board: str, st: dict) -> bool:
             try:
                 ev = block_event(board, t["id"])
                 reason = block_reason(board, ev) if ev is not None else ""
-                if reason.startswith(PIPELINE_STOP_HOLD_PREFIX) or reason.startswith(PIPELINE_IMPL_CHECKPOINT_PREFIX):
-                    prefix = (
-                        PIPELINE_IMPL_CHECKPOINT_PREFIX
-                        if reason.startswith(PIPELINE_IMPL_CHECKPOINT_PREFIX)
-                        else PIPELINE_STOP_HOLD_PREFIX
-                    )
-                    rest = reason[len(prefix):].split(None, 1)[0]
-                    if TASK_ID_RE.fullmatch(rest):
-                        all_stop_epics.add(rest)
+                for prefix in (
+                    PIPELINE_IMPL_CHECKPOINT_PREFIX,
+                    PIPELINE_CI_CHECKPOINT_PREFIX,
+                    PIPELINE_STOP_HOLD_PREFIX,
+                ):
+                    if reason.startswith(prefix):
+                        rest = reason[len(prefix):].split(None, 1)[0]
+                        if TASK_ID_RE.fullmatch(rest):
+                            all_stop_epics.add(rest)
+                        break
             except sqlite3.Error:
                 pass
     for eid in sorted(all_stop_epics):
@@ -3370,9 +3600,9 @@ def tick_board(board: str, st: dict) -> bool:
 
 # Hermes holds a card for 24h once a comment carries a PR URL and no assignee handoff follows
 # (`respawn_guarded` active_pr). Meant for a worker that published a PR and stopped, it also holds a
-# card whose parents just finished: teams-transcription [SHIP] t_3b14e30d, promoted 13:51 after PR #5
-# was approved, then skipped every minute while nobody looked (2026-11-19). A card held after its
-# latest promotion, never claimed since, gets one `resume` (the native handoff) per promotion.
+# card whose parents just finished: an earlier [SHIP] was promoted right after PR approval and then
+# skipped every minute while nobody looked (2026-11-19). A card held after its latest promotion,
+# never claimed since, gets one `resume` (the native handoff) per promotion.
 
 def held_after_promotion(board: str) -> list[tuple[str, int]]:
     return [(r["task_id"], r["promoted"]) for r in board_rows(board, """
@@ -3573,7 +3803,7 @@ def delivered(sub: dict, ev: int, ev_at: int) -> bool:
     self-post, which records no ping, and the cursor moves past an event only after that wake
     succeeded (gateway/kanban_watchers_notifier.py `deliver`). A subscription made after the block
     starts past it with nothing sent, hence its creation time. Counting only the ping replayed every
-    block to the app inbox once more (teams-transcription t_12402f67 event 2533, 2026-11-21)."""
+    block to the app inbox once more (2026-11-21 incident)."""
     return (sub["last_ping_event_id"] or 0) >= ev or (
         sub["delivery_mode"] == "notify+wake" and sub["last_event_id"] >= ev and (sub["created_at"] or 0) < ev_at)
 
@@ -3753,10 +3983,10 @@ def ask_assignees(board: str, tasks: dict[str, dict], subs: dict[str, list], st:
 # --- a block that is a workflow problem goes to the orchestrator, not the user ---------------------
 # Workers block with needs_input/capability for problems no user can decide ("Hermes 管理端請排除
 # goal judge 循環", "請交給有 terminal 的 worker"); asked in a chat, they wait on the person until
-# someone notices (teams-transcription, 2026-11-18: the whole board idle for hours). Once per block,
+# someone notices (onboarded board incident, 2026-11-18: the whole board idle for hours). Once per block,
 # Decisions judges whether only the user can answer; a confident "no" opens an [ADJ] for the
 # orchestrator instead. A card an open [ADJ] already repairs (`adj_targets`) gets no second one: the
-# new question goes to that [ADJ] as a comment (2026-11-18: t_a4059a2e duplicated Hermes' t_0c2c0548).
+# new question goes to that [ADJ] as a comment (2026-11-18 duplicate-[ADJ] incident).
 # Once ADJ_PER_CARD [ADJ] have repaired the card, whoever opened them, the user is asked instead.
 
 FLOW_QUESTION = (
@@ -3907,7 +4137,7 @@ def triage_cap_reason(tid: str, t: dict, blocked_children: list[str], laps: list
 def stalled_triage(board: str, tasks: dict[str, dict], children: dict[str, list], st: dict) -> bool:
     """A non-waiting `triage` card with open downstream children stalls the dependency chain silently:
     Hermes never dispatches `triage`, and without a `needs_input`/`capability` block neither `flow_blocks`
-    nor notifications fire (teams-transcription t_46ded1b5 -> t_12402f67, 2026-11-22). Open one [ADJ] for
+    nor notifications fire (2026-11-22 stalled-triage incident). Open one [ADJ] for
     the orchestrator (or comment on its live [ADJ]), bounded by ADJ_PER_CARD; once the cap is reached,
     escalate as a durable `needs_input` question on the card so the user is notified and can recover it.
     Returns True when a transient write failure requires retrying on the next tick."""
@@ -4544,6 +4774,22 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
     one Decisions call per AC that passed them."""
     repo = entry(board)["repo"]
     cards = plan_cards(board, epic)
+    epic_card = cards.get(epic) or {}
+    if not review and epic_card:
+        bad_mode, ep_pipe = _epic_pipe_from_body(epic_card.get("body"))
+        if not bad_mode and ep_pipe.get("valid") and not pipeline_lib.is_step_active("accept", ep_pipe):
+            return {
+                "epic": epic,
+                "mode": "final",
+                "deploy_sha": None,
+                "stop_after": ep_pipe["stop_after"],
+                "paused_at": ep_pipe.get("paused_at"),
+                "problems": [
+                    f"{epic} 目前設定 Stop-After={ep_pipe['stop_after']}，尚未進入 accept 階段，拒絕最終驗收；"
+                    "請先執行 `devflow epic advance` 推進至 accept"
+                ],
+                "criteria": [],
+            }
     prs = {n: pr_meta(repo, n) for n in numbers}
     spec, spec_conflicts, repo_acs, pr_scens = resolve_acceptance_spec(
         board, repo, epic, cards, prs, review=review
@@ -5537,7 +5783,7 @@ def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
                 print(f"devflow: ensure_pr_advisor failed for {board}/{rec.get('repo')}#{rec.get('pr')}: {err}",
                       file=sys.stderr)
     # Archive superseded open PR [ADV] cards from older fingerprints so they do not burn quota alongside
-    # the active advisor (teams-transcription PR #13 t_a34f8867 vs t_8d25cd59).
+    # the active advisor (older fingerprint [ADV] race).
     judgments = load_judgments()
     for t in tasks:
         if not (t.get("title") or "").startswith(PR_ADVISOR_TITLE) or t["status"] in ("done", "archived"):
@@ -5556,9 +5802,78 @@ def tick_prs(board: str, repo: str, tasks: list[dict]) -> bool:
     return retry
 
 
+def _pr_epic_pipe(board: str, repo: str, pr_num: int) -> tuple[str | None, dict | None]:
+    """Resolve owning `(epic_id, pipe_spec)` for `pr_num` from worker env, SQLite board, or checkpoints."""
+    env_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if env_task:
+        eid, _, ep_pipe = _task_epic_pipe(board, env_task)
+        if ep_pipe is not None:
+            return eid, ep_pipe
+    db = BOARDS / board / "kanban.db"
+    if db.is_file():
+        with suppress(sqlite3.Error):
+            cols = {r["name"] for r in board_rows(board, "PRAGMA table_info(tasks)")}
+            sel = "id, title, status" + (", body" if "body" in cols else "") + (", completion_contract" if "completion_contract" in cols else "")
+            trows = board_rows(board, f"SELECT {sel} FROM tasks")
+            tmap = {r["id"]: r for r in trows}
+            matched_tid: str | None = None
+            for tid, r in tmap.items():
+                if r.get("status") == "archived" or card_type(r.get("title") or "") not in ("DEV", "OPS"):
+                    continue
+                if card_pr(repo, r, {"runs": []}) == pr_num:
+                    matched_tid = tid
+                    break
+            if matched_tid is None:
+                tables = {r["name"] for r in board_rows(board, "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "task_runs" in tables:
+                    for rr in board_rows(board, "SELECT task_id, metadata FROM task_runs ORDER BY id DESC"):
+                        tid = rr.get("task_id")
+                        r = tmap.get(tid) or {}
+                        if r.get("status") != "archived" and card_type(r.get("title") or "") in ("DEV", "OPS"):
+                            if card_pr(repo, r, {"runs": [{"metadata": _decode_run_meta(rr.get("metadata"))}]}) == pr_num:
+                                matched_tid = tid
+                                break
+                if matched_tid is None and "task_events" in tables:
+                    for er in board_rows(board, "SELECT task_id, payload FROM task_events WHERE kind = 'review_requested' ORDER BY id DESC"):
+                        tid = er.get("task_id")
+                        r = tmap.get(tid) or {}
+                        if r.get("status") != "archived" and card_type(r.get("title") or "") in ("DEV", "OPS"):
+                            if card_pr(repo, r, {"runs": [{"metadata": _decode_run_meta(er.get("payload"))}]}) == pr_num:
+                                matched_tid = tid
+                                break
+            if matched_tid:
+                eid, _, ep_pipe = _task_epic_pipe(board, matched_tid, card_body=tmap[matched_tid].get("body"))
+                if ep_pipe is not None:
+                    return eid, ep_pipe
+    for rec in load_implement_checkpoints().values():
+        if (
+            isinstance(rec, dict)
+            and rec.get("board") == board
+            and rec.get("pr_number") == pr_num
+            and rec.get("epic")
+        ):
+            eid, _, ep_pipe = _task_epic_pipe(board, rec.get("task"), card_body=f"EPIC: {rec['epic']}\n")
+            if ep_pipe is not None:
+                return eid, ep_pipe
+    return None, None
+
+
 def cmd_check_pr(a) -> None:
     """Exit 0 `devflow-judgment` passed; 3 waiting for the [ADV] verdict; 4 advisor says revise."""
     e = entry(a.board)
+    epic_id, ep_pipe = _pr_epic_pipe(e["slug"], e["repo"], a.pr)
+    if ep_pipe is not None and ep_pipe.get("valid") and not pipeline_lib.is_step_active("review", ep_pipe):
+        print(json.dumps({
+            "ok": False,
+            "stage": "pipeline_stop",
+            "epic": epic_id,
+            "stop_after": ep_pipe["stop_after"],
+            "error": (
+                f"{epic_id or 'EPIC'} 設定 Stop-After={ep_pipe['stop_after']}，尚未進入 review 階段，"
+                "拒絕進行 PR 審查；請先執行 `devflow epic advance` 推進至 review"
+            ),
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
     j_role, _, j_isolated = trust_lib.judgment_gh_role(ROLES)
     try:
         rec, verdict = gate(e["slug"], e["repo"], a.pr)
@@ -5985,14 +6300,45 @@ def _checkpoint_fail(stage: str, error: str, **extra: Any) -> None:
     sys.exit(1)
 
 
+def _git_branch_and_head(repo_dir: Path, base_ref: str, *, fail_fn) -> tuple[str, str]:
+    br = preflight_lib._git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = (br.stdout or "").strip() if br.returncode == 0 else ""
+    if br.returncode != 0 or not branch or branch == "HEAD":
+        err = ((br.stderr or br.stdout).strip() if hasattr(br, "stderr") else "") or "detached HEAD"
+        fail_fn("git_state", f"無法取得目前分支名稱（{err[-200:]}）")
+
+    hd = preflight_lib._git(repo_dir, "rev-parse", "HEAD")
+    head_sha = (hd.stdout or "").strip().lower() if hd.returncode == 0 else ""
+    if hd.returncode != 0 or not trust_lib.FULL_SHA_RE.fullmatch(head_sha):
+        fail_fn("git_state", f"無法取得有效 40 碼 HEAD SHA（{head_sha!r}）")
+
+    cnt = preflight_lib._git(repo_dir, "rev-list", "--count", f"{base_ref}..HEAD")
+    commit_count = int((cnt.stdout or "").strip()) if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit() else 0
+    if cnt.returncode != 0 or commit_count < 1:
+        fail_fn(
+            "git_state",
+            f"目前分支 {branch} 相對於 {base_ref} 尚無任何已提交 commit，請先 commit 後再執行",
+        )
+    return branch, head_sha
+
+
 def cmd_checkpoint(a) -> None:
-    """Record a verified local-only implementation checkpoint for `Stop-After: implement` slices (no push/PR)."""
+    """Record a verified checkpoint for `Stop-After: implement` (local) or `Stop-After: ci` (PR+CI)."""
     e = entry(a.slug)
     repo_dir = Path(a.dir).resolve()
     base_ref = a.base or f"origin/{e['default_branch']}"
     task_id = str(a.task).strip()
     if not task_id:
         _checkpoint_fail("card_lookup", "checkpoint 必須提供有效的任務卡 ID")
+
+    env_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if env_task and task_id != env_task:
+        _checkpoint_fail(
+            "worker_task_mismatch",
+            f"worker 身分鎖定 {env_task}，禁止為其他任務卡 {task_id} 記錄 checkpoint",
+            worker_task=env_task,
+            requested_task=task_id,
+        )
 
     card_title, card_body = "", ""
     db_path = BOARDS / e["slug"] / "kanban.db"
@@ -6012,42 +6358,44 @@ def cmd_checkpoint(a) -> None:
         _checkpoint_fail("card_lookup", f"看板 {e['slug']} 找不到任務卡 {task_id}")
     kind = card_type(card_title)
     if kind not in ("DEV", "OPS"):
-        _checkpoint_fail("card_kind", f"{task_id} 的卡型 [{kind or '?'}] 不適用本機實作 checkpoint（僅限 [DEV]/[OPS]）")
+        _checkpoint_fail("card_kind", f"{task_id} 的卡型 [{kind or '?'}] 不適用 checkpoint（僅限 [DEV]/[OPS]）")
 
     epic_id, _, ep_pipe = _task_epic_pipe(e["slug"], task_id, card_body=card_body)
-    if not (
+    is_local_stop = (
         ep_pipe is not None
         and ep_pipe.get("valid")
         and pipeline_lib.is_step_active("implement", ep_pipe)
         and not pipeline_lib.is_step_active("ci", ep_pipe)
-    ):
+    )
+    is_ci_stop = (
+        ep_pipe is not None
+        and ep_pipe.get("valid")
+        and pipeline_lib.is_step_active("ci", ep_pipe)
+        and not pipeline_lib.is_step_active("review", ep_pipe)
+    )
+    if not (is_local_stop or is_ci_stop):
         _checkpoint_fail(
             "pipeline_not_local_stop",
-            f"{epic_id or task_id} 目前未設定只停在本機實作的區段"
+            f"{epic_id or task_id} 目前未設定 Stop-After=implement 或 Stop-After=ci 暫停點"
             f"（stop_after={(ep_pipe or {}).get('stop_after') or 'none'}）；"
-            "若已開放 CI／PR 請直接執行 `devflow pr submit`",
+            "若已開放 review 請直接送審",
             epic=epic_id,
             stop_after=(ep_pipe or {}).get("stop_after"),
         )
 
-    br = preflight_lib._git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
-    branch = (br.stdout or "").strip() if br.returncode == 0 else ""
-    if br.returncode != 0 or not branch or branch == "HEAD":
-        err = ((br.stderr or br.stdout).strip() if hasattr(br, "stderr") else "") or "detached HEAD"
-        _checkpoint_fail("git_state", f"checkpoint 無法取得目前分支名稱（{err[-200:]}）")
-
-    hd = preflight_lib._git(repo_dir, "rev-parse", "HEAD")
-    head_sha = (hd.stdout or "").strip().lower() if hd.returncode == 0 else ""
-    if hd.returncode != 0 or not trust_lib.FULL_SHA_RE.fullmatch(head_sha):
-        _checkpoint_fail("git_state", f"checkpoint 無法取得有效 40 碼 HEAD SHA（{head_sha!r}）")
-
-    cnt = preflight_lib._git(repo_dir, "rev-list", "--count", f"{base_ref}..HEAD")
-    commit_count = int((cnt.stdout or "").strip()) if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit() else 0
-    if cnt.returncode != 0 or commit_count < 1:
+    repo_cfg = policy_lib.load_repo_config(repo_dir)
+    contract = scope_lib.parse_card_contract(card_body)
+    configured_cmds = preflight_lib.configured_test_commands(
+        repo_dir, repo_cfg=repo_cfg, verify_cmds=contract["verify"]
+    )
+    if a.no_test and (env_task or configured_cmds):
         _checkpoint_fail(
-            "git_state",
-            f"目前分支 {branch} 相對於 {base_ref} 尚無任何已提交 commit，請先 commit 後再記錄 checkpoint",
+            "test_required",
+            "存在已設定的驗證指令或處於 worker 環境內，禁止使用 `--no-test` 略過測試並手填 `--test`",
+            configured=[c[0] for c in configured_cmds],
         )
+
+    branch, head_sha = _git_branch_and_head(repo_dir, base_ref, fail_fn=_checkpoint_fail)
 
     preflight_args = argparse.Namespace(
         slug=a.slug,
@@ -6071,14 +6419,101 @@ def cmd_checkpoint(a) -> None:
         for t in (rep.get("tests") or [])
         if isinstance(t, dict) and t.get("returncode") == 0 and t.get("name")
     ]
-    tests = [t.strip() for t in (a.test or []) if str(t).strip()] or auto_tests
-    payload: dict[str, Any] = {
+    if configured_cmds and not auto_tests:
+        _checkpoint_fail("test_required", "已設定的本機測試未產生任何通過紀錄，拒絕記錄 checkpoint")
+    tests = auto_tests if (configured_cmds or auto_tests) else [t.strip() for t in (a.test or []) if str(t).strip()]
+
+    key = implement_checkpoint_key(e["slug"], task_id)
+    if is_local_stop:
+        payload: dict[str, Any] = {
+            "board": e["slug"],
+            "epic": epic_id,
+            "task": task_id,
+            "step": "implement",
+            "local_only": True,
+            "ok": True,
+            "branch": branch,
+            "head_sha": head_sha,
+            "base_ref": base_ref,
+            "changed_files": changed_files,
+            "tests": tests,
+            **({"summary": str(a.summary).strip()} if (getattr(a, "summary", None) or "").strip() else {}),
+            "recorded_at": int(time.time()),
+        }
+        herrs = handoff_lib.validate_handoff("implement_local", payload, POLICY)
+        if herrs:
+            _checkpoint_fail("handoff_validation", "；".join(herrs), findings=herrs)
+        with locked("implement-checkpoints"):
+            data = load_implement_checkpoints()
+            data[key] = payload
+            save_implement_checkpoints(data)
+        reason = pipeline_impl_checkpoint_reason(epic_id, head_sha, branch)
+        kanban(
+            e["slug"],
+            "comment",
+            task_id,
+            f"devflow checkpoint：已驗證並記錄本機實作 checkpoint（step=implement_local, head={head_sha[:12]}, "
+            f"branch={branch}, files={len(changed_files)}, tests={len(tests)}）。請以 `kanban_block(kind=\"dependency\", reason=...)` 暫停等待推進。",
+        )
+        print(json.dumps({
+            "ok": True,
+            "stage": "implement_checkpoint",
+            "block_kind": "dependency",
+            "block_reason": reason,
+            "preflight": rep,
+            **payload,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # Stop-After: ci checkpoint — verify exact-head OPEN PR + completed GitHub ci.yml success
+    existing_list = run(
+        [
+            "gh", "pr", "list", "-R", e["repo"], "--head", branch, "--state", "all",
+            "--json", "url,number,headRefOid,state,title,body",
+        ],
+        cwd=repo_dir, gh="builder", check=False,
+    )
+    if existing_list.returncode != 0 or not (existing_list.stdout or "").strip():
+        msg = ((existing_list.stderr or existing_list.stdout or "").strip()[-400:]) or "空白回應"
+        _checkpoint_fail("pr_lookup", f"ci checkpoint 查詢分支 PR 失敗：{msg}")
+    try:
+        prs = json.loads(existing_list.stdout)
+    except ValueError as err:
+        _checkpoint_fail("pr_lookup", f"ci checkpoint 無法解析 PR 清單：{err}")
+    open_prs = [p for p in (prs if isinstance(prs, list) else []) if isinstance(p, dict) and str(p.get("state") or "").upper() == "OPEN"]
+    if len(open_prs) != 1 or not isinstance(open_prs[0].get("number"), int):
+        _checkpoint_fail("pr_lookup", f"分支 {branch} 需要剛好一個 OPEN PR 才能記錄 Stop-After: ci checkpoint（目前找到 {len(open_prs)} 個）")
+    pr = open_prs[0]
+    pr_num = pr["number"]
+    pr_owner = scope_lib.extract_kanban_task_id(pr.get("body"))
+    if pr_owner and pr_owner != task_id:
+        _checkpoint_fail("pr_owner_conflict", f"PR #{pr_num} 已綁定 {pr_owner}，與 {task_id} 衝突")
+    pr_head = str(pr.get("headRefOid") or "").strip().lower()
+    if pr_head != head_sha:
+        _checkpoint_fail(
+            "pr_head_mismatch",
+            f"PR #{pr_num} 目前遠端 head ({pr_head[:12]}) 與本機 HEAD ({head_sha[:12]}) 不符，請先 `devflow pr submit` 同步",
+        )
+    runs = workflow_runs(e["repo"], "ci.yml", head_sha=head_sha, event="pull_request")
+    run_rec = pick_run(runs, "ci.yml", "pull_request", sha=head_sha) if runs is not None else None
+    if not run_rec or str(run_rec.get("status") or "").strip().lower() != "completed" or str(run_rec.get("conclusion") or "").strip().lower() != "success":
+        _checkpoint_fail(
+            "ci_not_green",
+            f"PR #{pr_num} exact-head ({head_sha[:12]}) 的 GitHub `ci.yml` 尚未 completed/success，無法記錄 CI checkpoint",
+            pr_number=pr_num,
+            head_sha=head_sha,
+        )
+
+    ci_payload: dict[str, Any] = {
         "board": e["slug"],
         "epic": epic_id,
         "task": task_id,
-        "step": "implement",
-        "local_only": True,
+        "step": "ci",
+        "local_only": False,
         "ok": True,
+        "pr_number": pr_num,
+        "pr_url": pr.get("url"),
+        "run_id": run_rec.get("id"),
         "branch": branch,
         "head_sha": head_sha,
         "base_ref": base_ref,
@@ -6087,31 +6522,26 @@ def cmd_checkpoint(a) -> None:
         **({"summary": str(a.summary).strip()} if (getattr(a, "summary", None) or "").strip() else {}),
         "recorded_at": int(time.time()),
     }
-    herrs = handoff_lib.validate_handoff("implement_local", payload, POLICY)
-    if herrs:
-        _checkpoint_fail("handoff_validation", "；".join(herrs), findings=herrs)
-
-    key = implement_checkpoint_key(e["slug"], task_id)
     with locked("implement-checkpoints"):
         data = load_implement_checkpoints()
-        data[key] = payload
+        data[key] = ci_payload
         save_implement_checkpoints(data)
 
-    reason = pipeline_impl_checkpoint_reason(epic_id, head_sha, branch)
+    reason = pipeline_ci_checkpoint_reason(epic_id, pr_num, head_sha)
     kanban(
         e["slug"],
         "comment",
         task_id,
-        f"devflow checkpoint：已驗證並記錄本機實作 checkpoint（step=implement_local, head={head_sha[:12]}, "
-        f"branch={branch}, files={len(changed_files)}, tests={len(tests)}）。請以 `kanban_block(kind=\"dependency\", reason=...)` 暫停等待推進。",
+        f"devflow checkpoint：已驗證 exact-head CI checkpoint（step=ci, pr=#{pr_num}, head={head_sha[:12]}, "
+        f"run_id={run_rec.get('id')}）。請以 `kanban_block(kind=\"dependency\", reason=...)` 暫停等待推進至 review。",
     )
     print(json.dumps({
         "ok": True,
-        "stage": "implement_checkpoint",
+        "stage": "ci_checkpoint",
         "block_kind": "dependency",
         "block_reason": reason,
         "preflight": rep,
-        **payload,
+        **ci_payload,
     }, ensure_ascii=False, indent=2))
 
 
@@ -6119,6 +6549,17 @@ def cmd_pr_submit(a) -> None:
     """Shift-left single entry for developers: resolve existing PR metadata/owner/state, run
     deterministic preflight against effective PR title/body, then push and create/edit PR."""
     e = entry(a.slug)
+    env_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    req_task = str(getattr(a, "task", "") or "").strip()
+    if env_task and req_task and req_task != env_task:
+        print(json.dumps({
+            "ok": False,
+            "stage": "worker_task_mismatch",
+            "worker_task": env_task,
+            "requested_task": req_task,
+            "error": f"worker 身分鎖定 {env_task}，禁止替其他任務卡 {req_task} 送審／開 PR",
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
     repo_dir = Path(a.dir).resolve()
     supplied_title = a.pr_title
     supplied_body = Path(a.pr_body_file).read_text(encoding="utf-8") if a.pr_body_file else a.pr_body
@@ -6293,7 +6734,12 @@ def cmd_pr_submit(a) -> None:
         created = True
         updated_metadata = False
 
-    print(json.dumps({
+    review_active = True
+    stop_after_val = None
+    if ep_pipe is not None and ep_pipe.get("valid"):
+        stop_after_val = ep_pipe.get("stop_after")
+        review_active = pipeline_lib.is_step_active("review", ep_pipe)
+    out_obj: dict[str, Any] = {
         "ok": True,
         "stage": "submitted",
         "created": created,
@@ -6302,7 +6748,16 @@ def cmd_pr_submit(a) -> None:
         "pr_number": pr_info.get("number"),
         "head_sha": pr_info.get("headRefOid"),
         "preflight": rep,
-    }, ensure_ascii=False, indent=2))
+        **({"epic": epic_id, "stop_after": stop_after_val} if stop_after_val else {}),
+        "review_active": review_active,
+    }
+    if not review_active:
+        out_obj["next_action"] = "wait_ci_then_checkpoint"
+        out_obj["next_hint"] = (
+            f"EPIC 設定 Stop-After={stop_after_val}（尚未開放 review）：請等待 CI 綠燈後執行 "
+            f"`devflow checkpoint {e['slug']} {a.task} --dir .` 與 `kanban_block(kind=\"dependency\", ...)`，不要呼叫 kanban_request_review。"
+        )
+    print(json.dumps(out_obj, ensure_ascii=False, indent=2))
 
 
 def _decode_run_meta(raw: Any) -> Any:
@@ -6392,27 +6847,14 @@ def cmd_check_card(a) -> None:
             findings.append(f"[{kind}] assignee 應為 {want['assignee']}，收到 {a.assignee}")
         if a.workspace and a.workspace != want["workspace"]:
             findings.append(f"[{kind}] workspace 應為 {want['workspace']}，收到 {a.workspace}")
+        if kind == "EPIC":
+            findings.extend(_epic_header_problems(body))
         if kind in ("DEV", "OPS"):
             if why := done_problem(a.title, body):
                 findings.append(why)
             findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
             parent_ids = list(getattr(a, "parent", None) or [])
-            if req_scope and board_arg and parent_ids:
-                test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
-                for pid, arch_meta in _resolve_check_card_arch_parents(board_arg, parent_ids):
-                    arch_files, handoff_errs = handoff_lib.validate_arch_handoff(arch_meta, POLICY)
-                    if handoff_errs:
-                        findings.append(
-                            f"[{kind}] 父卡 [ARCH] {pid} 缺少有效結構化交接（{'；'.join(handoff_errs)}），無法略過 Allowed-Scope 檢查"
-                        )
-                    elif contract["allowed_scope"]:
-                        if missing_arch := handoff_lib.missing_arch_scope_files(
-                            arch_files, contract["allowed_scope"], test_paths=test_paths
-                        ):
-                            findings.append(
-                                f"[{kind}] 的 `Allowed-Scope` 漏列父卡 [ARCH] {pid} 規劃的檔案："
-                                + ", ".join(missing_arch[:8])
-                            )
+            findings.extend(_arch_parent_scope_problems(board_arg or "", kind, parent_ids, contract["allowed_scope"], repo_cfg))
         if why := body_problem(kind, a.title, body):
             findings.append(why)
     print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
@@ -6544,7 +6986,7 @@ def cmd_stats(a) -> None:
 
 def keep_protected(e: dict) -> dict | None:
     """After a merge, a repo still at contract=no gets `repo protect` (it only acts once the default
-    branch has the devflow-ci job). Was a manual [SHIP] step: teams-transcription merged three PRs
+    branch has the devflow-ci job). Was a manual [SHIP] step: an onboarded repo merged three PRs
     after main had devflow-ci and stayed contract=no, so no PR card was held to exact-head CI."""
     return None if e.get("contract") else protect_repo(e["slug"])
 
@@ -6612,7 +7054,7 @@ def main() -> None:
     p.add_argument("--metadata", help="inline JSON metadata object to validate")
     p.add_argument("--metadata-file", help="path to JSON metadata file to validate")
     p.set_defaults(fn=cmd_check_handoff)
-    p = sub.add_parser("checkpoint", help="record a verified local-only implement checkpoint when EPIC Stop-After=implement")
+    p = sub.add_parser("checkpoint", help="record a verified slice checkpoint when EPIC Stop-After is implement or ci")
     p.add_argument("slug"); p.add_argument("task")
     p.add_argument("--dir", default=".", help="worktree root (default: cwd)")
     p.add_argument("--base", help="base git ref to diff against (default: origin/<default_branch>)")

@@ -940,8 +940,9 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         self.assertEqual(cards_ci["t_dev1"]["completion_contract"], REPO)
         self.assertEqual(cards_ci["t_ship1"]["status"], "blocked")
 
-        # 8. Under Stop-After: ci, local checkpoint fails closed & cmd_pr_submit pushes and creates PR #99 on same worktree
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ctx_cp_ci:
+        # 8. Under Stop-After: ci before PR creation, ci checkpoint fails closed; then cmd_pr_submit creates PR #99
+        with mock.patch.object(df, "run", side_effect=fake_gh_only_list), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ctx_cp_ci:
             df.cmd_checkpoint(types.SimpleNamespace(
                 slug="b", task="t_dev1", dir=str(repo_dir), base=None,
                 no_test=False, test=[], summary="",
@@ -991,8 +992,425 @@ class BinDevflowPipelineIntegration(unittest.TestCase):
         self.assertTrue(pr2_out["created"])
         self.assertEqual(pr2_out["pr_number"], 99)
         self.assertEqual(pr2_out["head_sha"], head_sha)
+        self.assertFalse(pr2_out["review_active"])
+        self.assertEqual(pr2_out["next_action"], "wait_ci_then_checkpoint")
         self.assertTrue(any("push" in c for c in pr_calls), pr_calls)
         self.assertTrue(any(c[:3] == ["gh", "pr", "create"] for c in pr_calls), pr_calls)
+
+        # 9. Stop-After: ci checkpoint & cmd_check_pr gate + hold_out_of_slice_cards + epic advance to review
+        # 9a. cmd_check_pr refuses while review step is inactive (even when worker env binds task)
+        old_kt = os.environ.get("HERMES_KANBAN_TASK")
+        os.environ["HERMES_KANBAN_TASK"] = "t_dev1"
+        try:
+            buf_cpr = io.StringIO()
+            with contextlib.redirect_stdout(buf_cpr), self.assertRaises(SystemExit) as ctx_cpr:
+                df.cmd_check_pr(types.SimpleNamespace(board="b", pr=99))
+            self.assertEqual(ctx_cpr.exception.code, 1)
+            self.assertEqual(json.loads(buf_cpr.getvalue())["stage"], "pipeline_stop")
+        finally:
+            if old_kt is not None:
+                os.environ["HERMES_KANBAN_TASK"] = old_kt
+            else:
+                os.environ.pop("HERMES_KANBAN_TASK", None)
+
+        # 9b. Stop-After: ci checkpoint fails closed if ci.yml is not completed/success yet
+        buf_ci_wait = io.StringIO()
+        with mock.patch.object(df, "run", side_effect=fake_gh_submit), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 501, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "in_progress", "conclusion": None,
+             }]), \
+             contextlib.redirect_stdout(buf_ci_wait), self.assertRaises(SystemExit) as ctx_ci_wait:
+            df.cmd_checkpoint(types.SimpleNamespace(
+                slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                no_test=False, test=[], summary="",
+            ))
+        self.assertEqual(ctx_ci_wait.exception.code, 1)
+        self.assertEqual(json.loads(buf_ci_wait.getvalue())["stage"], "ci_not_green")
+
+        # 9c. Exact-head ci.yml green -> cmd_checkpoint records ci_checkpoint & pipeline-ci-checkpoint reason
+        buf_ci_ok = io.StringIO()
+        with mock.patch.object(df, "run", side_effect=fake_gh_submit), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 502, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "completed", "conclusion": "success",
+             }]), \
+             contextlib.redirect_stdout(buf_ci_ok):
+            df.cmd_checkpoint(types.SimpleNamespace(
+                slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                no_test=False, test=[], summary="PR #99 CI green",
+            ))
+        ci_ok = json.loads(buf_ci_ok.getvalue())
+        self.assertTrue(ci_ok["ok"])
+        self.assertEqual(ci_ok["stage"], "ci_checkpoint")
+        self.assertTrue(ci_ok["block_reason"].startswith("pipeline-ci-checkpoint:t_ep1"), ci_ok)
+
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = 't_dev1'")
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_dev1', 'blocked', ?, 10)",
+                (json.dumps({"kind": "dependency", "reason": ci_ok["block_reason"]}, ensure_ascii=False),),
+            )
+            c.commit()
+        cards_ci_paused = df.plan_cards("b", "t_ep1")
+        with mock.patch.object(df, "pr_meta", return_value={"state": "OPEN", "headRefOid": head_sha}), \
+             mock.patch.object(df, "workflow_runs", return_value=[{
+                 "id": 502, "path": ".github/workflows/ci.yml", "event": "pull_request",
+                 "head_sha": head_sha, "status": "completed", "conclusion": "success",
+             }]):
+            self.assertTrue(df._maybe_mark_slice_paused("b", "t_ep1", cards_ci_paused, pipe_lib.parse_epic_pipeline(
+                cards_ci_paused["t_ep1"]["body"], df.POLICY, epic_mode="deliver"
+            )))
+        self.assertIn("Paused-At: ci", df.plan_cards("b", "t_ep1")["t_ep1"]["body"])
+
+        # Advance to review -> releases ci checkpoint hold cleanly to developer with request_review note
+        with contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after="review", to_end=False))
+        self.assertEqual(df.plan_cards("b", "t_ep1")["t_dev1"]["status"], "ready")
+        self.assertTrue(any("kanban_request_review" in msg for tid, msg in comments if tid == "t_dev1"), comments)
+
+    def test_stop_after_holds_ready_epic_gates_final_acceptance_and_blocks_worker_spoofing(self) -> None:
+        import os
+        import sqlite3
+        import subprocess
+        from unittest import mock
+
+        hermes = self.root / "hermes-epic-stop"
+        board_dir = hermes / "kanban" / "boards" / "b"
+        board_dir.mkdir(parents=True)
+        old_data = os.environ.get("DEVFLOW_HERMES_DATA")
+        os.environ["DEVFLOW_HERMES_DATA"] = str(hermes)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("DEVFLOW_HERMES_DATA", old_data)
+            if old_data is not None else os.environ.pop("DEVFLOW_HERMES_DATA", None)
+        )
+        df = load_devflow(self.root)
+
+        repo_dir = self.root / "repo-spoof"
+        remote = self.root / "origin-spoof.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(repo_dir)], check=True, capture_output=True)
+        for k, v in (("user.name", "Dev"), ("user.email", "dev@example.com")):
+            subprocess.run(["git", "-C", str(repo_dir), "config", k, v], check=True, capture_output=True)
+        (repo_dir / "app").mkdir(parents=True)
+        (repo_dir / "app" / "x.py").write_text("X = 1\n", encoding="utf-8")
+        check_sh = repo_dir / ".devflow" / "check.sh"
+        check_sh.parent.mkdir(parents=True, exist_ok=True)
+        check_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        check_sh.chmod(0o755)
+        subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "remote", "add", "origin", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "push", "-u", "origin", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "fetch", "origin", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "checkout", "-b", "wt/t_dev1"], check=True, capture_output=True)
+        (repo_dir / "app" / "x.py").write_text("X = 2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", "app/x.py"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "feat: x"], check=True, capture_output=True)
+
+        db = board_dir / "kanban.db"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT,
+                block_kind TEXT, assignee TEXT, workspace_kind TEXT,
+                workspace_path TEXT, completion_contract TEXT,
+                created_by TEXT, result TEXT, goal_mode INTEGER
+            );
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT, metadata TEXT);
+            CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER);
+        """)
+        epic_ship_body = (
+            "Mode: deliver\nStop-After: ship\n"
+            "## 目標\n停在出貨後等待人手動驗收\n\n"
+            "## 驗收\n- AC-1 [api] 回傳 200\n"
+            "  - S1 [smoke]\n    - Given ok\n    - When GET /ok\n    - Then 200\n"
+        )
+        arch_body = "## 目標\n架構\nEPIC: t_ep1\n"
+        dev_body = f"## 目標\n改\n\n## 本卡完成\n{df.DONE_TEXT}\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/x.py\nEPIC: t_ep1\n"
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ("t_ep1", "[EPIC] Stop Ship", epic_ship_body, "ready", None, "orchestrator", "dir", None, None, "user", None, 0))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ("t_ship1", "[SHIP] 出貨", "EPIC: t_ep1\n", "done", None, "devops", "dir", None, None, "orchestrator", None, 0))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ("t_arch1", "[ARCH] 設計", arch_body, "done", None, "architect", "dir", None, None, "orchestrator", None, 0))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ("t_dev1", "[DEV] 實作", dev_body, "review", None, "reviewer", "worktree", str(repo_dir), REPO, "orchestrator", None, 1))
+        conn.execute("INSERT INTO task_links VALUES ('t_ship1', 't_ep1')")
+        conn.execute("INSERT INTO task_links VALUES ('t_arch1', 't_dev1')")
+        conn.execute("INSERT INTO task_runs VALUES (1, 't_arch1', 'done', ?)",
+                     (json.dumps({"decisions": ["keep x.py"], "target_files": ["app/x.py", "app/y.py"]}),))
+        conn.commit()
+        conn.close()
+
+        # 1. check_acceptance(review=False) fails closed while Stop-After != accept, while review=True remains allowed
+        with mock.patch.object(df, "entry", return_value={"slug": "b", "repo": REPO, "path": str(repo_dir), "default_branch": "main"}):
+            rep_final = df.check_acceptance("b", "t_ep1", [1], review=False, evidence=[], tmp=self.root / "t1")
+            self.assertEqual(rep_final["criteria"], [])
+            self.assertTrue(any("Stop-After=ship" in p and "拒絕最終驗收" in p for p in rep_final["problems"]), rep_final)
+            with mock.patch.object(df, "pr_meta", return_value={"number": 1, "state": "OPEN", "headRefOid": "a" * 40, "body": "Covers: t_ep1/AC-1.S1"}), \
+                 mock.patch.object(df, "branch_file", return_value=None), \
+                 mock.patch.object(df, "workflow_runs", return_value=[]):
+                rep_rev = df.check_acceptance("b", "t_ep1", [1], review=True, evidence=[], tmp=self.root / "t2")
+                self.assertEqual(len(rep_rev["criteria"]), 1)
+
+        # 2. hold_out_of_slice_cards NEVER holds fresh 1-card intake EPIC, DOES hold finished Stop-After: ship EPIC
+        held_calls: list[tuple[str, str]] = []
+
+        def fake_hold(run_fn, hpy, boards, brd, cid, reason, *, allow_review=False):
+            held_calls.append((cid, reason))
+            with sqlite3.connect(db) as c:
+                prev = c.execute("SELECT status FROM tasks WHERE id = ?", (cid,)).fetchone()
+                payload = {"kind": "dependency", "reason": reason}
+                if allow_review and prev and prev[0] == "review":
+                    payload["source_status"] = "review"
+                    payload["resume_status"] = "review"
+                c.execute("UPDATE tasks SET status = 'blocked', block_kind = 'dependency' WHERE id = ?", (cid,))
+                c.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 20)",
+                    (cid, json.dumps(payload, ensure_ascii=False)),
+                )
+                c.commit()
+            return True, False
+
+        df.kanban = lambda b, cmd, tid, *args: ""
+        fresh_cards = {"t_ep1": {"id": "t_ep1", "title": "[EPIC] fresh", "body": "Mode: deliver\nStop-After: ship\n", "status": "ready"}}
+        with mock.patch.object(df.kanban_adapter, "hold_task_dependency", side_effect=fake_hold):
+            self.assertFalse(df.hold_out_of_slice_cards("b", "t_ep1", fresh_cards, pipe_lib.parse_epic_pipeline(
+                "Mode: deliver\nStop-After: ship\n", df.POLICY, epic_mode="deliver"
+            )))
+            self.assertEqual(held_calls, [])
+
+            # Also verifies Stop-After: ship holds finished ready [EPIC] AND holds stray review [DEV] when review is inactive
+            ci_only_cards = {
+                "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "body": epic_ship_body, "status": "ready"},
+                "t_dev1": {"id": "t_dev1", "title": "[DEV] 實作", "body": dev_body, "status": "review"},
+            }
+            df.hold_out_of_slice_cards("b", "t_ep1", ci_only_cards, pipe_lib.parse_epic_pipeline(
+                "Mode: deliver\nStop-After: ci\n", df.POLICY, epic_mode="deliver"
+            ))
+            self.assertIn("t_dev1", [cid for cid, _ in held_calls])
+
+            held_calls.clear()
+            ship_cards = {
+                "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "body": epic_ship_body, "status": "ready"},
+                "t_ship1": {"id": "t_ship1", "title": "[SHIP] 出貨", "body": "EPIC: t_ep1\n", "status": "done"},
+            }
+            df.hold_out_of_slice_cards("b", "t_ep1", ship_cards, pipe_lib.parse_epic_pipeline(
+                epic_ship_body, df.POLICY, epic_mode="deliver"
+            ))
+            self.assertEqual([cid for cid, _ in held_calls], ["t_ep1"])
+
+        # Advancing Stop-After: ship -> accept releases held [EPIC]
+        resumed_ids: list[str] = []
+        with mock.patch.object(df, "resume", side_effect=lambda b, tid, note=None: resumed_ids.append(tid) or "ok"):
+            ship_cards["t_ep1"]["status"] = "blocked"
+            ship_cards["t_ep1"]["block_kind"] = "dependency"
+            df.release_pipeline_stop_holds("b", "t_ep1", ship_cards, pipe_lib.parse_epic_pipeline(
+                "Mode: deliver\nStart-At: accept\nStop-After: accept\n", df.POLICY, epic_mode="deliver"
+            ))
+            self.assertEqual(resumed_ids, ["t_ep1"])
+
+            # Also releases held [EPIC] when Stop-After: repro advances to design with no child card covering design
+            resumed_ids.clear()
+            repro_only_cards = {
+                "t_ep1": {"id": "t_ep1", "title": "[EPIC] e", "body": "Mode: deliver\nStart-At: design\nStop-After: design\n",
+                          "status": "blocked", "block_kind": "dependency"},
+                "t_res1": {"id": "t_res1", "title": "[RES] 調查", "body": "EPIC: t_ep1\n", "status": "done"},
+            }
+            with mock.patch.object(df, "_card_has_pipeline_stop_hold", side_effect=lambda b, e, tid, card=None: tid == "t_ep1"):
+                df.release_pipeline_stop_holds("b", "t_ep1", repro_only_cards, pipe_lib.parse_epic_pipeline(
+                    "Mode: deliver\nStart-At: design\nStop-After: design\n", df.POLICY, epic_mode="deliver"
+                ))
+            self.assertEqual(resumed_ids, ["t_ep1"])
+
+        # 2b. PR #41 Findings #1 & #2: REAL hold_task_dependency(allow_review=True) + plan_cards() -> SQLite event lookup
+        # Test both inline hermes_py SQL script (via stubbed hermes_cli) and SQLite fallback, then release on advance to review.
+        import subprocess as _subproc
+        stub_pkg = self.root / "stub_hermes_cli"
+        (stub_pkg / "hermes_cli").mkdir(parents=True, exist_ok=True)
+        (stub_pkg / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+        (stub_pkg / "hermes_cli" / "kanban_db_connect.py").write_text(
+            "import sqlite3\ndef connect(p):\n    return sqlite3.connect(p)\n", encoding="utf-8",
+        )
+        (stub_pkg / "hermes_cli" / "kanban_db.py").write_text(
+            "import contextlib, json, time\n"
+            "@contextlib.contextmanager\n"
+            "def write_txn(c):\n"
+            "    with c:\n"
+            "        yield\n"
+            "def _append_event(c, tid, kind, payload):\n"
+            "    c.execute('INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',\n"
+            "              (tid, kind, json.dumps(payload, ensure_ascii=False), int(time.time())))\n",
+            encoding="utf-8",
+        )
+
+        with sqlite3.connect(db) as c:
+            c.execute("DELETE FROM task_events WHERE task_id = 't_dev1'")
+            c.execute("UPDATE tasks SET status = 'review', block_kind = NULL, assignee = 'reviewer' WHERE id = 't_dev1'")
+            c.execute(
+                "UPDATE tasks SET status = 'ready', block_kind = NULL, body = ? WHERE id = 't_ep1'",
+                ("Mode: deliver\nStart-At: implement\nStop-After: ci\n## 目標\nx\n## 驗收\n- AC-1 [api] ok\n",),
+            )
+            c.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t_dev1', 'review_requested', ?, 30)",
+                (json.dumps({"implementer": "developer"}),),
+            )
+            c.execute(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("t_dev_sub", "[DEV] 副線", dev_body, "review", None, "reviewer", "worktree", str(repo_dir), REPO, "orchestrator", None, 1),
+            )
+            c.execute("INSERT INTO task_links VALUES ('t_arch1', 't_dev_sub')")
+            c.commit()
+
+        # Path A: SQLite fallback via hold_out_of_slice_cards (HERMES_PY missing)
+        ci_pipe_real = pipe_lib.parse_epic_pipeline("Mode: deliver\nStop-After: ci\n", df.POLICY, epic_mode="deliver")
+        with mock.patch.object(df, "HERMES_PY", str(self.root / "missing-hermes-py")):
+            df.hold_out_of_slice_cards("b", "t_ep1", {"t_ep1": df.plan_cards("b", "t_ep1")["t_ep1"], "t_dev1": df.plan_cards("b", "t_ep1")["t_dev1"]}, ci_pipe_real)
+
+        # Path B: Real inline hermes_py script execution against stubbed hermes_cli -> SQLite
+        def _run_with_stub_pkg(cmd, **kw):
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(stub_pkg) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            return _subproc.run(cmd, env=env, text=True, capture_output=True, check=kw.get("check", True))
+
+        held_sub, fail_sub = df.kanban_adapter.hold_task_dependency(
+            _run_with_stub_pkg, sys.executable, df.BOARDS, "b", "t_dev_sub",
+            df.pipeline_stop_hold_reason("t_ep1", "ci"), allow_review=True,
+        )
+        self.assertTrue(held_sub and not fail_sub, (held_sub, fail_sub))
+
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            for tid in ("t_dev1", "t_dev_sub"):
+                trow = dict(c.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (tid,)).fetchone())
+                self.assertEqual(trow, {"status": "blocked", "block_kind": "dependency"}, tid)
+                evrow = dict(c.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1", (tid,)).fetchone())
+                epay = json.loads(evrow["payload"])
+                self.assertEqual(epay.get("source_status"), "review", (tid, epay))
+                self.assertEqual(epay.get("resume_status"), "review", (tid, epay))
+            c.execute("DELETE FROM tasks WHERE id = 't_dev_sub'")
+            c.execute("DELETE FROM task_links WHERE child_id = 't_dev_sub'")
+            c.commit()
+
+        # Reload through REAL plan_cards() (no `events` key on cards!) and verify release_pipeline_stop_holds keeps t_dev1 held under Stop-After: ci
+        reloaded_cards = df.plan_cards("b", "t_ep1")
+        self.assertNotIn("events", reloaded_cards["t_dev1"])
+        with mock.patch.object(df, "resume", side_effect=AssertionError("review-held card must stay blocked while review step is inactive")):
+            df.release_pipeline_stop_holds("b", "t_ep1", reloaded_cards, ci_pipe_real)
+        self.assertEqual(reloaded_cards["t_dev1"]["status"], "blocked")
+
+        # Advance EPIC to review via REAL cmd_epic_advance -> unblocks t_dev1 back into review
+        def sqlite_kanban(board, cmd, *args):
+            with sqlite3.connect(db) as kc:
+                kc.row_factory = sqlite3.Row
+                if cmd == "show":
+                    tid = args[0]
+                    t = dict(kc.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+                    evs = []
+                    for r in kc.execute("SELECT id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC", (tid,)):
+                        evs.append({"id": r["id"], "kind": r["kind"], "payload": json.loads(r["payload"] or "{}"), "created_at": r["created_at"]})
+                    return json.dumps({"task": t, "events": evs})
+                if cmd == "edit":
+                    tid, flag, val = args[0], args[1], args[2]
+                    if flag == "--body":
+                        kc.execute("UPDATE tasks SET body = ? WHERE id = ?", (val, tid))
+                        kc.commit()
+                    return ""
+                if cmd == "comment":
+                    tid, msg = args[0], args[1]
+                    kc.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'comment', ?, 40)",
+                               (tid, json.dumps({"body": msg}, ensure_ascii=False)))
+                    kc.commit()
+                    return ""
+                if cmd == "assign":
+                    tid, who = args[0], args[1]
+                    kc.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (None if who == "none" else who, tid))
+                    kc.commit()
+                    return ""
+                if cmd == "unblock":
+                    tid = args[0]
+                    rows = kc.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1", (tid,)).fetchall()
+                    p_old = json.loads(rows[0]["payload"] or "{}") if rows else {}
+                    dest = "review" if p_old.get("resume_status") == "review" else "ready"
+                    kc.execute("UPDATE tasks SET status = ?, block_kind = NULL WHERE id = ?", (dest, tid))
+                    kc.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'unblocked', ?, 41)",
+                               (tid, json.dumps({"to": dest})))
+                    kc.commit()
+                    return ""
+            return ""
+
+        with mock.patch.object(df, "kanban", side_effect=sqlite_kanban), \
+             contextlib.redirect_stdout(io.StringIO()):
+            df.cmd_epic_advance(types.SimpleNamespace(board="b", epic="t_ep1", stop_after="review", to_end=False))
+        with sqlite3.connect(db) as c:
+            row_after = c.execute("SELECT status, block_kind, assignee FROM tasks WHERE id = 't_dev1'").fetchone()
+            self.assertEqual(tuple(row_after), ("review", None, "reviewer"))
+
+        # 3. Worker identity lock & --no-test spoofing prevention in cmd_checkpoint / cmd_pr_submit
+        with sqlite3.connect(db) as c:
+            c.execute(
+                "UPDATE tasks SET body = ? WHERE id = 't_ep1'",
+                ("Mode: deliver\nStart-At: implement\nStop-After: implement\n## 目標\nx\n## 驗收\n- AC-1 [cli] ok\n  - S1\n    - Given a\n    - When b\n    - Then c\n",),
+            )
+            c.commit()
+        old_kt = os.environ.get("HERMES_KANBAN_TASK")
+        os.environ["HERMES_KANBAN_TASK"] = "t_other_card"
+        try:
+            with mock.patch.object(df, "entry", return_value={"slug": "b", "repo": REPO, "path": str(repo_dir), "default_branch": "main"}):
+                buf_m1 = io.StringIO()
+                with contextlib.redirect_stdout(buf_m1), self.assertRaises(SystemExit) as cm1:
+                    df.cmd_checkpoint(types.SimpleNamespace(
+                        slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                        no_test=False, test=[], summary="",
+                    ))
+                self.assertEqual(cm1.exception.code, 1)
+                self.assertEqual(json.loads(buf_m1.getvalue())["stage"], "worker_task_mismatch")
+
+                buf_m2 = io.StringIO()
+                with contextlib.redirect_stdout(buf_m2), self.assertRaises(SystemExit) as cm2:
+                    df.cmd_pr_submit(types.SimpleNamespace(
+                        slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                        pr_title="feat: x", pr_body="Kanban: t_dev1", pr_body_file=None,
+                        no_test=False, allow_dirty=False, dry_run=True,
+                    ))
+                self.assertEqual(cm2.exception.code, 1)
+                self.assertEqual(json.loads(buf_m2.getvalue())["stage"], "worker_task_mismatch")
+        finally:
+            if old_kt is not None:
+                os.environ["HERMES_KANBAN_TASK"] = old_kt
+            else:
+                os.environ.pop("HERMES_KANBAN_TASK", None)
+
+        # --no-test + --test "fake" rejected when repo defines .devflow/check.sh (even outside worker env)
+        with mock.patch.object(df, "entry", return_value={"slug": "b", "repo": REPO, "path": str(repo_dir), "default_branch": "main"}):
+            buf_nt = io.StringIO()
+            with contextlib.redirect_stdout(buf_nt), self.assertRaises(SystemExit) as cm_nt:
+                df.cmd_checkpoint(types.SimpleNamespace(
+                    slug="b", task="t_dev1", dir=str(repo_dir), base=None,
+                    no_test=True, test=["fake -> pass"], summary="spoof",
+                ))
+            self.assertEqual(cm_nt.exception.code, 1)
+            self.assertEqual(json.loads(buf_nt.getvalue())["stage"], "test_required")
+
+        # 4. cmd_check_card and _validate_edit_op reject invalid [EPIC] headers & [DEV] narrowing away [ARCH] target_files
+        buf_cc = io.StringIO()
+        with contextlib.redirect_stdout(buf_cc), self.assertRaises(SystemExit) as cm_cc:
+            df.cmd_check_card(types.SimpleNamespace(
+                title="[EPIC] Bad Pipe",
+                body="Mode: deliver\nStop-After: bogus_step\n## 目標\nx\n",
+                body_file=None, assignee=None, workspace=None, board=None, parent=[],
+            ))
+        self.assertEqual(cm_cc.exception.code, 1)
+        self.assertTrue(any("Stop-After" in f for f in json.loads(buf_cc.getvalue())["findings"]))
+
+        epic_edit_errs = df._validate_edit_op("b", {"op": "edit", "task": "t_ep1", "body": "Mode: deliver\nStart-At: ship\nStop-After: repro\n"})
+        self.assertTrue(any("Start-At" in e for e in epic_edit_errs), epic_edit_errs)
+        dev_edit_errs = df._validate_edit_op(
+            "b", {"op": "edit", "task": "t_dev1", "body": dev_body},
+        )
+        self.assertTrue(any("app/y.py" in e for e in dev_edit_errs), dev_edit_errs)
 
 
 if __name__ == "__main__":

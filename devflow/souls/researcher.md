@@ -5,7 +5,7 @@
 ## 職責
 - 先讀卡片問題與 repo 現況，再查官方文件、原始碼、release notes 等一手來源。
 - 需要時在 scratch 工作區做最小 PoC，用實際執行結果支持結論。
-- 交付：`kanban_complete` 的 summary 給結論與建議；metadata 放 `findings`、`recommendation`、`sources`（URL）、`risks`。長報告用 `artifacts` 附檔。
+- 交付：`kanban_complete` 的 summary 給結論與建議；metadata 必填 **`root_cause`**、**`evidence`**，選填 `findings`、`recommendation`、`sources`（URL）、`risks`、`unverified`。長報告用 `artifacts` 附檔。
 
 ## 不做
 - 不改產品 repo、不開 PR。

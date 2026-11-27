@@ -73,8 +73,27 @@ def validate_handoff(step: str, metadata: Any, policy: dict[str, Any] | None = N
         return [f"[{key}] handoff metadata 須為 JSON 物件，收到 {type(metadata).__name__}"]
 
     schema = schemas[key]
+    required = list(schema.get("required") or [])
+    when_clauses = schema.get("required_when") or []
+    if when_clauses:
+        matched_req: list[str] | None = None
+        default_req: list[str] | None = None
+        for clause in when_clauses:
+            if not isinstance(clause, dict):
+                continue
+            cond = clause.get("when")
+            if isinstance(cond, dict) and cond:
+                if all(k in metadata and metadata.get(k) == v for k, v in cond.items()):
+                    matched_req = list(clause.get("required") or [])
+                    break
+            elif clause.get("default") and default_req is None:
+                default_req = list(clause.get("required") or [])
+        for req in (matched_req if matched_req is not None else (default_req or [])):
+            if req not in required:
+                required.append(req)
+
     errs: list[str] = []
-    for req in schema.get("required") or []:
+    for req in required:
         if req not in metadata or _is_empty_handoff_value(metadata.get(req)):
             errs.append(f"[{key}] handoff metadata 缺少必填欄位 `{req}`")
 
@@ -287,8 +306,6 @@ def merge_allowed_scope_into_body(
             if _NEXT_HEADING_RE.match(lines[i]):
                 end_idx = i
                 break
-            if scope_lib.EPIC_REF if hasattr(scope_lib, "EPIC_REF") else False:  # pragma: no cover
-                pass
             if re.match(r"^\s*EPIC[：:]", lines[i], re.I) and epic_line_idx is None:
                 epic_line_idx = i
         insert_idx = epic_line_idx if epic_line_idx is not None else end_idx

@@ -192,6 +192,7 @@ def load_rules() -> list[Rule]:
     return rules
 
 
+# --- BEGIN SHARED IMPORT LEXER ---
 def _resolve_py_relative_import(rel_path: str, module: str | None, level: int) -> str:
     if level <= 0:
         return module or ""
@@ -204,7 +205,8 @@ def _resolve_py_relative_import(rel_path: str, module: str | None, level: int) -
 
 
 def _import_matches_forbidden(imp: str, forbidden: str) -> bool:
-    clean_imp, forb = (imp or "").strip(), (forbidden or "").strip()
+    clean_imp = (imp or "").strip()
+    forb = (forbidden or "").strip()
     if not clean_imp or not forb:
         return False
     if forb.endswith("/"):
@@ -224,6 +226,7 @@ _JS_LINE_BREAKS = frozenset(("\r", "\n", "\u2028", "\u2029"))
 
 
 def _decode_js_escape(text: str, bs_idx: int, lineno: int) -> tuple[str, int, int]:
+    """Decode JS string/template backslash escape at `bs_idx`; return `(decoded, next_idx, next_line)`."""
     n = len(text)
     if bs_idx + 1 >= n:
         return "", bs_idx + 1, lineno
@@ -278,8 +281,10 @@ def _decode_js_escape(text: str, bs_idx: int, lineno: int) -> tuple[str, int, in
 
 
 def _scan_template_tail(text: str, start: int, lineno: int, *, first: bool) -> tuple[str, int, int, bool]:
+    """Scan a JS template segment starting after `` ` `` or `}`; returns `(kind, next_idx, next_line, hit_interp)`."""
     buf: list[str] = []
-    i, n = start, len(text)
+    i = start
+    n = len(text)
     while i < n:
         ch = text[i]
         if ch == "\\" and i + 1 < n:
@@ -346,6 +351,7 @@ def _is_member_dot(tok: tuple[str, str, int]) -> bool:
 
 
 def _is_jsx_close_gt(tokens: list[tuple[str, str, int]]) -> bool:
+    """Return True when a trailing `>` token closes `<Tag />` or `</Tag>` JSX syntax."""
     sig = _sig_tokens_tail(tokens, 8)
     if len(sig) < 2 or sig[0][0] != "OP" or sig[0][1] != ">":
         return False
@@ -386,6 +392,7 @@ def _js_allows_regex(tokens: list[tuple[str, str, int]], *, in_for_paren: bool =
 
 
 def _ctrl_paren_kind(tokens: list[tuple[str, str, int]]) -> str:
+    """Return `'for'`, `'ctrl'`, or `''` for an opening `(` (`if`/`while`/`for`/`with`/`for await`)."""
     sig = _sig_tokens_tail(tokens, 3)
     if not sig or sig[0][0] != "IDENT":
         return ""
@@ -421,7 +428,8 @@ def _is_expr_prefix_tok(
         if pv == "of":
             return in_for_paren
         if pv == "default":
-            return idx + 1 < len(sig) and sig[idx + 1][0] == "IDENT" and sig[idx + 1][1] == "export"
+            is_exp = idx + 1 < len(sig) and sig[idx + 1][0] == "IDENT" and sig[idx + 1][1] == "export"
+            return is_exp
         return pv in _BRACE_EXPR_KW
     return False
 
@@ -433,6 +441,7 @@ def _is_fn_class_expr(
     *,
     in_for_paren: bool = False,
 ) -> bool:
+    """Return True when `function`/`class` begins an expression rather than a statement declaration."""
     sig = _sig_tokens_tail(tokens, 4)
     if not sig:
         return False
@@ -456,6 +465,7 @@ def _brace_open_kind(
     *,
     in_for_paren: bool = False,
 ) -> str:
+    """Classify `{` as `'fn_expr'`, `'obj'`, or `'block'` so closing `}` preserves division vs regex."""
     depth = (paren_len, len(brace_kinds))
     sig = _sig_tokens_tail(tokens, 2)
     if expr_head_depths and expr_head_depths[-1] == depth:
@@ -486,7 +496,7 @@ def _prune_depths(
     for stack in (ternary_depths, expr_head_depths):
         while stack:
             dp, db = stack[-1]
-            drop = (dp > paren_len or db > brace_len) if strict else (dp >= paren_len and db >= brace_len)
+            drop = (dp >= paren_len and db >= brace_len) if not strict else (dp > paren_len or db > brace_len)
             if not drop:
                 break
             stack.pop()
@@ -515,7 +525,10 @@ def _count_js_line_breaks(text: str, start: int, end: int) -> int:
 
 
 def _try_scan_js_regex(text: str, start: int, lineno: int) -> int | None:
-    i, n, in_cls = start + 1, len(text), False
+    """Speculatively scan single-line `/pattern/flags`; return next index or None if unterminated or invalid flags."""
+    i = start + 1
+    n = len(text)
+    in_cls = False
     while i < n:
         rc = text[i]
         if rc == "\\" and i + 1 < n:
@@ -547,13 +560,20 @@ _JSX_CLOSE_TAG_AT_RE = _JSX_CLOSE_TAG_RE
 
 
 def _last_jsx_closes(text: str) -> dict[str, int]:
+    """Map each JSX tag name (`""` for fragments) to its latest closing tag offset, or empty if none."""
     if "</" not in text:
         return {}
-    return {m.group(1) or "": m.end() for m in _JSX_CLOSE_TAG_RE.finditer(text)}
+    out: dict[str, int] = {}
+    for m in _JSX_CLOSE_TAG_RE.finditer(text):
+        out[m.group(1) or ""] = m.end()
+    return out
 
 
 def _scan_jsx_attr_string(text: str, start: int, lineno: int) -> tuple[int, int] | None:
-    q, i, n = text[start], start + 1, len(text)
+    """Scan `'...'` or `"..."` inside a JSX attribute; return `(next_idx, next_line)` or None if unclosed."""
+    q = text[start]
+    i = start + 1
+    n = len(text)
     while i < n:
         c = text[i]
         if c == "\\" and i + 1 < n:
@@ -580,7 +600,9 @@ def _scan_jsx_open_tag(
     lineno: int,
     jsx_closes: dict[str, int],
 ) -> tuple[str, bool, int, int, list[tuple[str, str, int]]] | None:
-    n, p = len(text), lt_idx + 1
+    """Scan `<Tag ...>` / `<Tag .../>` / `<>`; return `(tag, self_closing, next_i, next_line, prop_tokens)` or None."""
+    n = len(text)
+    p = lt_idx + 1
     if p >= n:
         return None
     if text[p] == ">":
@@ -590,9 +612,11 @@ def _scan_jsx_open_tag(
     q = p + 1
     while q < n and (text[q].isalnum() or text[q] in ("_", "$", ".", "-")):
         q += 1
-    tag_name, p = text[p:q], q
+    tag_name = text[p:q]
+    p = q
     if p < n and not (text[p] in _JS_LINE_BREAKS or _is_js_ws(text[p]) or text[p] in (">", "/", "<")):
         return None
+
     prop_tokens: list[tuple[str, str, int]] = []
     angle = 0
     while p < n:
@@ -605,10 +629,14 @@ def _scan_jsx_open_tag(
             p += 1
             continue
         if ch == "<":
-            angle += 1; p += 1; continue
+            angle += 1
+            p += 1
+            continue
         if ch == ">":
             if angle > 0:
-                angle -= 1; p += 1; continue
+                angle -= 1
+                p += 1
+                continue
             return tag_name, False, p + 1, lineno, prop_tokens
         if ch in ("'", '"'):
             s_res = _scan_jsx_attr_string(text, p, lineno)
@@ -667,6 +695,7 @@ def _try_scan_jsx(
     lineno: int,
     jsx_closes: dict[str, int],
 ) -> tuple[list[tuple[str, str, int]], int, int] | None:
+    """Speculatively scan a JSX element or fragment so JSX child text apostrophes/quotes never start JS strings."""
     head = _scan_jsx_open_tag(text, start_lt, lineno, jsx_closes)
     if head is None:
         return None
@@ -675,7 +704,9 @@ def _try_scan_jsx(
         return toks_out, i, cur_line
     if jsx_closes.get(tag_name, -1) < i:
         return None
-    stack, n = [tag_name], len(text)
+
+    stack = [tag_name]
+    n = len(text)
     while stack and i < n:
         ch = text[i]
         if ch in _JS_LINE_BREAKS:
@@ -729,6 +760,7 @@ def _tokenize_js_span(
     stop_on_rbrace: bool = False,
     jsx_closes: dict[str, int] | None = None,
 ) -> tuple[list[tuple[str, str, int]], int, int, bool]:
+    """Tokenize JS/TS/JSX from `start`, optionally stopping on an unmatched `}` (for `{expr}` spans)."""
     tokens: list[tuple[str, str, int]] = []
     tpl_braces: list[int] = []
     paren_ctrl: list[str] = []
@@ -736,7 +768,8 @@ def _tokenize_js_span(
     expr_head_depths: list[tuple[int, int]] = []
     ternary_depths: list[tuple[int, int]] = []
     closes = _last_jsx_closes(text) if jsx_closes is None else jsx_closes
-    i, n = start, len(text)
+    i = start
+    n = len(text)
     if start == 0:
         if i < n and text[i] == "\ufeff":
             i += 1
@@ -756,13 +789,15 @@ def _tokenize_js_span(
             i += 1
             continue
         if ch == "/" and i + 1 < n:
-            if text[i + 1] == "/":
+            nxt = text[i + 1]
+            if nxt == "/":
                 i += 2
                 while i < n and text[i] not in _JS_LINE_BREAKS:
                     i += 1
                 continue
-            if text[i + 1] == "*":
-                cmt_line, had_nl = lineno, False
+            if nxt == "*":
+                cmt_line = lineno
+                had_nl = False
                 i += 2
                 while i < n:
                     if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
@@ -793,8 +828,10 @@ def _tokenize_js_span(
                 i, lineno = jend, jline
                 continue
         if ch in ("'", '"'):
-            q, start_line, buf = ch, lineno, []
+            q = ch
+            start_line = lineno
             i += 1
+            buf: list[str] = []
             while i < n:
                 c = text[i]
                 if c == "\\" and i + 1 < n:
@@ -893,7 +930,9 @@ def _tokenize_js_span(
             i += 1
             continue
         if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
-            start_num, start_line, is_dec = i, lineno, True
+            start_num = i
+            start_line = lineno
+            is_dec = True
             if ch == ".":
                 i += 1
                 while i < n and (text[i].isdigit() or text[i] == "_"):
@@ -924,7 +963,8 @@ def _tokenize_js_span(
             tokens.append(("NUM", text[start_num:i], start_line))
             continue
         if ch.isalpha() or ch in ("_", "$"):
-            start_id, start_line = i, lineno
+            start_id = i
+            start_line = lineno
             i += 1
             while i < n and (text[i].isalnum() or text[i] in ("_", "$")):
                 i += 1
@@ -943,22 +983,31 @@ def _tokenize_js_span(
             i += len(matched_op)
             continue
         if ch == "!":
-            tokens.append(("OP" if _js_allows_regex(tokens, in_for_paren=in_for) else "POSTFIX_BANG", "!", lineno))
+            # Prefix logical negation allows a following regex literal; TS postfix `!` ends an operand so `/` divides.
+            tok_kind = "OP" if _js_allows_regex(tokens, in_for_paren=in_for) else "POSTFIX_BANG"
+            tokens.append((tok_kind, "!", lineno))
             i += 1
             continue
-        tokens.append(("PUNCT" if ch in ("[", "]", ".", "=", ",") else "OP", ch, lineno))
+        if ch in ("[", "]", ".", "=", ","):
+            tokens.append(("PUNCT", ch, lineno))
+        else:
+            tokens.append(("OP", ch, lineno))
         i += 1
     return tokens, i, lineno, not stop_on_rbrace
 
 
 def _tokenize_js(text: str) -> list[tuple[str, str, int]]:
+    """Lex JS/TS outside comments, strings, regexes, templates, and JSX text so literals never look like imports."""
     return _tokenize_js_span(text)[0]
 
 
 def _extract_js_imports(text: str) -> list[tuple[int, str]]:
+    """Extract static/dynamic JS/TS module specifiers without scanning string or comment contents."""
     toks = _tokenize_js(text)
     out: list[tuple[int, str]] = []
-    n, paren_depth, brace_depth = len(toks), 0, 0
+    n = len(toks)
+    paren_depth = 0
+    brace_depth = 0
     stmt_start = True
     prev_kind, prev_val = "", ""
 
@@ -978,9 +1027,13 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
         if kind == "PUNCT" and val == "(":
             paren_depth += 1
         elif (kind == "PUNCT" and val == ")") or kind == "CTRL_CLOSE":
-            paren_depth = max(0, paren_depth - 1)
+            paren_depth -= 1
+            if paren_depth < 0:
+                paren_depth = 0
         elif (kind == "PUNCT" and val in ("{", "}")) or kind == "EXPR_RBRACE":
-            brace_depth = max(0, brace_depth + (1 if kind == "PUNCT" and val == "{" else -1))
+            brace_depth += 1 if kind == "PUNCT" and val == "{" else -1
+            if brace_depth < 0:
+                brace_depth = 0
 
         is_member = _is_member_dot((prev_kind, prev_val, 0))
         if kind == "IDENT" and not is_member:
@@ -990,13 +1043,27 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                     k = _next_sig(j + 1)
                     if k < n and toks[k][0] == "STR":
                         out.append((line, toks[k][1].strip()))
+                elif (
+                    val == "require"
+                    and j < n
+                    and ((toks[j][0] == "PUNCT" and toks[j][1] == ".") or (toks[j][0] == "OP" and toks[j][1] == "?."))
+                ):
+                    r_idx = _next_sig(j + 1)
+                    if r_idx < n and toks[r_idx][0] == "IDENT" and toks[r_idx][1] == "resolve":
+                        p_idx = _next_sig(r_idx + 1)
+                        if p_idx < n and toks[p_idx][0] == "PUNCT" and toks[p_idx][1] == "(":
+                            k = _next_sig(p_idx + 1)
+                            if k < n and toks[k][0] == "STR":
+                                out.append((line, toks[k][1].strip()))
                 elif val == "import" and stmt_start and j < n:
                     if toks[j][0] == "STR":
                         out.append((line, toks[j][1].strip()))
                     elif toks[j][0] != "PUNCT" or toks[j][1] != ".":
-                        depth, m = 0, j
+                        # Scan `import ... from 'mod'` allowing newlines inside `{ ... }`.
+                        depth = 0
+                        m = j
                         while m < n:
-                            mk, mv, _ = toks[m]
+                            mk, mv, mline = toks[m]
                             if mk == "PUNCT" and mv == "{":
                                 depth += 1
                             elif mk == "PUNCT" and mv == "}":
@@ -1013,7 +1080,7 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                                 if nxt < n and toks[nxt][0] == "IDENT" and toks[nxt][1] == "from":
                                     m = nxt
                                     continue
-                                if toks[m - 1][1] == "}":
+                                if m > j and toks[m - 1][1] == "}":
                                     m += 1
                                     continue
                                 break
@@ -1025,7 +1092,8 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                     or (toks[j][0] == "PUNCT" and toks[j][1] == "{")
                     or (toks[j][0] == "IDENT" and toks[j][1] == "type")
                 ):
-                    depth, m = 0, j
+                    depth = 0
+                    m = j
                     while m < n:
                         mk, mv, _ = toks[m]
                         if mk == "PUNCT" and mv == "{":
@@ -1041,15 +1109,18 @@ def _extract_js_imports(text: str) -> list[tuple[int, str]]:
                             break
                         m += 1
 
-        stmt_start = bool(kind == "PUNCT" and val in (";", "{", "}") and paren_depth == 0)
+        if kind == "PUNCT" and val in (";", "{", "}") and paren_depth == 0:
+            stmt_start = True
+        else:
+            stmt_start = False
         prev_kind, prev_val = kind, val
         i += 1
     return out
 
 
-def _extract_python_imports(path: str, text: str) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
+def _extract_python_imports(rel_path: str, text: str) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
     try:
-        tree = ast.parse(text, filename=path)
+        tree = ast.parse(text, filename=rel_path)
     except SyntaxError as err:
         return [], (err.lineno or 1, err.msg or "syntax error")
     out: list[tuple[int, str]] = []
@@ -1059,16 +1130,19 @@ def _extract_python_imports(path: str, text: str) -> tuple[list[tuple[int, str]]
                 out.append((node.lineno, alias.name))
         elif isinstance(node, ast.ImportFrom):
             if node.module:
-                if base_mod := _resolve_py_relative_import(path, node.module, node.level):
+                base_mod = _resolve_py_relative_import(rel_path, node.module, node.level)
+                if base_mod:
                     out.append((node.lineno, base_mod))
                     for alias in node.names:
                         if alias.name and alias.name != "*":
                             out.append((node.lineno, f"{base_mod}.{alias.name}"))
             else:
                 for alias in node.names:
-                    if mod := _resolve_py_relative_import(path, alias.name, node.level):
-                        out.append((node.lineno, mod))
+                    resolved = _resolve_py_relative_import(rel_path, alias.name, node.level)
+                    if resolved:
+                        out.append((node.lineno, resolved))
     return out, None
+# --- END SHARED IMPORT LEXER ---
 
 
 def _extract_imports(path: str, text: str) -> list[tuple[int, str]]:

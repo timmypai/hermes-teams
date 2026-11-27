@@ -20,6 +20,7 @@ if str(KIT) not in sys.path:
 
 from lib import handoff as handoff_lib  # noqa: E402
 from lib import policy as policy_lib  # noqa: E402
+from lib import scope as scope_lib  # noqa: E402
 from test_judgment import REPO, load_devflow  # noqa: E402
 
 
@@ -72,6 +73,30 @@ class HandoffValidation(unittest.TestCase):
         self.assertTrue(any("萬用" in e or "過寬" in e for e in errs3), errs3)
         self.assertTrue(handoff_lib.validate_handoff("unknown", {}, self.policy))
         self.assertTrue(handoff_lib.validate_handoff("implement", None, self.policy))
+
+    def test_repro_matches_research_skill_and_ship_supports_conditional_required_when(self) -> None:
+        repro_meta = {
+            "root_cause": "worker skipped lock before writing cursor",
+            "evidence": ["https://github.com/o/r/issues/1", "bin/worker.py:42"],
+            "recommendation": "acquire per-task lock",
+            "findings": ["cursor updated out of order"],
+            "sources": ["https://github.com/o/r/issues/1"],
+            "risks": ["slightly higher lock contention"],
+            "unverified": [],
+        }
+        self.assertEqual(handoff_lib.validate_card_handoff("RES", repro_meta, self.policy), [])
+
+        # Conditional ship schema: shipped=false requires `reason` (NOT merged_sha); shipped PR requires `merged_sha`
+        self.assertEqual(
+            handoff_lib.validate_card_handoff("SHIP", {"shipped": False, "reason": "advisor advise revise"}, self.policy),
+            [],
+        )
+        errs_false = handoff_lib.validate_card_handoff("SHIP", {"shipped": False}, self.policy)
+        self.assertTrue(any("`reason`" in e for e in errs_false), errs_false)
+        self.assertFalse(any("merged_sha" in e for e in errs_false), errs_false)
+        self.assertEqual(handoff_lib.validate_card_handoff("SHIP", {"merged_sha": "d" * 40}, self.policy), [])
+        errs_empty = handoff_lib.validate_card_handoff("SHIP", {}, self.policy)
+        self.assertTrue(any("`merged_sha`" in e for e in errs_empty), errs_empty)
 
 
 class ArchTargetFileInheritance(unittest.TestCase):
@@ -178,6 +203,11 @@ class AtomicScopeMerge(unittest.TestCase):
             (env_body, None, ["config.v1"]),
             (env_body, None, ["config/"]),
             ("## 目標\nx\n\n## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n", "## 目標\nx\n## 不能碰\n- `**/*.env`\n", ["config.v1"]),
+            (base.replace("src/private/**", "src*/private.py"), None, ["src/a*"]),
+            (base.replace("src/private/**", "src/?x.py"), None, ["src/**src/a?.py"]),
+            (base.replace("src/private/**", "app/[z].py"), None, ["app/[!z-a].py"]),
+            (base.replace("src/private/**", "app/[! -~].py"), None, ["app/[! -~]*.py"]),
+            (base.replace("src/private/**", "app/**/page.tsx"), None, ["app/[id]"]),
         ):
             with self.assertRaises(ValueError, msg=f"{oos_body} / {epic_body} + {bad_add}"):
                 handoff_lib.merge_allowed_scope_into_body(oos_body, bad_add, epic_body=epic_body)
@@ -198,6 +228,69 @@ class AtomicScopeMerge(unittest.TestCase):
         self.assertIn("tests/**/*.py", ok4)
         _, ok5 = handoff_lib.merge_allowed_scope_into_body(base, ["config", "config.v1"], epic_body=None)
         self.assertIn("config.v1", ok5)
+
+    def test_globs_overlap_precision_and_zero_false_negatives_property(self) -> None:
+        # Conservative bounds preserve genuinely disjoint shapes without violating scope.match_glob soundness
+        for a, b in (
+            ("src/foo.py", "src/foobar.py"),
+            ("src/*_test.py", "src/*.ts"),
+        ):
+            self.assertFalse(handoff_lib._globs_overlap(a, b), (a, b))
+            self.assertFalse(handoff_lib._globs_overlap(b, a), (b, a))
+        # Wildcardless `src/secret.py` matches descendants `src/secret.py/...` under scope.match_glob -> sound True
+        self.assertTrue(handoff_lib._globs_overlap("src/*_test.py", "src/secret.py"))
+        # Slash-spanning, prefix/suffix `**`, descending/empty class, Unicode complement & bracketed Next.js route dir (PR #41 regressions)
+        for a, b in (
+            ("src/a*", "src*/private.py"),
+            ("src/**src/a?.py", "src/?x.py"),
+            ("src/**src", "src"),
+            (".env", "env"),
+            (".devflow/**", "devflow/a.py"),
+            ("app/[!z-a].py", "app/[z].py"),
+            ("app/[! -~].py", "app/[! -~]*.py"),
+            ("app/[id]", "app/**/page.tsx"),
+        ):
+            self.assertTrue(handoff_lib._globs_overlap(a, b), (a, b))
+            self.assertTrue(handoff_lib._globs_overlap(b, a), (b, a))
+
+        # Unconditional 0-false-negative property check across 59 globs x 57 paths
+        globs = [
+            "app/a.py", "app/b.py", "src/foo.py", "src/foobar.py", "src/secret.py",
+            "src/*_test.py", "src/*_prod.py", "src/*.py", "src/*.ts", "src/*.rs",
+            "src/private", "src/private/", "src/private/**", "src/private/*.py", "src/private/*.ts",
+            "src/a*", "src*/private.py", "src/*/private.py",
+            "src/**src/a?.py", "src/?x.py", "src/**src", "src/**a.py", "src/**/a.py",
+            "src/**src/foo.py", "src/*bar.py",
+            "app/[a-z]/*.py", "app/[a-z]*.py", "app/[a-z]", "app/[id]", "app/**/page.tsx",
+            "app/secret/x.py", "app/secret/**", "app/public*.py",
+            "app/[!z-a].py", "app/[z].py", "app/[z-a].py", "app/[z-ax].py", "app/[! -~].py", "app/[! -~]*.py",
+            "**/*.env", "src/**/*.py", "tests/**/*.py", "config", "config.v1", "config/",
+            "a/**/foo.py", "a/*/foo.py", "a/*/b/*.py", "docs/[!x]/*.md", "ops/?/cfg.yml",
+            "a[/-]b", "a/**/b/**/c.py", "a/**b/c", "a/**//b",
+            ".env", "env", ".devflow/**", "devflow/a.py",
+            "*/*.py", "app/*/", "src/api/**", "src/a*.py", "seccomp*.json",
+        ]
+        paths = [
+            "app/a.py", "app/b.py", "app/x/m.py", "app/1/m.py", "app/secret/x.py", "app/secret/x.py/a.py",
+            "app/secret/a.py", "app/public_api.py", "app/a", "app/a/b.py",
+            "app/[id]/page.tsx", "app/z.py", "app/x.py", "app/中.py",
+            "src/foo.py", "src/foobar.py", "src/a_test.py", "src/a_prod.py", "src/secret.py",
+            "src/secret.py/a_test.py", "src/private", "src/private/a.py", "src/private/sub/b.ts",
+            "src/app/private.py", "src/x/private.py",
+            "src/ax.py", "src/src/ax.py", "src", "src/a.py", "src/x/a.py", "src/bar.py/src/foo.py",
+            "src/api/auth.py", "src/lib.rs", "config", "config/a.env", "config.v1", "config.v1/a.env",
+            "a/foo.py", "a/b/foo.py", "a/b/c/foo.py", "a/x/b/y.py", "a/bar_foo.py",
+            "a/b", "a-b", "a/b/c.py", "a/x/b/y/c.py", "a/b/c", "a/xb/c", "a/x/b",
+            ".env", "env", ".devflow/a.py", "devflow/a.py",
+            "docs/y/a.md", "docs/x/a.md", "docs/x/y/a.md", "ops/z/cfg.yml", "ops/a/b/cfg.yml",
+            "tests/unit/a.py", "src/nested/mod.py", "a.env", "x/y.py",
+        ]
+        for p in paths:
+            matching = [g for g in globs if scope_lib.match_glob(p, g)]
+            for i, g1 in enumerate(matching):
+                for g2 in matching[i:]:
+                    self.assertTrue(handoff_lib._globs_overlap(g1, g2), (p, g1, g2))
+                    self.assertTrue(handoff_lib._globs_overlap(g2, g1), (p, g2, g1))
 
 
 class BinDevflowHandoffIntegration(unittest.TestCase):

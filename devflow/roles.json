@@ -90,7 +90,10 @@
     "handoff_schemas": {
       "repro": {
         "required": ["root_cause", "evidence"],
-        "optional": ["affected_paths", "non_goals", "open_questions"]
+        "optional": [
+          "affected_paths", "non_goals", "open_questions",
+          "recommendation", "findings", "sources", "risks", "unverified"
+        ]
       },
       "design": {
         "required": ["decisions", "target_files"],
@@ -105,8 +108,15 @@
         "optional": ["base_ref", "summary", "followups"]
       },
       "ship": {
-        "required": ["merged_sha"],
-        "optional": ["deployed_sha", "acceptance_report", "followups"]
+        "required": [],
+        "required_when": [
+          {"when": {"shipped": false}, "required": ["reason"]},
+          {"default": true, "required": ["merged_sha"]}
+        ],
+        "optional": [
+          "shipped", "reason", "merged_sha", "deployed_sha",
+          "deploy_run_url", "integration_run_url", "acceptance_report", "verify", "followups"
+        ]
       }
     }
   },

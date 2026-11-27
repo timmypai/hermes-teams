@@ -1,10 +1,12 @@
 """Developer preflight CLI gate (`devflow preflight`): deterministic local checks before PR/review."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import tomllib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +134,57 @@ def _file_hash(repo_dir: Path, path: str) -> str | None:
         return None
 
 
+def configured_test_commands(
+    repo_dir: Path,
+    *,
+    repo_cfg: dict[str, str] | None = None,
+    verify_cmds: list[str] | None = None,
+) -> list[tuple[str, list[str] | str, bool]]:
+    """Return ordered local verification/test commands declared by the repo or card."""
+    cfg = repo_cfg if repo_cfg is not None else load_repo_config(repo_dir)
+    cmds: list[tuple[str, list[str] | str, bool]] = []
+    check_sh = repo_dir / ".devflow" / "check.sh"
+    if check_sh.is_file():
+        cmds.append(("check.sh", ["bash", str(check_sh)], False))
+    if verify_cmds:
+        for idx, cmd in enumerate(verify_cmds, 1):
+            cmds.append((f"verify_{idx}", cmd, True))
+    elif (review_cmd := repo_review_test_cmd(cfg)):
+        cmds.append(("review_test", review_cmd, True))
+    elif (repo_dir / ".devflow" / "test.sh").is_file():
+        cmds.append(("test.sh", ["bash", str(repo_dir / ".devflow" / "test.sh")], False))
+    return cmds
+
+
+def _load_repo_baseline(repo_dir: Path) -> Counter[tuple[str, str, str]]:
+    """Load optional `.devflow/baseline.json` using `(rule, path, line_text)` keys."""
+    baseline_path = repo_dir / ".devflow" / "baseline.json"
+    if not baseline_path.is_file():
+        return Counter()
+    try:
+        data = json.loads(baseline_path.read_text(encoding="utf-8"))
+        entries = data.get("entries") or []
+        return Counter(
+            (str(e["rule"]), str(e["path"]), str(e["text"]).strip())
+            for e in entries
+            if isinstance(e, dict) and "rule" in e and "path" in e and "text" in e
+        )
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
+        return Counter()
+
+
+def _line_text_at(repo_dir: Path, rel_path: str, lineno: int, cache: dict[str, list[str]]) -> str:
+    if lineno <= 0 or not rel_path:
+        return ""
+    if rel_path not in cache:
+        try:
+            cache[rel_path] = (repo_dir / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            cache[rel_path] = []
+    lines = cache[rel_path]
+    return lines[lineno - 1].strip() if lineno <= len(lines) else ""
+
+
 def run_preflight(
     repo_dir: Path,
     *,
@@ -257,11 +310,15 @@ def run_preflight(
     else:
         checks["standard_delivery"] = "ok"
 
-    # 4c. Declarative diff_policy / diff_budget rules under .devflow/rules/*.toml
+    # 4c. Declarative TOML rules under .devflow/rules/*.toml
+    # Always evaluate diff_policy/diff_budget AND all static rules (`regex`, `import_boundary`,
+    # `cross_file`) unconditionally via lint_engine so check.sh stubs/comments never bypass enforcement.
     rules_dir = repo_dir / ".devflow" / "rules"
     if rules_dir.is_dir():
         dp_rules: list[lint_engine.LintRule] = []
+        static_rules: list[lint_engine.LintRule] = []
         dp_findings: list[str] = []
+        static_findings: list[str] = []
         for rp in sorted(rules_dir.glob("*.toml")):
             try:
                 raw_toml = tomllib.loads(rp.read_text(encoding="utf-8"))
@@ -269,12 +326,15 @@ def run_preflight(
                 dp_findings.append(f"規則檔 {rp.name} 無法解析：{err}")
                 continue
             rkind = str(raw_toml.get("kind") or "regex").strip().lower()
-            if rkind not in lint_engine.DIFF_KINDS:
-                continue
             try:
-                dp_rules.append(lint_engine.load_rule(rp))
+                rule_obj = lint_engine.load_rule(rp)
             except lint_engine.LintConfigError as err:
-                dp_findings.append(str(err))
+                (dp_findings if rkind in lint_engine.DIFF_KINDS else static_findings).append(str(err))
+                continue
+            if rkind in lint_engine.DIFF_KINDS:
+                dp_rules.append(rule_obj)
+            else:
+                static_rules.append(rule_obj)
         if dp_rules:
             numstat = _git_numstat(repo_dir, base_ref)
             for hit in lint_engine.evaluate_diff_policy(
@@ -284,6 +344,29 @@ def run_preflight(
         if dp_rules or dp_findings:
             findings.extend(dp_findings)
             checks["diff_policy"] = "fail" if dp_findings else "ok"
+
+        if static_rules:
+            touched_set = set(all_touched)
+            legacy_baseline = _load_repo_baseline(repo_dir)
+            line_cache: dict[str, list[str]] = {}
+            for hit in lint_engine.scan_repo(static_rules, repo_dir):
+                if hit["kind"] != "cross_file":
+                    if hit["file"] not in touched_set:
+                        continue
+                    key = (
+                        str(hit["id"]),
+                        str(hit["file"]),
+                        _line_text_at(repo_dir, str(hit["file"]), int(hit["line"] or 0), line_cache),
+                    )
+                    if legacy_baseline[key] > 0:
+                        legacy_baseline[key] -= 1
+                        continue
+                static_findings.append(
+                    f"{hit['file']}:{hit['line']} [{hit['id']}] {hit['detail']} ({hit['match']})"
+                )
+        if static_findings or static_rules:
+            findings.extend(static_findings)
+            checks["static_rules"] = "fail" if static_findings else "ok"
 
     # 5. PR title & body checks (fix -> Lesson, Covers -> valid scenario IDs)
     pr_findings: list[str] = []
@@ -306,18 +389,9 @@ def run_preflight(
     # 6. Local checks & targeted tests (optional)
     test_outputs: list[dict] = []
     if run_tests:
-        cmds: list[tuple[str, list[str] | str, bool]] = []
-        check_sh = repo_dir / ".devflow" / "check.sh"
-        if check_sh.is_file():
-            cmds.append(("check.sh", ["bash", str(check_sh)], False))
-        # Prefer card Verify -> repo DEVFLOW_REVIEW_TEST_CMD -> .devflow/test.sh
-        if contract["verify"]:
-            for idx, cmd in enumerate(contract["verify"], 1):
-                cmds.append((f"verify_{idx}", cmd, True))
-        elif (review_cmd := repo_review_test_cmd(repo_cfg)):
-            cmds.append(("review_test", review_cmd, True))
-        elif (repo_dir / ".devflow" / "test.sh").is_file():
-            cmds.append(("test.sh", ["bash", str(repo_dir / ".devflow" / "test.sh")], False))
+        cmds = configured_test_commands(
+            repo_dir, repo_cfg=repo_cfg, verify_cmds=contract["verify"]
+        )
 
         for label, cmd, use_shell in cmds:
             p = subprocess.run(cmd, cwd=repo_dir, shell=use_shell, text=True, capture_output=True)
