@@ -1678,16 +1678,17 @@ def _collect_slice_step_evidence(
     cards: dict[str, dict],
     ep_pipe: dict,
 ) -> tuple[dict[str, dict[str, Any]], bool]:
-    """Gather exact-head CI completion evidence for straddling `[DEV]`/`[OPS]` cards in `review` under `Stop-After: ci`."""
+    """Gather verified completion evidence for straddling `[DEV]`/`[OPS]` cards under `Stop-After: implement|ci`."""
     steps = list(ep_pipe.get("steps") or [])
     start_at = str(ep_pipe.get("start_at") or "").strip().lower()
     stop_after = str(ep_pipe.get("stop_after") or "").strip().lower()
     if not ep_pipe.get("valid") or not steps or start_at not in steps or stop_after not in steps or stop_after == steps[-1]:
         return {}, False
-    if stop_after != "ci":
+    if stop_after not in ("implement", "ci"):
         return {}, False
 
     s_idx, e_idx = steps.index(start_at), steps.index(stop_after)
+    want_status = "blocked" if stop_after == "implement" else "review"
     candidates: list[tuple[str, dict]] = []
     for cid, c in sorted(cards.items()):
         if cid == epic or c.get("status") == "archived":
@@ -1696,10 +1697,55 @@ def _collect_slice_step_evidence(
         span = pipeline_lib.card_step_span(kind, ep_pipe, POLICY)
         if span is None or span[1] < s_idx or span[0] > e_idx:
             continue
-        if span[0] <= e_idx < span[1] and str(c.get("status") or "").strip().lower() == "review":
+        if span[0] <= e_idx < span[1] and str(c.get("status") or "").strip().lower() == want_status:
+            if stop_after == "implement" and str(c.get("block_kind") or "").strip().lower() != "dependency":
+                continue
             candidates.append((cid, c))
     if not candidates:
         return {}, False
+
+    if stop_after == "implement":
+        checkpoints = load_implement_checkpoints()
+        evidence: dict[str, dict[str, Any]] = {}
+        for cid, c in candidates:
+            held, reason = _card_has_implement_checkpoint_hold(board, epic, cid, card=c)
+            if not held:
+                continue
+            rec = checkpoints.get(implement_checkpoint_key(board, cid))
+            if not isinstance(rec, dict):
+                continue
+            if (
+                rec.get("board") != board
+                or rec.get("epic") != epic
+                or rec.get("task") != cid
+                or str(rec.get("step") or "").strip().lower() != "implement"
+                or rec.get("ok") is not True
+                or rec.get("local_only") is not True
+            ):
+                continue
+            sha = str(rec.get("head_sha") or "").strip().lower()
+            if not trust_lib.FULL_SHA_RE.fullmatch(sha) or f"head={sha[:12]}" not in reason:
+                continue
+            if handoff_lib.validate_handoff("implement_local", rec, POLICY):
+                continue
+            ws = str(c.get("workspace_path") or "").strip()
+            if ws:
+                ws_path = Path(ws)
+                if ws_path.is_dir() and (ws_path / ".git").exists():
+                    hd = preflight_lib._git(ws_path, "rev-parse", "HEAD")
+                    st_git = preflight_lib._git(ws_path, "status", "--porcelain")
+                    if hd.returncode != 0 or st_git.returncode != 0:
+                        continue
+                    if (hd.stdout or "").strip().lower() != sha or (st_git.stdout or "").strip():
+                        continue
+            evidence[cid] = {
+                "step": "implement",
+                "ok": True,
+                "local_only": True,
+                "head_sha": sha,
+                "branch": str(rec.get("branch") or "").strip(),
+            }
+        return evidence, False
 
     try:
         repo = (entry(board).get("repo") or "").strip()
@@ -2738,6 +2784,67 @@ def _ship_has_plan_risk_hold_marker(board: str, epic: str, ship_id: str) -> bool
 
 
 PIPELINE_STOP_HOLD_PREFIX = "pipeline-stop-hold:"
+PIPELINE_IMPL_CHECKPOINT_PREFIX = "pipeline-implement-checkpoint:"
+IMPLEMENT_CHECKPOINTS = ROOT / "state" / "implement-checkpoints.json"
+
+
+def load_implement_checkpoints() -> dict[str, dict]:
+    if not IMPLEMENT_CHECKPOINTS.is_file():
+        return {}
+    try:
+        data = json.loads(IMPLEMENT_CHECKPOINTS.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_implement_checkpoints(data: dict[str, dict]) -> None:
+    IMPLEMENT_CHECKPOINTS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IMPLEMENT_CHECKPOINTS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(IMPLEMENT_CHECKPOINTS)
+
+
+def implement_checkpoint_key(board: str, task_id: str) -> str:
+    return f"{board}/{task_id}"
+
+
+def pipeline_impl_checkpoint_reason(epic: str, head_sha: str, branch: str) -> str:
+    return (
+        f"{PIPELINE_IMPL_CHECKPOINT_PREFIX}{epic} head={head_sha[:12]} branch={branch}"
+        "（Stop-After=implement；等待 devflow epic advance 推進至 ci 後再推分支開 PR）"
+    )
+
+
+def _card_block_reason(board: str, task_id: str, *, card: dict | None = None) -> str | None:
+    db = BOARDS / board / "kanban.db"
+    if db.exists():
+        try:
+            ev = block_event(board, task_id)
+            if ev is not None:
+                return block_reason(board, ev)
+        except sqlite3.Error:
+            pass
+    for ev in reversed((card or {}).get("events") or []):
+        if isinstance(ev, dict) and ev.get("kind") in ("blocked", "block_loop_detected", "unblocked"):
+            if ev["kind"] == "unblocked":
+                return None
+            return str((ev.get("payload") or {}).get("reason") or "")
+    return None
+
+
+def _card_has_implement_checkpoint_hold(
+    board: str,
+    epic: str,
+    task_id: str,
+    *,
+    card: dict | None = None,
+) -> tuple[bool, str]:
+    reason = _card_block_reason(board, task_id, card=card) or ""
+    prefix = f"{PIPELINE_IMPL_CHECKPOINT_PREFIX}{epic}"
+    if reason == prefix or (reason.startswith(prefix) and len(reason) > len(prefix) and reason[len(prefix)].isspace()):
+        return True, reason
+    return False, ""
 
 
 def pipeline_stop_hold_reason(epic: str, stop_after: str) -> str:
@@ -2796,7 +2903,7 @@ def hold_out_of_slice_cards(board: str, epic: str, cards: dict[str, dict], pipe_
 
 
 def release_pipeline_stop_holds(board: str, epic: str, cards: dict[str, dict], pipe_spec: dict) -> bool:
-    """Release cards held by `pipeline-stop-hold:` once the EPIC's active slice reaches their step."""
+    """Release cards held by `pipeline-stop-hold:` or `pipeline-implement-checkpoint:` once active slice advances."""
     if not pipe_spec.get("valid"):
         return False
     retry = False
@@ -2806,12 +2913,22 @@ def release_pipeline_stop_holds(board: str, epic: str, cards: dict[str, dict], p
         kind = card_type(c.get("title") or "") or ""
         if c.get("status") != "blocked" or c.get("block_kind") != "dependency":
             continue
-        if pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
-            continue
-        if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
-            continue
+        is_cp_hold, _ = _card_has_implement_checkpoint_hold(board, epic, cid, card=c)
+        if is_cp_hold:
+            if not pipeline_lib.is_step_active("ci", pipe_spec):
+                continue
+            resume_msg = (
+                f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，"
+                "解除本地實作暫停，請續以 devflow pr submit 推分支開 PR。"
+            )
+        else:
+            if pipeline_lib.is_card_beyond_stop(kind, pipe_spec, POLICY):
+                continue
+            if not _card_has_pipeline_stop_hold(board, epic, cid, card=c):
+                continue
+            resume_msg = f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。"
         try:
-            resume(board, cid, f"devflow：{epic} 已推進至 Stop-After={pipe_spec['stop_after']}，解除階段暫停。")
+            resume(board, cid, resume_msg)
             c["status"] = "ready"
             c["block_kind"] = None
         except (SystemExit, Exception) as err:  # noqa: BLE001 - isolate per-card release failure
@@ -3213,8 +3330,13 @@ def tick_board(board: str, st: dict) -> bool:
             try:
                 ev = block_event(board, t["id"])
                 reason = block_reason(board, ev) if ev is not None else ""
-                if reason.startswith(PIPELINE_STOP_HOLD_PREFIX):
-                    rest = reason[len(PIPELINE_STOP_HOLD_PREFIX):].split(None, 1)[0]
+                if reason.startswith(PIPELINE_STOP_HOLD_PREFIX) or reason.startswith(PIPELINE_IMPL_CHECKPOINT_PREFIX):
+                    prefix = (
+                        PIPELINE_IMPL_CHECKPOINT_PREFIX
+                        if reason.startswith(PIPELINE_IMPL_CHECKPOINT_PREFIX)
+                        else PIPELINE_STOP_HOLD_PREFIX
+                    )
+                    rest = reason[len(prefix):].split(None, 1)[0]
                     if TASK_ID_RE.fullmatch(rest):
                         all_stop_epics.add(rest)
             except sqlite3.Error:
@@ -5858,6 +5980,141 @@ def _pr_lookup_fail(error: str) -> None:
     sys.exit(1)
 
 
+def _checkpoint_fail(stage: str, error: str, **extra: Any) -> None:
+    print(json.dumps({"ok": False, "stage": stage, "error": error, **extra}, ensure_ascii=False, indent=2))
+    sys.exit(1)
+
+
+def cmd_checkpoint(a) -> None:
+    """Record a verified local-only implementation checkpoint for `Stop-After: implement` slices (no push/PR)."""
+    e = entry(a.slug)
+    repo_dir = Path(a.dir).resolve()
+    base_ref = a.base or f"origin/{e['default_branch']}"
+    task_id = str(a.task).strip()
+    if not task_id:
+        _checkpoint_fail("card_lookup", "checkpoint 必須提供有效的任務卡 ID")
+
+    card_title, card_body = "", ""
+    db_path = BOARDS / e["slug"] / "kanban.db"
+    if db_path.is_file():
+        with suppress(sqlite3.Error):
+            rows = board_rows(e["slug"], "SELECT title, body FROM tasks WHERE id = ?", (task_id,))
+            if rows:
+                card_title = rows[0].get("title") or ""
+                card_body = rows[0].get("body") or ""
+    if not card_title:
+        with suppress(SystemExit, Exception):
+            pd = json.loads(kanban(e["slug"], "show", task_id, "--json"))
+            pt = pd.get("task") or {}
+            card_title = pt.get("title") or ""
+            card_body = pt.get("body") or ""
+    if not card_title:
+        _checkpoint_fail("card_lookup", f"看板 {e['slug']} 找不到任務卡 {task_id}")
+    kind = card_type(card_title)
+    if kind not in ("DEV", "OPS"):
+        _checkpoint_fail("card_kind", f"{task_id} 的卡型 [{kind or '?'}] 不適用本機實作 checkpoint（僅限 [DEV]/[OPS]）")
+
+    epic_id, _, ep_pipe = _task_epic_pipe(e["slug"], task_id, card_body=card_body)
+    if not (
+        ep_pipe is not None
+        and ep_pipe.get("valid")
+        and pipeline_lib.is_step_active("implement", ep_pipe)
+        and not pipeline_lib.is_step_active("ci", ep_pipe)
+    ):
+        _checkpoint_fail(
+            "pipeline_not_local_stop",
+            f"{epic_id or task_id} 目前未設定只停在本機實作的區段"
+            f"（stop_after={(ep_pipe or {}).get('stop_after') or 'none'}）；"
+            "若已開放 CI／PR 請直接執行 `devflow pr submit`",
+            epic=epic_id,
+            stop_after=(ep_pipe or {}).get("stop_after"),
+        )
+
+    br = preflight_lib._git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = (br.stdout or "").strip() if br.returncode == 0 else ""
+    if br.returncode != 0 or not branch or branch == "HEAD":
+        err = ((br.stderr or br.stdout).strip() if hasattr(br, "stderr") else "") or "detached HEAD"
+        _checkpoint_fail("git_state", f"checkpoint 無法取得目前分支名稱（{err[-200:]}）")
+
+    hd = preflight_lib._git(repo_dir, "rev-parse", "HEAD")
+    head_sha = (hd.stdout or "").strip().lower() if hd.returncode == 0 else ""
+    if hd.returncode != 0 or not trust_lib.FULL_SHA_RE.fullmatch(head_sha):
+        _checkpoint_fail("git_state", f"checkpoint 無法取得有效 40 碼 HEAD SHA（{head_sha!r}）")
+
+    cnt = preflight_lib._git(repo_dir, "rev-list", "--count", f"{base_ref}..HEAD")
+    commit_count = int((cnt.stdout or "").strip()) if cnt.returncode == 0 and (cnt.stdout or "").strip().isdigit() else 0
+    if cnt.returncode != 0 or commit_count < 1:
+        _checkpoint_fail(
+            "git_state",
+            f"目前分支 {branch} 相對於 {base_ref} 尚無任何已提交 commit，請先 commit 後再記錄 checkpoint",
+        )
+
+    preflight_args = argparse.Namespace(
+        slug=a.slug,
+        task=task_id,
+        dir=str(repo_dir),
+        base=a.base,
+        pr_title=None,
+        pr_body=None,
+        pr_body_file=None,
+        no_test=bool(a.no_test),
+        allow_dirty=False,
+    )
+    _, rep, _, _ = _run_card_preflight(preflight_args, require_task=True)
+    if not rep["ok"]:
+        print(json.dumps({"ok": False, "stage": "preflight", "preflight": rep}, ensure_ascii=False, indent=2))
+        sys.exit(1)
+
+    changed_files = [str(f) for f in (rep.get("files") or []) if str(f).strip()]
+    auto_tests = [
+        f"{t['name']}=pass"
+        for t in (rep.get("tests") or [])
+        if isinstance(t, dict) and t.get("returncode") == 0 and t.get("name")
+    ]
+    tests = [t.strip() for t in (a.test or []) if str(t).strip()] or auto_tests
+    payload: dict[str, Any] = {
+        "board": e["slug"],
+        "epic": epic_id,
+        "task": task_id,
+        "step": "implement",
+        "local_only": True,
+        "ok": True,
+        "branch": branch,
+        "head_sha": head_sha,
+        "base_ref": base_ref,
+        "changed_files": changed_files,
+        "tests": tests,
+        **({"summary": str(a.summary).strip()} if (getattr(a, "summary", None) or "").strip() else {}),
+        "recorded_at": int(time.time()),
+    }
+    herrs = handoff_lib.validate_handoff("implement_local", payload, POLICY)
+    if herrs:
+        _checkpoint_fail("handoff_validation", "；".join(herrs), findings=herrs)
+
+    key = implement_checkpoint_key(e["slug"], task_id)
+    with locked("implement-checkpoints"):
+        data = load_implement_checkpoints()
+        data[key] = payload
+        save_implement_checkpoints(data)
+
+    reason = pipeline_impl_checkpoint_reason(epic_id, head_sha, branch)
+    kanban(
+        e["slug"],
+        "comment",
+        task_id,
+        f"devflow checkpoint：已驗證並記錄本機實作 checkpoint（step=implement_local, head={head_sha[:12]}, "
+        f"branch={branch}, files={len(changed_files)}, tests={len(tests)}）。請以 `kanban_block(kind=\"dependency\", reason=...)` 暫停等待推進。",
+    )
+    print(json.dumps({
+        "ok": True,
+        "stage": "implement_checkpoint",
+        "block_kind": "dependency",
+        "block_reason": reason,
+        "preflight": rep,
+        **payload,
+    }, ensure_ascii=False, indent=2))
+
+
 def cmd_pr_submit(a) -> None:
     """Shift-left single entry for developers: resolve existing PR metadata/owner/state, run
     deterministic preflight against effective PR title/body, then push and create/edit PR."""
@@ -5951,6 +6208,12 @@ def cmd_pr_submit(a) -> None:
         sys.exit(1)
     epic_id, _, ep_pipe = _task_epic_pipe(e["slug"], a.task)
     if ep_pipe is not None and ep_pipe.get("valid") and not pipeline_lib.is_step_active("ci", ep_pipe):
+        err_hint = (
+            f"請先執行 `devflow checkpoint {e['slug']} {a.task} --dir .` 記錄本機實作 checkpoint 並以 `kanban_block(kind=\"dependency\", ...)` 暫停，"
+            "待 `devflow epic advance` 推進至 ci 後再推分支開 PR"
+            if ep_pipe["stop_after"] == "implement"
+            else "請先完成階段回報或執行 `devflow epic advance` 推進流程"
+        )
         print(json.dumps({
             "ok": False,
             "stage": "pipeline_stop",
@@ -5958,7 +6221,7 @@ def cmd_pr_submit(a) -> None:
             "stop_after": ep_pipe["stop_after"],
             "error": (
                 f"{epic_id or 'EPIC'} 設定 Stop-After={ep_pipe['stop_after']}，尚未開放推分支開 PR / 跑 CI；"
-                "請先完成階段回報或執行 `devflow epic advance` 推進流程"
+                + err_hint
             ),
         }, ensure_ascii=False, indent=2))
         sys.exit(1)
@@ -6176,57 +6439,86 @@ def cmd_check_handoff(a) -> None:
         except ValueError as err:
             findings.append(f"無法解析 --metadata JSON：{err}")
 
-    card_title = ""
+    card_title, card_body, card_status = "", "", ""
     card_runs: list[dict] = []
     db = BOARDS / a.board / "kanban.db"
     if db.is_file():
         with suppress(sqlite3.Error):
-            rows = board_rows(a.board, "SELECT title FROM tasks WHERE id = ?", (a.task,))
+            cols = {r["name"] for r in board_rows(a.board, "PRAGMA table_info(tasks)")}
+            sel = "title" + (", body" if "body" in cols else "") + (", status" if "status" in cols else "")
+            rows = board_rows(a.board, f"SELECT {sel} FROM tasks WHERE id = ?", (a.task,))
             if rows:
                 card_title = rows[0].get("title") or ""
-    if not card_title or not explicit_meta:
+                card_body = rows[0].get("body") or ""
+                card_status = str(rows[0].get("status") or "").strip().lower()
+    if not card_title or not explicit_meta or (not card_body and card_type(card_title) in ("DEV", "OPS")):
         with suppress(SystemExit, Exception):
             pd = json.loads(kanban(a.board, "show", a.task, "--json"))
             pt = pd.get("task") or {}
             card_title = card_title or (pt.get("title") or "")
+            card_body = card_body or (pt.get("body") or "")
+            card_status = card_status or str(pt.get("status") or "").strip().lower()
             card_runs = list(pd.get("runs") or [])
 
     if not card_title:
         findings.append(f"找不到任務卡 {a.board}/{a.task}")
     kind = card_type(card_title) if card_title else ""
-    step = handoff_lib.step_for_card_kind(kind)
-    if card_title and not step:
+    req_step = (getattr(a, "step", None) or "").strip().lower() or None
+    eff_step = req_step or handoff_lib.step_for_card_kind(kind)
+    if req_step is None and kind in ("DEV", "OPS") and card_status not in ("done", "review"):
+        _, _, ep_pipe = _task_epic_pipe(a.board, a.task, card_body=card_body)
+        if (
+            ep_pipe is not None
+            and ep_pipe.get("valid")
+            and pipeline_lib.is_step_active("implement", ep_pipe)
+            and not pipeline_lib.is_step_active("ci", ep_pipe)
+        ):
+            eff_step = "implement_local"
+    if card_title and not eff_step:
         findings.append(f"{a.task} 的卡型 [{kind or '?'}] 不需要步驟交接 schema（適用：RES/ARCH/DEV/OPS/SHIP）")
 
     if not findings and not explicit_meta:
-        loaded_meta, has_run = completed_card_handoff(a.board, a.task, {"runs": card_runs} if card_runs else None)
-        if not has_run:
-            for r in reversed(card_runs):
-                if isinstance(r, dict) and r.get("metadata") is not None:
-                    loaded_meta = _decode_run_meta(r.get("metadata"))
-                    has_run = True
-                    break
-            if not has_run and db.is_file():
-                with suppress(sqlite3.Error):
-                    rrows = board_rows(
-                        a.board, "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (a.task,)
-                    )
-                    if rrows:
-                        loaded_meta = _decode_run_meta(rrows[0].get("metadata"))
+        has_run = False
+        loaded_meta: Any = {}
+        if eff_step == "implement_local":
+            cp = load_implement_checkpoints().get(implement_checkpoint_key(a.board, a.task))
+            if isinstance(cp, dict):
+                loaded_meta = cp
+                has_run = True
+        if not has_run and eff_step != "implement_local":
+            loaded_meta, has_run = completed_card_handoff(a.board, a.task, {"runs": card_runs} if card_runs else None)
+            if not has_run:
+                for r in reversed(card_runs):
+                    if isinstance(r, dict) and r.get("metadata") is not None:
+                        loaded_meta = _decode_run_meta(r.get("metadata"))
                         has_run = True
+                        break
+                if not has_run and db.is_file():
+                    with suppress(sqlite3.Error):
+                        rrows = board_rows(
+                            a.board, "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (a.task,)
+                        )
+                        if rrows:
+                            loaded_meta = _decode_run_meta(rrows[0].get("metadata"))
+                            has_run = True
         if not has_run:
-            findings.append(f"{a.task} 尚無 run metadata，請提供 --metadata 或先記錄結構化交接")
+            missing_msg = (
+                f"{a.task} 尚無本機實作 checkpoint，請先執行 `devflow checkpoint` 或提供 --metadata"
+                if eff_step == "implement_local"
+                else f"{a.task} 尚無 run metadata，請提供 --metadata 或先記錄結構化交接"
+            )
+            findings.append(missing_msg)
         else:
             meta = loaded_meta
 
     if not findings:
-        findings.extend(handoff_lib.validate_card_handoff(kind, meta, POLICY))
+        findings.extend(handoff_lib.validate_card_handoff(kind, meta, POLICY, step=eff_step))
     print(json.dumps({
         "ok": not findings,
         "board": a.board,
         "task": a.task,
         "kind": kind,
-        "step": step,
+        "step": eff_step,
         "findings": findings,
     }, ensure_ascii=False, indent=2))
     if findings:
@@ -6314,11 +6606,20 @@ def main() -> None:
     p.add_argument("--board", help="optional repo slug to apply repo-specific .devflow/config.env policy")
     p.add_argument("--parent", action="append", default=[], help="optional parent card ID(s) to check [ARCH] target_files coverage")
     p.set_defaults(fn=cmd_check_card)
-    p = check.add_parser("handoff", help="validate structured handoff metadata for a step card (repro/design/implement/ship)")
+    p = check.add_parser("handoff", help="validate structured handoff metadata for a step card (repro/design/implement/implement_local/ship)")
     p.add_argument("board"); p.add_argument("task")
+    p.add_argument("--step", help="optional explicit handoff step override (e.g. implement_local)")
     p.add_argument("--metadata", help="inline JSON metadata object to validate")
     p.add_argument("--metadata-file", help="path to JSON metadata file to validate")
     p.set_defaults(fn=cmd_check_handoff)
+    p = sub.add_parser("checkpoint", help="record a verified local-only implement checkpoint when EPIC Stop-After=implement")
+    p.add_argument("slug"); p.add_argument("task")
+    p.add_argument("--dir", default=".", help="worktree root (default: cwd)")
+    p.add_argument("--base", help="base git ref to diff against (default: origin/<default_branch>)")
+    p.add_argument("--no-test", action="store_true", help="skip running check.sh/test.sh (requires explicit --test evidence)")
+    p.add_argument("--test", action="append", default=[], help="verified local test command/result summary (repeatable)")
+    p.add_argument("--summary", default="", help="short plain summary of local implementation")
+    p.set_defaults(fn=cmd_checkpoint)
     p = sub.add_parser("preflight", help="developer pre-flight deterministic checks before pushing PR or requesting review")
     p.add_argument("slug"); p.add_argument("task", nargs="?")
     p.add_argument("--dir", default=".", help="worktree root (default: cwd)")

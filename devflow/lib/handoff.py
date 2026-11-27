@@ -24,16 +24,33 @@ def step_for_card_kind(kind: str) -> str | None:
     return CARD_KIND_STEPS.get((kind or "").strip().upper())
 
 
-def validate_card_handoff(kind: str, metadata: Any, policy: dict[str, Any] | None = None) -> list[str]:
-    """Validate structured `metadata` for a completed card based on its card kind."""
+def validate_card_handoff(
+    kind: str,
+    metadata: Any,
+    policy: dict[str, Any] | None = None,
+    *,
+    step: str | None = None,
+) -> list[str]:
+    """Validate structured `metadata` for a completed or checkpointed card based on its card kind."""
     upper = (kind or "").strip().upper()
+    step_override = (step or "").strip().lower()
+    if step_override == "implement_local":
+        if upper not in ("DEV", "OPS"):
+            return [f"[{upper or '?'}] 卡型不支援 `implement_local` 本機實作 checkpoint"]
+        return validate_handoff("implement_local", metadata, policy)
     if upper == "ARCH":
+        if step_override and step_override != "design":
+            return [f"[ARCH] 不支援步驟 '{step_override}'（預期 design）"]
         _, errs = validate_arch_handoff(metadata, policy)
         return errs
-    step = step_for_card_kind(upper)
-    if not step:
+    default_step = step_for_card_kind(upper)
+    if step_override:
+        if not default_step or step_override != default_step:
+            return [f"[{upper or '?'}] 卡型預期步驟 '{default_step or 'none'}'，與指定 '{step_override}' 不符"]
+        return validate_handoff(default_step, metadata, policy)
+    if not default_step:
         return []
-    return validate_handoff(step, metadata, policy)
+    return validate_handoff(default_step, metadata, policy)
 
 
 def _is_empty_handoff_value(value: Any) -> bool:

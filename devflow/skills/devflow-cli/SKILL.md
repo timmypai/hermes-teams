@@ -23,7 +23,8 @@ metadata:
 | `devflow repo protect SLUG` | 設 default branch 的 `devflow-ci`／`devflow-judgment` required checks |
 | `devflow contract SLUG [DIR] [--ui] [--sync-standard]` | 補齊契約檔；`--sync-standard` 還原公版交付檔 |
 | `devflow check card --title T [--body-file F] [--board SLUG] [--assignee A] [--workspace W] [--parent P]` | 建卡／改卡前確定性檢查卡型、欄位、範圍宣告、`[ARCH]` 檔案涵蓋與技術洩漏 |
-| `devflow check handoff SLUG TASK [--metadata JSON \| --metadata-file F]` | 依 `handoff_schemas` 驗證卡的交接 `metadata` 欄位 |
+| `devflow check handoff SLUG TASK [--step STEP] [--metadata JSON \| --metadata-file F]` | 依 `handoff_schemas` 驗證卡的交接 `metadata` 欄位 |
+| `devflow checkpoint SLUG TASK [--dir DIR] [--base REF] [--test T] [--summary S]` | `Stop-After: implement` 時驗證已提交本機修改並記錄本機 checkpoint（不 push、不開 PR） |
 | `devflow epic advance SLUG EPIC [--stop-after STEP \| --to-end]` | 推進分段 EPIC 的 `Start-At:`／`Stop-After:` 往下一步或結尾 |
 | `devflow scope add SLUG TASK --add GLOB... [--note T]` | 驗證並原子合併核准的 `Allowed-Scope` glob（拒絕萬用與禁止範圍） |
 | `devflow check ac [--said TEXT] < AC行` | D0：建 EPIC 前檢查 AC 草稿 |

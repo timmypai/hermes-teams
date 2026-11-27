@@ -33,10 +33,35 @@ class HandoffValidation(unittest.TestCase):
             "repro": {"root_cause": "timeout on /v1/foo", "evidence": ["logs/1.txt"]},
             "design": {"decisions": ["split queue"], "target_files": ["app/q.py", "app/worker.py"]},
             "implement": {"pr_url": "https://github.com/o/r/pull/1", "head_sha": "a" * 40, "tests": "12 passed"},
+            "implement_local": {
+                "branch": "wt/t_dev1", "head_sha": "c" * 40, "tests": ["pytest -> pass"], "changed_files": ["app/q.py"],
+            },
             "ship": {"merged_sha": "b" * 40},
         }
         for step, meta in cases.items():
             self.assertEqual(handoff_lib.validate_handoff(step, meta, self.policy), [], step)
+
+    def test_implement_local_schema_and_step_override(self) -> None:
+        local_meta = {
+            "branch": "wt/t_dev1",
+            "head_sha": "c" * 40,
+            "tests": ["check.sh=pass"],
+            "changed_files": ["app/a.py"],
+        }
+        self.assertEqual(handoff_lib.validate_handoff("implement_local", local_meta, self.policy), [])
+        self.assertEqual(handoff_lib.validate_card_handoff("DEV", local_meta, self.policy, step="implement_local"), [])
+        self.assertEqual(handoff_lib.validate_card_handoff("OPS", local_meta, self.policy, step="implement_local"), [])
+        # Default DEV completion still requires PR metadata
+        default_errs = handoff_lib.validate_card_handoff("DEV", local_meta, self.policy)
+        self.assertTrue(any("pr_url" in e for e in default_errs), default_errs)
+        # Missing tests or changed_files fails implement_local
+        no_tests = handoff_lib.validate_handoff("implement_local", {**local_meta, "tests": []}, self.policy)
+        self.assertTrue(any("tests" in e for e in no_tests), no_tests)
+        no_files = handoff_lib.validate_handoff("implement_local", {**local_meta, "changed_files": []}, self.policy)
+        self.assertTrue(any("changed_files" in e for e in no_files), no_files)
+        # Other card kinds reject implement_local
+        self.assertTrue(handoff_lib.validate_card_handoff("RES", local_meta, self.policy, step="implement_local"))
+        self.assertTrue(handoff_lib.validate_card_handoff("SHIP", local_meta, self.policy, step="implement_local"))
 
     def test_missing_or_empty_required_fields_and_broad_target_files_fail(self) -> None:
         errs = handoff_lib.validate_handoff("design", {"decisions": ["x"], "target_files": []}, self.policy)

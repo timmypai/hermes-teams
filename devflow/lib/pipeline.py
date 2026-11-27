@@ -332,14 +332,28 @@ def slice_stop_reached(
         status = str(c.get("status") or "").strip().lower()
         if status in ("done", "archived"):
             continue
-        if span[0] <= e_idx < span[1] and status == "review":
+        if span[0] <= e_idx < span[1]:
             ev = ev_map.get(cid)
             if (
-                isinstance(ev, dict)
-                and str(ev.get("step") or "").strip().lower() == stop_after
+                stop_after == "ci"
+                and status == "review"
+                and isinstance(ev, dict)
+                and str(ev.get("step") or "").strip().lower() == "ci"
                 and ev.get("ok") is True
                 and bool(str(ev.get("head_sha") or "").strip())
                 and ev.get("pr_number") is not None
+            ):
+                continue
+            if (
+                stop_after == "implement"
+                and status == "blocked"
+                and str(c.get("block_kind") or "").strip().lower() == "dependency"
+                and isinstance(ev, dict)
+                and str(ev.get("step") or "").strip().lower() == "implement"
+                and ev.get("ok") is True
+                and ev.get("local_only") is True
+                and bool(str(ev.get("head_sha") or "").strip())
+                and bool(str(ev.get("branch") or "").strip())
             ):
                 continue
         return False
