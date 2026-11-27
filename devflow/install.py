@@ -26,7 +26,7 @@ ROOT = DATA / "devflow"
 _KIT_DIR = Path(__file__).resolve().parent
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
-from lib import lint_engine, vendor as vendor_lib  # noqa: E402
+from lib import lint_engine, policy as policy_lib, vendor as vendor_lib  # noqa: E402
 
 ROLES = json.loads((ROOT / "roles.json").read_text())
 VENDOR = ROOT / "vendor" / "mattpocock-skills"
@@ -231,6 +231,15 @@ def configure_role(role: str, spec: dict, mp: dict[str, Path], pstack: list[str]
             link.parent.mkdir(exist_ok=True)
             link.symlink_to(DATA / "plugins" / name)
     cfg = raw_config(home)
+    if policy_lib.obsolete_hooks(ROLES):
+        policy_lib.retire_obsolete_hooks(
+            home,
+            policy_lib.obsolete_hooks(ROLES),
+            yaml_cls=YAML,
+            backup_fn=backup,
+            log_fn=log,
+        )
+        cfg = raw_config(home)
     names = enabled_plugins(cfg)
     if any(n not in names for n in wanted):
         settings["plugins.enabled"] = json.dumps([*names, *(n for n in wanted if n not in names)])

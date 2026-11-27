@@ -9,7 +9,8 @@ ALLOWED_SCOPE_RE = re.compile(r"^\s*Allowed-Scope[：:]\s*(.+)$", re.M | re.I)
 OUT_OF_SCOPE_RE = re.compile(r"^\s*Out-of-Scope[：:]\s*(.+)$", re.M | re.I)
 NON_GOALS_RE = re.compile(r"^\s*Non-Goals[：:]\s*(.+)$", re.M | re.I)
 VERIFY_CMD_RE = re.compile(r"^\s*Verify[：:]\s*(.+)$", re.M | re.I)
-MODE_RE = re.compile(r"^\s*Mode[：:]\s*([a-zA-Z0-9_-]+)\s*$", re.M | re.I)
+MODE_RE = re.compile(r"^\s*Mode[：:][ \t]*(.*?)[ \t]*$", re.M | re.I)
+ALLOW_WRITE_RE = re.compile(r"^\s*Allow-Write[：:][ \t]*(.*?)[ \t]*$", re.M | re.I)
 KANBAN_TASK_RE = re.compile(r"^\s*Kanban[：:]\s*(t_[0-9A-Za-z]+)\b", re.M | re.I)
 EPIC_SECTION_RE = re.compile(r"^##\s*(目標|驗收|使用者原話|使用者決定|不能碰)[ \t]*\n(.*?)(?=^## |\Z)", re.M | re.S)
 _PATH_TOKEN_RE = re.compile(r"`([^`\s]+)`|(?<![A-Za-z0-9_])((?:\.[A-Za-z0-9_-]+|[A-Za-z0-9_.-]+)/(?:[A-Za-z0-9_.*?/-]+))")
@@ -41,16 +42,63 @@ def parse_card_contract(body: str | None) -> dict:
     }
 
 
+def _strip_inline_comment(raw: str | None) -> str:
+    """Strip trailing `# ...` inline comments from a header directive value."""
+    return (raw or "").split("#", 1)[0].strip()
+
+
 def parse_epic_mode(epic_body: str | None, valid_modes: set[str] | frozenset[str] | None = None) -> tuple[str, str | None]:
-    """Return `(resolved_mode, invalid_raw_or_none)` from an EPIC's `Mode:` line (defaults to `deliver`)."""
-    m = MODE_RE.search(epic_body or "")
-    if not m:
+    """Return `(resolved_mode, invalid_or_conflict_raw)` from an EPIC's `Mode:` line (defaults to `deliver`).
+
+    Parses every declaration line (supporting inline `# ...` comments) and fails closed on
+    invalid syntax or conflicting duplicates.
+    """
+    matches = list(MODE_RE.finditer(epic_body or ""))
+    if not matches:
         return "deliver", None
-    raw = m.group(1).strip().lower()
     allowed = valid_modes or frozenset({"deliver", "investigate", "review"})
-    if raw not in allowed:
-        return "deliver", raw
-    return raw, None
+    modes: list[str] = []
+    invalids: list[str] = []
+    for m in matches:
+        raw = _strip_inline_comment(m.group(1)).lower()
+        if not raw:
+            invalids.append("<empty>")
+        elif raw not in allowed:
+            invalids.append(raw)
+        else:
+            modes.append(raw)
+    if invalids:
+        return "deliver", ", ".join(dict.fromkeys(invalids))
+    unique_modes = list(dict.fromkeys(modes))
+    if len(unique_modes) > 1:
+        return "deliver", " vs ".join(unique_modes)
+    return unique_modes[0], None
+
+
+def parse_epic_allow_write(epic_body: str | None) -> tuple[bool | None, str | None]:
+    """Return `(allow_write_override, invalid_or_conflict_raw)` from an EPIC's `Allow-Write:` lines.
+
+    Parses every declaration line (supporting inline `# ...` comments) and fails closed to `False`
+    whenever any declaration is invalid or contradictory duplicates are present.
+    """
+    matches = list(ALLOW_WRITE_RE.finditer(epic_body or ""))
+    if not matches:
+        return None, None
+    values: list[bool] = []
+    invalids: list[str] = []
+    for m in matches:
+        raw = _strip_inline_comment(m.group(1)).lower()
+        if raw in ("true", "yes", "on", "1"):
+            values.append(True)
+        elif raw in ("false", "no", "off", "0"):
+            values.append(False)
+        else:
+            invalids.append(raw or "<empty>")
+    if invalids:
+        return False, ", ".join(dict.fromkeys(invalids))
+    if len(set(values)) > 1:
+        return False, "conflicting declarations (true vs false)"
+    return values[0], None
 
 
 _ROOT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
