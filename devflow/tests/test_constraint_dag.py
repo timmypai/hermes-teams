@@ -244,6 +244,121 @@ class ConstraintDagBoundaries(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
         self.assertTrue(any("Allow-Write: false" in f for f in json.loads(ro_buf.getvalue())["findings"]))
 
+    def _run_check_card(self, **kwargs) -> tuple[int, dict]:
+        buf = io.StringIO()
+        code = 0
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.df.cmd_check_card(types.SimpleNamespace(body_file=None, parent=[], **kwargs))
+        except SystemExit as exc:
+            code = int(exc.code or 0)
+        return code, json.loads(buf.getvalue())
+
+    def _full_dev_plan(self, header: str) -> dict[str, dict]:
+        ep = self._epic(header, with_scenarios=True)
+        dev_bundle = self._dev("t_dev1", acs="AC-1, AC-2", parents=[], with_ship=True)
+        ep["parents"] = ["t_ship1"]
+        return {"t_ep1": ep, **dev_bundle}
+
+    def test_EPIC_authorization_fails_closed_on_conflicts_comments_and_invalid_values(self) -> None:
+        # 1. Inline # comments on Allow-Write: false and Mode: investigate are honored rather than ignored.
+        found_comment_dev = self.df.plan_rules("b", "t_ep1", self._full_dev_plan("Allow-Write: false # read-only\n"))
+        self.assertTrue(any("Allow-Write: false" in f and "[DEV]" in f for f in found_comment_dev), found_comment_dev)
+        ep_comment_ro = self._epic("Allow-Write: false # read-only\n", with_scenarios=False)
+        res_ro = self._res("t_res1", assignee="devops", ws="dir", status="ready",
+                           body="## 目標\n取證\n覆蓋：AC-1, AC-2\nEPIC: t_ep1\n")
+        ep_comment_ro["parents"] = ["t_res1"]
+        self.assertEqual(self.df.plan_rules("b", "t_ep1", {"t_ep1": ep_comment_ro, "t_res1": res_ro}), [])
+
+        found_comment_mode = self.df.plan_rules("b", "t_ep1", self._full_dev_plan("Mode: investigate # read-only\n"))
+        self.assertTrue(any("Mode: investigate" in f and "[DEV]" in f for f in found_comment_mode), found_comment_mode)
+
+        # 2. Conflicting or malformed Mode / Allow-Write declarations NEVER restore write permission in plan_rules.
+        bad_headers = [
+            ("Allow-Write: true\nAllow-Write: false\n", "Allow-Write"),
+            ("Allow-Write: true # one\nAllow-Write: false # two\n", "Allow-Write"),
+            ("Allow-Write: maybe\n", "Allow-Write"),
+            ("Allow-Write: false extra-tokens\n", "Allow-Write"),
+            ("Allow-Write:   \n", "Allow-Write"),
+            ("Mode: deliver\nMode: investigate\n", "Mode"),
+            ("Mode: bogus\n", "Mode"),
+            ("Mode: investigate\nAllow-Write: true\n", "衝突"),
+        ]
+        for header, expected_token in bad_headers:
+            found = self.df.plan_rules("b", "t_ep1", self._full_dev_plan(header))
+            self.assertTrue(any(expected_token in f for f in found), (header, found))
+            self.assertTrue(any("禁止建立 [DEV] 卡" in f for f in found), (header, found))
+
+        # 3. Real temporary SQLite board: cmd_check_card propagates referenced EPIC auth errors & blocks DEV.
+        db_dir = Path(self.root) / "boards" / "b"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_dir / "kanban.db")
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, body TEXT)")
+        conn.commit()
+        old_boards = self.df.BOARDS
+        self.df.BOARDS = Path(self.root) / "boards"
+        self.addCleanup(setattr, self.df, "BOARDS", old_boards)
+        self.addCleanup(conn.close)
+
+        dev_body = (
+            f"## 目標\n改碼\n\n## 本卡完成\n{self.df.DONE_TEXT}\n\n"
+            "## 驗收\n覆蓋：AC-1\nAllowed-Scope: app/**\nEPIC: t_ep1\n"
+        )
+        res_body = "## 目標\n取證\nEPIC: t_ep1\n"
+
+        for header, expected_token in bad_headers:
+            ep_body = self._epic(header, with_scenarios=True)["body"]
+            conn.execute("DELETE FROM tasks WHERE id = 't_ep1'")
+            conn.execute("INSERT INTO tasks VALUES (?, ?)", ("t_ep1", ep_body))
+            conn.commit()
+
+            code_dev, res_dev = self._run_check_card(
+                board="b", title="[DEV] 嘗試偷渡寫卡", body=dev_body, assignee="developer", workspace="worktree"
+            )
+            self.assertEqual(code_dev, 1, (header, res_dev))
+            self.assertFalse(res_dev["ok"], (header, res_dev))
+            self.assertTrue(any("授權設定無效" in f for f in res_dev["findings"]), (header, res_dev))
+            self.assertTrue(any(expected_token in f for f in res_dev["findings"]), (header, res_dev))
+            self.assertTrue(any("禁止建立 [DEV] 卡" in f for f in res_dev["findings"]), (header, res_dev))
+
+            # Even non-writing [RES] card surfaces referenced EPIC authorization errors in check card.
+            code_res, res_check = self._run_check_card(
+                board="b", title="[RES] 附掛問題 EPIC", body=res_body, assignee="devops", workspace="dir"
+            )
+            self.assertEqual(code_res, 1, (header, res_check))
+            self.assertFalse(res_check["ok"], (header, res_check))
+            self.assertTrue(any("參考的 t_ep1 授權設定無效" in f for f in res_check["findings"]), (header, res_check))
+
+        # Allow-Write: false # read-only in SQLite DB blocks DEV and allows paired RES.
+        conn.execute("DELETE FROM tasks WHERE id = 't_ep1'")
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?)",
+            ("t_ep1", self._epic("Allow-Write: false # read-only\n", with_scenarios=False)["body"]),
+        )
+        conn.commit()
+        code_dev_ro, res_dev_ro = self._run_check_card(
+            board="b", title="[DEV] 嘗試繞過註解", body=dev_body, assignee="developer", workspace="worktree"
+        )
+        self.assertEqual(code_dev_ro, 1, res_dev_ro)
+        self.assertTrue(any("Allow-Write: false" in f for f in res_dev_ro["findings"]), res_dev_ro)
+
+        code_res_ro, res_check_ro = self._run_check_card(
+            board="b", title="[RES] 唯讀查證", body=res_body, assignee="devops", workspace="dir"
+        )
+        self.assertEqual(code_res_ro, 0, res_check_ro)
+        self.assertTrue(res_check_ro["ok"], res_check_ro)
+
+        # Valid EPIC header works and check card on invalid EPIC header itself still fails cleanly without duplication.
+        code_ep_bad, res_ep_bad = self._run_check_card(
+            board="b",
+            title="[EPIC] 衝突宣告",
+            body=self._epic("Allow-Write: true\nAllow-Write: false\n", with_scenarios=True)["body"],
+            assignee="orchestrator",
+            workspace="dir",
+        )
+        self.assertEqual(code_ep_bad, 1, res_ep_bad)
+        self.assertTrue(any("Allow-Write" in f for f in res_ep_bad["findings"]), res_ep_bad)
+
 
 class ObsoleteHooksCleanup(unittest.TestCase):
     def test_retire_obsolete_hooks_removes_stage_card_and_preserves_dispatch_tick(self) -> None:

@@ -1877,8 +1877,16 @@ def _epic_authorization_state(body: str | None) -> tuple[str, dict[str, Any], bo
         errors.append(f"Allow-Write '{bad_allow_write}' 無效（允許：true / false）")
     if not mode_allow_write and allow_write_override is True:
         errors.append(f"Allow-Write: true 與唯讀 Mode '{epic_mode}' 衝突（請移除衝突或明確允許改碼）")
-    allow_write = mode_allow_write and (allow_write_override is not False)
+    allow_write = (not errors) and mode_allow_write and (allow_write_override is not False)
     return epic_mode, mode_cfg, allow_write_override, allow_write, errors
+
+
+def _write_limit_label(epic_mode: str, allow_write_override: bool | None, auth_errors: list[str]) -> str:
+    if auth_errors:
+        return "授權設定無效或衝突"
+    if allow_write_override is False:
+        return "Allow-Write: false"
+    return f"Mode: {epic_mode}"
 
 
 def _card_executor_problems(
@@ -1956,7 +1964,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         found.append(f"{epic}: {pprob}")
     if not acs:
         found.append(f"{epic}: EPIC 沒有編號驗收條件（AC-1、AC-2…）")
-    skip_scenarios = (
+    skip_scenarios = (not auth_errors) and (
         ship_only
         or in_discovery_phase
         or (not allow_write)
@@ -2037,7 +2045,7 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         found.extend(_card_executor_problems(tid, kind, c["assignee"], c["workspace_kind"] or "scratch", mode_cfg))
         if kind in ("DEV", "OPS"):
             if not allow_write:
-                limit_label = "Allow-Write: false" if allow_write_override is False else f"Mode: {epic_mode}"
+                limit_label = _write_limit_label(epic_mode, allow_write_override, auth_errors)
                 found.append(f"{tid}: 本 EPIC 為 {limit_label}（不開放改程式補丁），禁止建立 [{kind}] 卡；如需改碼請另開允許寫入的 EPIC")
             contract = c.get("completion_contract") or "local-only"
             # Hermes pins OWNER/REPO to the exact PR URL once the card publishes its PR.
@@ -6886,19 +6894,29 @@ def _resolve_check_card_arch_parents(board_arg: str, parent_ids: list[str]) -> l
     return out
 
 
-def _card_epic_auth_for_check(board_arg: str | None, body: str | None) -> tuple[str, dict[str, Any], bool | None, bool]:
-    """Best-effort lookup of referenced EPIC authorization boundaries for `devflow check card`."""
-    epic_mode, mode_cfg, allow_write_override, allow_write = "deliver", policy_lib.mode_config(POLICY, "deliver"), None, True
+def _card_epic_auth_for_check(
+    board_arg: str | None, body: str | None
+) -> tuple[str | None, str, dict[str, Any], bool | None, bool, list[str]]:
+    """Lookup referenced EPIC authorization boundaries for `devflow check card` (fail closed on errors)."""
+    epic_id: str | None = None
+    epic_mode, mode_cfg, allow_write_override, allow_write, auth_errors = (
+        "deliver",
+        policy_lib.mode_config(POLICY, "deliver"),
+        None,
+        True,
+        [],
+    )
     if board_arg and (em := EPIC_REF.search(body or "")):
+        epic_id = em.group(1)
         db = BOARDS / board_arg / "kanban.db"
         if db.is_file():
             with suppress(sqlite3.Error):
-                rows = board_rows(board_arg, "SELECT body FROM tasks WHERE id = ?", (em.group(1),))
+                rows = board_rows(board_arg, "SELECT body FROM tasks WHERE id = ?", (epic_id,))
                 if rows and rows[0].get("body") is not None:
-                    epic_mode, mode_cfg, allow_write_override, allow_write, _ = _epic_authorization_state(
+                    epic_mode, mode_cfg, allow_write_override, allow_write, auth_errors = _epic_authorization_state(
                         rows[0]["body"]
                     )
-    return epic_mode, mode_cfg, allow_write_override, allow_write
+    return epic_id, epic_mode, mode_cfg, allow_write_override, allow_write, auth_errors
 
 
 def cmd_check_card(a) -> None:
@@ -6915,13 +6933,18 @@ def cmd_check_card(a) -> None:
     if kind not in CARDS:
         findings.append(f"標題缺少已知卡型前綴 [{'/'.join(CARDS)}]")
     else:
-        epic_mode, mode_cfg, allow_write_override, allow_write = _card_epic_auth_for_check(board_arg, body)
+        epic_id, epic_mode, mode_cfg, allow_write_override, allow_write, epic_auth_errors = _card_epic_auth_for_check(
+            board_arg, body
+        )
         findings.extend(_card_executor_problems("", kind, a.assignee, a.workspace, mode_cfg))
         if kind == "EPIC":
             findings.extend(_epic_header_problems(body))
+        elif epic_auth_errors:
+            for herr in epic_auth_errors:
+                findings.append(f"參考的 {epic_id} 授權設定無效：{herr}")
         if kind in ("DEV", "OPS"):
             if not allow_write:
-                limit_label = "Allow-Write: false" if allow_write_override is False else f"Mode: {epic_mode}"
+                limit_label = _write_limit_label(epic_mode, allow_write_override, epic_auth_errors)
                 findings.append(f"本 EPIC 為 {limit_label}（不開放改程式補丁），禁止建立 [{kind}] 卡")
             if why := done_problem(a.title, body):
                 findings.append(why)
