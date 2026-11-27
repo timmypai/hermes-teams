@@ -19,6 +19,7 @@ cwd 是本卡專屬 worktree（分支 `wt/<task-id>`）。沙箱內 `.git` 唯�
 3. 需要時 `git fetch origin && git rebase origin/<default>`。
 
 ## 2. 先紅後綠、最小改動
+- 重構僅限本卡目標與 `Allowed-Scope` 內，禁止順手重構無關模組；跨模組重設計建議寫進 `followups`。
 - **驗收情境先寫、先紅**：覆蓋的非 `[manual]` 情境 `<EPIC>/AC-n.Sm`，Given／When／Then 文字與 EPIC **逐字一致**；Given 結尾斷言前置狀態；Then 斷言具體可觀察值；`[smoke]` 只能讀不寫；不得 skip。
   - `[ui]`／`[api]`：寫在 `.devflow/ui/*.spec.ts`（用 `ac.ts` 的 `scenario()`）。
   - `[cli]`／`[lib]`：寫在 `.devflow/verify.sh`（打建出的成品，不直接呼叫原始碼）。
@@ -48,9 +49,11 @@ Kanban: <task-id>"
 ```
 kanban_request_review(
   reviewer="reviewer",
-  summary="<白話做了什麼與測試結果>",
+  summary="PR #<N>（head <sha 前 7 碼>）：<白話做了什麼與測試結果>；exact-head CI <綠/無>",
   metadata={"published_pr": "<PR URL>", "pr_url": "<PR URL>", "pr_number": N, "branch": "wt/<id>",
             "head_sha": "<git rev-parse HEAD>", "tests": ["<指令> → pass"], "ci_run": "<CI run URL>",
             "followups": [...]})
 ```
 被退件時在同一個 worktree 與 PR 修正、`pr submit` 後再送審。不 merge、不部署、不 push 到 main；範圍外發現寫進 `followups`。
+
+`[DEV]`/`[OPS]` 以 Hermes `goal_mode` 執行：送審前 `goal judge` 會依 `## 本卡完成` 核對完成證據，因此 `summary` 必須明確寫出 PR `#N`、exact head SHA 與 exact-head CI 綠燈（或無 CI）結果。若遇到 `continuation turn` 或 `goal judge` 拒絕送審，先確認 PR 與 exact-head CI 確實已綠並補齊 `summary` 後最多重試一次；若條件已成立仍遭拒，**嚴禁改呼叫 `kanban_complete` 或亂改程式**，改呼叫 `kanban_block` 回報拒絕訊息原文交由流程處理。

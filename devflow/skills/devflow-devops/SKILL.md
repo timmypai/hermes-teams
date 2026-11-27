@@ -39,7 +39,7 @@ metadata:
 容器連不到主機 `127.0.0.1:<port>`，一律 `devflow operate <slug> <op> --arg k=v`（只跑 default branch 上已存在的腳本），並用 `vision_analyze` 看截圖確認。缺 `DEVFLOW_OPS_ENV` secret 時用「請你設好後回覆『完成』」格式 `capability` block。**禁止在 `[SHIP]` 為補腳本而連開 `[DEV]`／`[OPS]` 串回自己上游**，缺口寫進 `followups` 交 orchestrator。
 
 ## 4. 失敗處理
-- **程式碼、測試或部署程式問題**：建一張 `[DEV] 修正 PR #N：<白話原因>`（**必設 `assignee="developer"`、`workspace_kind="worktree"`、`workspace_path`=原卡 worktree、`goal_mode=true`、`completion_contract` 依 `devflow repo list`**；body 必含固定 `## 本卡完成`、`覆蓋：AC-n`、沿用原卡的 `Allowed-Scope:` 與 `EPIC: t_xxx`）→ 接一張新 `[SHIP]` → `kanban_link(新 SHIP, EPIC)` → 本卡 `kanban_complete(summary="未出貨：<原因>", metadata={"shipped": false, "reason": "<原因>", "created_cards": [...]})`。不要把新卡 link 回已開始執行的原 `[SHIP]`（事後補丁卡上限 2 張）。
+- **程式碼、測試或部署程式問題**：建一張 `[DEV] 修正 PR #N：<白話原因>`（**必設 `assignee="developer"`、`workspace_kind="worktree"`、`workspace_path`=原卡 worktree、`goal_mode=true`、`completion_contract` 依 `devflow repo list`**；body 必含固定 `## 本卡完成`、`覆蓋：AC-n`、沿用原卡的 `Allowed-Scope:` 與 `EPIC: t_xxx`，不把 run URL 或內部技術細節塞進 body，改用 `kanban_comment` 在新卡附錯誤摘要與 run URL）→ 接一張新 `[SHIP]` → `kanban_link(新 SHIP, EPIC)` → 本卡 `kanban_complete(summary="未出貨：<原因>", metadata={"shipped": false, "reason": "<原因>", "created_cards": [...]})`。不要把新卡 link 回已開始執行的原 `[SHIP]`（事後補丁卡上限 2 張）。
 - **runner offline、主機元件缺件**：先 `devflow repo doctor`／`devflow runner request`；容器內修不了就 `capability` block，不連開補診斷 PR。
 - **`default branch tip only` 失敗**：不是程式問題，追最新 commit 的 deploy run（沒有就 `gh workflow run deploy.yml --ref <default>`），不要 rerun 舊 run。
 
