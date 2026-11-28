@@ -234,6 +234,108 @@ def body_hygiene_leaks(text: str) -> list[str]:
     return [label for label, pat in LEAK_PATTERNS if pat.search(text or "")]
 
 
+_CARD_SECTION_HEAD_RE = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.M)
+_CLAUSE_SPLIT_RE = re.compile(r"[\n。；;]+")
+
+
+def parse_card_sections(body: str | None) -> list[tuple[str, str]]:
+    """Split a card body into ordered `(heading, content)` pairs (`""` for leading preamble)."""
+    text = body or ""
+    matches = list(_CARD_SECTION_HEAD_RE.finditer(text))
+    if not matches:
+        stripped = text.strip()
+        return [("", stripped)] if stripped else []
+    sections: list[tuple[str, str]] = []
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        sections.append(("", preamble))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((m.group(1).strip(), text[m.end():end].strip()))
+    return sections
+
+
+def strip_excluded_card_fields(text: str, excluded_fields: list[str] | tuple[str, ...]) -> str:
+    """Drop single-line structured directive fields (`Field: ...`) exempt from handoff checks."""
+    fields = [re.escape(str(f).strip()) for f in (excluded_fields or ()) if str(f).strip()]
+    if not fields:
+        return text or ""
+    field_re = re.compile(rf"^\s*(?:{'|'.join(fields)})[：:]", re.I)
+    return "\n".join(line for line in (text or "").splitlines() if not field_re.match(line))
+
+
+def _compile_patterns(raw_patterns: list[str] | tuple[str, ...], *, flags: int = 0) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pat in raw_patterns or ():
+        if not isinstance(pat, str) or not pat.strip():
+            continue
+        try:
+            compiled.append(re.compile(pat, flags))
+        except re.error:
+            continue
+    return compiled
+
+
+def post_handoff_problems(kind: str | None, body: str | None, handoff_rules: dict | None) -> list[str]:
+    """Detect post-handoff lifecycle criteria (review/approval, merge/deploy, live acceptance)
+    leaked into author-stage card sections before handoff, driven declaratively by policy rules."""
+    if not isinstance(handoff_rules, dict):
+        return []
+    target_cards = {str(k).strip().upper() for k in (handoff_rules.get("cards") or ()) if str(k).strip()}
+    if not kind or kind.strip().upper() not in target_cards:
+        return []
+    excluded_sections = {str(s).strip() for s in (handoff_rules.get("excluded_sections") or ()) if str(s).strip()}
+    if done_heading := str(handoff_rules.get("done_heading") or "").strip():
+        excluded_sections.add(done_heading.lstrip("#").strip())
+    excluded_fields = list(handoff_rules.get("excluded_fields") or ())
+    negations = _compile_patterns(handoff_rules.get("negation_prefixes") or (), flags=re.I)
+
+    compiled_rules: list[tuple[str, str, list[re.Pattern[str]]]] = []
+    for item in handoff_rules.get("post_handoff_clauses") or ():
+        if not isinstance(item, dict):
+            continue
+        stage = str(item.get("stage") or "downstream").strip()
+        label = str(item.get("label") or item.get("id") or "下游階段條件").strip()
+        pats = _compile_patterns(item.get("patterns") or (), flags=re.I)
+        if pats:
+            compiled_rules.append((stage, label, pats))
+    if not compiled_rules:
+        return []
+
+    findings: list[str] = []
+    seen_hits: set[tuple[str, str, str]] = set()
+    for heading, raw_section in parse_card_sections(body):
+        if heading in excluded_sections:
+            continue
+        cleaned = strip_excluded_card_fields(raw_section, excluded_fields)
+        if not cleaned.strip():
+            continue
+        sec_label = f"`## {heading}`" if heading else "卡片前言"
+        for clause in _CLAUSE_SPLIT_RE.split(cleaned):
+            clause_str = clause.strip()
+            if not clause_str:
+                continue
+            for stage, label, pats in compiled_rules:
+                for pat in pats:
+                    m = pat.search(clause_str)
+                    if not m:
+                        continue
+                    prefix = clause_str[max(0, m.start() - 28):m.start()]
+                    if any(neg.search(prefix) for neg in negations):
+                        continue
+                    snippet = m.group(0).strip()
+                    sig = (sec_label, stage, label)
+                    if sig in seen_hits:
+                        break
+                    seen_hits.add(sig)
+                    findings.append(
+                        f"{sec_label} 不可要求{label}（「{snippet}」屬於送審後 `{stage}` 階段）："
+                        "goal_mode 會在送審前卡死；請只寫送審前可驗證交付，或移入 `Non-Goals` / repo 政策 / `[SHIP]` / EPIC"
+                    )
+                    break
+    return findings
+
+
 def extract_kanban_task_id(pr_body: str | None) -> str | None:
     m = KANBAN_TASK_RE.search(pr_body or "")
     return m.group(1) if m else None

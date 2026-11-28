@@ -43,7 +43,7 @@ worker 內只能用 `kanban_*`。需要 edit／link／unlink／archive／assign�
    Verify: <針對性快測指令，選填>
    EPIC: t_xxxx
    ```
-   `## 本卡完成` 一字不改照抄；PR 卡不可只覆蓋 `[manual]` AC；body 是規格不是紀錄，PR 號、SHA、經過寫進 `kanban_comment`。務必在建卡時就加 `goal_mode=true`（Hermes 工具無法事後修改；等待中的卡雖會由 `devflow tick` 在 DB 原地補開，但若在 tick 前已被認領就會以非 goal mode 執行，屆時只能作廢重建）。
+   `## 本卡完成` 一字不改照抄；PR 卡不可只覆蓋 `[manual]` AC；`## 目標` 與 `## 驗收` 只寫作者送審前可驗證的交付物，嚴禁寫入獨立審查／批准（含指定審核者帳號）、合併部署或真人驗收等送審後條件（寫進會導致 `goal_mode` 無法轉進 `review` 欄；下游規則見 repo 政策、`[SHIP]` 與 EPIC）；body 是規格不是紀錄，PR 號、SHA、經過寫進 `kanban_comment`。務必在建卡時就加 `goal_mode=true`（Hermes 工具無法事後修改；等待中的卡雖會由 `devflow tick` 在 DB 原地補開，但若在 tick 前已被認領就會以非 goal mode 執行，屆時只能作廢重建）。
 5. 把每條路徑的最後一張卡 `kanban_link(parent_id=<leaf>, child_id=<EPIC>)`。
 6. **自查（0 錯才准進等待）**：跑 `devflow check plan <slug> <EPIC>`。
    - `actionable_rules` 必須當場修到 `[]` 並再跑一次確認。

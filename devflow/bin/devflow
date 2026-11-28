@@ -1313,35 +1313,55 @@ def repo_deploys(board: str) -> bool:
 # passed the judge but read to devops as "complete the card, the [SHIP] reviews" (later cards
 # closed with no review); this text passed 3/3 and puts review on the card itself.
 # Which tool hands off lives in the skills (devflow-develop §6), which the judge does not read.
-DONE_HEADING = "## 本卡完成"
-DONE_TEXT = "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。"
+def _handoff_rules() -> dict[str, Any]:
+    return policy_lib.card_handoff_rules(POLICY)
+
+
+def _done_spec() -> tuple[str, str, re.Pattern[str]]:
+    rules = _handoff_rules()
+    heading = rules["done_heading"]
+    text = rules["done_text"]
+    pat = re.compile(rf"^{re.escape(heading)}[ \t]*\n(.*?)(?=^##?[ \t]|\Z)", re.M | re.S)
+    return heading, text, pat
+
+
+_INIT_DONE_HEADING, _INIT_DONE_TEXT, _INIT_DONE_RE = _done_spec()
+DONE_HEADING = _INIT_DONE_HEADING
+DONE_TEXT = _INIT_DONE_TEXT
 JUDGE_CHARS = int(POLICY["judge_chars"])
-DONE_RE = re.compile(rf"^{DONE_HEADING}[ \t]*\n(.*?)(?=^##?[ \t]|\Z)", re.M | re.S)  # its ### subsections too
+DONE_RE = _INIT_DONE_RE
 
 
 def done_problem(title: str, body: str) -> str | None:
+    heading, text, pat = _done_spec()
     goal = f"{title}\n\n{body or ''}".strip()
-    m = DONE_RE.search(goal)
+    m = pat.search(goal)
     if not m:
-        return f"缺 `{DONE_HEADING}`：goal judge 不知道送審前要完成什麼"
-    if norm(m.group(1)) != norm(DONE_TEXT):
-        return (f"`{DONE_HEADING}` 被改過：只能是「{DONE_TEXT}」。寫進送審後才會發生的事"
+        return f"缺 `{heading}`：goal judge 不知道送審前要完成什麼"
+    if norm(m.group(1)) != norm(text):
+        return (f"`{heading}` 被改過：只能是「{text}」。寫進送審後才會發生的事"
                 "（已交 review、批准、合併、部署），goal judge 會永遠拒絕送審")
     if m.end(1) > JUDGE_CHARS:
-        return f"`{DONE_HEADING}` 在第 {m.end(1)} 字才結束，goal judge 只讀前 {JUDGE_CHARS} 字：移到 `## 目標` 後面，縮短目標"
+        return f"`{heading}` 在第 {m.end(1)} 字才結束，goal judge 只讀前 {JUDGE_CHARS} 字：移到 `## 目標` 後面，縮短目標"
     return None
+
+
+def post_handoff_card_problems(kind: str | None, body: str | None) -> list[str]:
+    """Validate author-stage sections against declarative `card_handoff_rules`."""
+    return scope_lib.post_handoff_problems(kind, body, _handoff_rules())
 
 
 def repaired_done(body: str) -> str:
     """`body` with devflow's own `## 本卡完成` right after `## 目標` (else before the first `##` heading,
     else at the end: text after the section would read as part of it), any other version removed."""
-    rest = re.sub(r"\n{3,}", "\n\n", DONE_RE.sub("", body or "")).strip("\n")
+    heading, text, pat = _done_spec()
+    rest = re.sub(r"\n{3,}", "\n\n", pat.sub("", body or "")).strip("\n")
     heads = [(m.start(), m.group(1)) for m in re.finditer(r"^## (.*)$", rest, re.M)]
     goal = next((i for i, (_, h) in enumerate(heads) if h.strip() == "目標"), None)
     at = (heads[goal + 1][0] if goal + 1 < len(heads) else len(rest)) if goal is not None else (
         heads[0][0] if heads else len(rest))
     head, tail = rest[:at].rstrip("\n"), rest[at:].lstrip("\n")
-    return (head + "\n\n" if head else "") + f"{DONE_HEADING}\n{DONE_TEXT}\n" + ("\n" + tail if tail else "")
+    return (head + "\n\n" if head else "") + f"{heading}\n{text}\n" + ("\n" + tail if tail else "")
 
 
 # A card body is for a HUMAN to read and judge in seconds: plain-language goal and which ACs it covers.
@@ -1421,7 +1441,8 @@ def body_problem(kind: str, title: str, body: str) -> str | None:
     elif kind == "ADV" or title.startswith(PR_ADVISOR_TITLE):
         return None  # written by devflow itself
     elif kind in ("DEV", "OPS"):
-        text = DONE_RE.sub("", text)
+        _, _, done_pat = _done_spec()
+        text = done_pat.sub("", text)
     text = text.strip()
     issues: list[str] = []
     if len(text) > CARD_CHARS:
@@ -2060,6 +2081,8 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
                 found.append(f"{tid}: [{kind}] 後面沒有 [SHIP]，PR 不會合併部署")
             if (why := done_problem(c["title"], c["body"])):
                 found.append(f"{tid}: [{kind}] {why}")
+            for why in post_handoff_card_problems(kind, c["body"]):
+                found.append(f"{tid}: [{kind}] {why}")
             card_contract = scope_lib.parse_card_contract(c["body"])
             for scope_prob in scope_lib.allowed_scope_problems(card_contract["allowed_scope"], required=req_scope):
                 found.append(f"{tid}: [{kind}] {scope_prob}")
@@ -2588,6 +2611,7 @@ def _validate_edit_op(board: str, op: dict) -> list[str]:
     if kind in ("DEV", "OPS"):
         if why := done_problem(eff_title, eff_body):
             errs.append(why)
+        errs.extend(post_handoff_card_problems(kind, eff_body))
         repo_cfg = policy_lib.load_repo_config(entry(board).get("path")) if board in load_state() else {}
         req_scope = policy_lib.repo_require_allowed_scope(
             repo_cfg, {**POLICY, "require_allowed_scope": REQUIRE_ALLOWED_SCOPE}
@@ -7003,6 +7027,7 @@ def cmd_check_card(a) -> None:
                 findings.append(f"本 EPIC 為 {limit_label}（不開放改程式補丁），禁止建立 [{kind}] 卡")
             if why := done_problem(a.title, body):
                 findings.append(why)
+            findings.extend(post_handoff_card_problems(kind, body))
             findings.extend(scope_lib.allowed_scope_problems(contract["allowed_scope"], required=req_scope))
             parent_ids = list(getattr(a, "parent", None) or [])
             findings.extend(_arch_parent_scope_problems(board_arg or "", kind, parent_ids, contract["allowed_scope"], repo_cfg))

@@ -137,6 +137,57 @@ DEFAULT_HANDOFF_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+DEFAULT_CARD_HANDOFF_RULES: dict[str, Any] = {
+    "cards": ["DEV", "OPS"],
+    "done_heading": "## 本卡完成",
+    "done_text": "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。",
+    "excluded_sections": ["本卡完成"],
+    "excluded_fields": ["Non-Goals", "Out-of-Scope", "Allowed-Scope", "Verify", "EPIC"],
+    "negation_prefixes": [
+        r"不(?:做|負責|含|包含|需|需要|要求|得|能|可|判|視為|宣稱|涵蓋|代替|替代|進行|涉|碰)",
+        r"未(?:完成|取得|經|做|合併|部署|審查|批准|驗收|上線|通過)",
+        r"(?:非|不是|不屬|不在)本卡(?:職責|範圍|任務|完成條件)?",
+        r"排除",
+        r"(?:交)?由\s*\[?SHIP\]?\s*負責",
+        r"留待(?:後續|修正版|真人|\[?SHIP\]?)",
+    ],
+    "post_handoff_clauses": [
+        {
+            "id": "downstream_review_approval",
+            "stage": "review",
+            "label": "下游獨立審查／批准條件",
+            "patterns": [
+                r"(?:獨立|正式|原生|exact[- ]?head|非作者)\s*(?:GitHub\s*)?(?:審查|review)",
+                r"(?:審查|審核|review)\s*(?:通過|核准|批准|放行|同意|成立|結果|結論|限|交由)",
+                r"\b(?:APPROVED|CHANGES_REQUESTED)\b",
+                r"(?:kanban_request_review|review\s*欄(?:完成|通過|核准|執行|審查))",
+            ],
+        },
+        {
+            "id": "downstream_merge_deploy",
+            "stage": "ship",
+            "label": "下游合併／部署條件",
+            "patterns": [
+                r"devflow\s+ship\s+merge",
+                r"(?:合併|merge)\s*(?:PR|至\s*main|到\s*main|並\s*部署|後\s*部署|上線|出貨)",
+                r"(?:PR|pull\s*request|分支|本卡|變更|修正)\s*(?:須|需|要|應|已)?\s*(?:合併|merge|部署上線)",
+                r"(?:部署|deploy)\s*(?:上線|至\s*(?:正式|線上|Oracle|主機)|後\s*(?:驗收|驗證|上線|交接))",
+                r"\[SHIP\]\s*(?:出貨|合併|部署)",
+            ],
+        },
+        {
+            "id": "downstream_human_acceptance",
+            "stage": "accept",
+            "label": "下游真人／線上驗收條件",
+            "patterns": [
+                r"(?:真人|使用者|本人|人工)\s*(?:實測|聽驗|線上)?\s*(?:驗收|測試|確認)\s*(?:通過|完成|成功)",
+                r"(?:等待|完成|通過)\s*(?:真人|本人|使用者)\s*(?:驗收|聽驗)",
+                r"真實\s*Teams\s*會議\s*(?:驗收|聽驗|確認)",
+            ],
+        },
+    ],
+}
+
 DEFAULT_POLICY: dict[str, Any] = {
     "port_base": 18100,
     "card_chars": 600,
@@ -162,6 +213,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "modes": {k: dict(v) for k, v in DEFAULT_MODES.items()},
     "pipelines": {k: dict(v) for k, v in DEFAULT_PIPELINES.items()},
     "handoff_schemas": {k: dict(v) for k, v in DEFAULT_HANDOFF_SCHEMAS.items()},
+    "card_handoff_rules": dict(DEFAULT_CARD_HANDOFF_RULES),
 }
 
 
@@ -625,3 +677,46 @@ def handoff_schemas(policy: dict[str, Any] | None = None) -> dict[str, dict[str,
             if key and isinstance(spec, dict):
                 out[key] = _normalize_handoff_schema(spec)
     return out
+
+
+def card_handoff_rules(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return normalized declarative author-handoff rules and post-handoff lint clauses."""
+    raw = (policy or {}).get("card_handoff_rules")
+    src = raw if isinstance(raw, dict) else {}
+
+    def _str_list(val: Any, fallback: list[str]) -> list[str]:
+        if isinstance(val, list):
+            return [str(x).strip() for x in val if str(x).strip()]
+        return list(fallback)
+
+    def _clause_list(val: Any, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(val, list):
+            return [dict(item) for item in fallback]
+        out: list[dict[str, Any]] = []
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            pats = [str(p) for p in (item.get("patterns") or []) if isinstance(p, str) and p.strip()]
+            if not pats:
+                continue
+            out.append({
+                "id": str(item.get("id") or "").strip() or f"rule_{len(out) + 1}",
+                "stage": str(item.get("stage") or "downstream").strip(),
+                "label": str(item.get("label") or item.get("id") or "下游階段條件").strip(),
+                "patterns": pats,
+            })
+        return out
+
+    done_heading = str(src.get("done_heading") or DEFAULT_CARD_HANDOFF_RULES["done_heading"]).strip()
+    done_text = str(src.get("done_text") or DEFAULT_CARD_HANDOFF_RULES["done_text"]).strip()
+    return {
+        "cards": [c.upper() for c in _str_list(src.get("cards"), DEFAULT_CARD_HANDOFF_RULES["cards"])],
+        "done_heading": done_heading,
+        "done_text": done_text,
+        "excluded_sections": _str_list(src.get("excluded_sections"), DEFAULT_CARD_HANDOFF_RULES["excluded_sections"]),
+        "excluded_fields": _str_list(src.get("excluded_fields"), DEFAULT_CARD_HANDOFF_RULES["excluded_fields"]),
+        "negation_prefixes": _str_list(src.get("negation_prefixes"), DEFAULT_CARD_HANDOFF_RULES["negation_prefixes"]),
+        "post_handoff_clauses": _clause_list(
+            src.get("post_handoff_clauses"), DEFAULT_CARD_HANDOFF_RULES["post_handoff_clauses"]
+        ),
+    }
