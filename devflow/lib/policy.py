@@ -212,6 +212,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "auto_flow_adj": False,
     "require_human_approval_for_protected": True,
     "require_allowed_scope": True,
+    "require_then_clauses": False,
     "max_role_prompt_chars": 12000,
     "acceptance_source_budget": 80000,
     "acceptance_evidence_budget": 20000,
@@ -278,6 +279,7 @@ def load_policy(root: Path, roles: dict[str, Any]) -> dict[str, Any]:
         ("DEVFLOW_AUTO_FLOW_ADJ", "auto_flow_adj"),
         ("DEVFLOW_REQUIRE_HUMAN_APPROVAL_FOR_PROTECTED", "require_human_approval_for_protected"),
         ("DEVFLOW_REQUIRE_ALLOWED_SCOPE", "require_allowed_scope"),
+        ("DEVFLOW_REQUIRE_THEN_CLAUSES", "require_then_clauses"),
     ):
         raw = os.environ.get(env_key, "").strip().lower()
         if raw in ("1", "true", "yes", "on"):
@@ -635,6 +637,16 @@ def repo_require_allowed_scope(repo_cfg: dict[str, str], policy: dict[str, Any])
     if raw in ("0", "false", "no", "off"):
         return False
     return bool(policy.get("require_allowed_scope", True))
+
+
+def repo_require_then_clauses(repo_cfg: dict[str, str], policy: dict[str, Any]) -> bool:
+    """Whether non-manual scenarios must declare structured `Then` clauses mapped to assertions/receipts."""
+    raw = (repo_cfg.get("DEVFLOW_REQUIRE_THEN_CLAUSES") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(policy.get("require_then_clauses", False))
 
 
 def repo_require_human_approval(repo_cfg: dict[str, str], policy: dict[str, Any]) -> bool:

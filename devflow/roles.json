@@ -23,6 +23,7 @@
     "auto_flow_adj": false,
     "require_human_approval_for_protected": true,
     "require_allowed_scope": true,
+    "require_then_clauses": false,
     "max_role_prompt_chars": 12000,
     "acceptance_source_budget": 80000,
     "acceptance_evidence_budget": 20000,
