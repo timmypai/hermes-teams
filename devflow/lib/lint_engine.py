@@ -1325,13 +1325,15 @@ def scan_files(rules: list[LintRule], files: dict[str, str]) -> list[dict[str, A
                 continue
             lines = text.splitlines()
             if rule.kind == "regex":
+                line_hits: dict[int, str] = {}
                 for pat in rule.patterns:
                     for m in pat.finditer(text):
                         lineno = text.count("\n", 0, m.start()) + 1
-                        if _is_line_exempt(lines, lineno, rule.id):
+                        if lineno in line_hits or _is_line_exempt(lines, lineno, rule.id):
                             continue
-                        findings.append(_finding(rule, rel_path, m.group(0), line=lineno))
-                        break
+                        line_hits[lineno] = m.group(0)
+                for lineno in sorted(line_hits):
+                    findings.append(_finding(rule, rel_path, line_hits[lineno], line=lineno))
             elif rule.kind == "import_boundary":
                 ext = PurePosixPath(rel_path).suffix.lower()
                 if ext == ".py":
