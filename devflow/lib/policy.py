@@ -213,6 +213,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     "require_human_approval_for_protected": True,
     "require_allowed_scope": True,
     "max_role_prompt_chars": 12000,
+    "acceptance_source_budget": 80000,
+    "acceptance_evidence_budget": 20000,
     "default_test_paths": list(DEFAULT_TEST_PATHS),
     "default_artifact_paths": list(DEFAULT_ARTIFACT_PATHS),
     "card_executors": {k: [dict(item) for item in v] for k, v in DEFAULT_CARD_EXECUTORS.items()},
@@ -262,6 +264,8 @@ def load_policy(root: Path, roles: dict[str, Any]) -> dict[str, Any]:
         "DEVFLOW_MAX_REVIEW_ROUNDS": "max_review_rounds",
         "DEVFLOW_MAX_EPIC_CARDS": "max_epic_cards",
         "DEVFLOW_MAX_DIFF_FILES": "max_diff_files",
+        "DEVFLOW_ACCEPTANCE_SOURCE_BUDGET": "acceptance_source_budget",
+        "DEVFLOW_ACCEPTANCE_EVIDENCE_BUDGET": "acceptance_evidence_budget",
     }
     for env_key, pol_key in int_env.items():
         raw = os.environ.get(env_key, "").strip()
