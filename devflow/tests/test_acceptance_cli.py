@@ -771,6 +771,46 @@ class SourceExcerpts(Case):
         root = self.write("verify.sh", f"scenario {A2S1} x\n")
         self.assertEqual(self.df.source_excerpts(root, [A1S1]), [])
 
+    def test_deduplicates_identical_files_and_includes_referenced_companion_assertions(self) -> None:
+        shared = f"SCENARIO = '{A1S1}'\nrun(['bash', 'verify.sh'])\n"
+        self.write("group_a/runner.py", shared)
+        self.write("group_b/runner.py", shared)
+        self.write("group_b/verify.sh", "python - < test_receipts.py\n")
+        self.write("group_b/test_receipts.py", "assert receipt['checkpoint'] == 'after_replace_track'\n")
+        root = self.write("unrelated/other.py", "assert False\n")
+        parts = self.df.source_excerpts(root, [A1S1])
+        texts = [p["text"] for p in parts]
+        joined = "\n".join(texts)
+        self.assertEqual(sum("SCENARIO =" in t for t in texts), 1)
+        self.assertIn("--- source group_b/verify.sh ---", joined)
+        self.assertIn("assert receipt['checkpoint'] == 'after_replace_track'", joined)
+        self.assertNotIn("unrelated/other.py", joined)
+
+    def test_prioritizes_multi_referenced_companion_under_tight_budget(self) -> None:
+        runner = f"SCENARIO = '{A1S1}'\n# verify.sh test_receipts.py big_other.py\n"
+        verify = "run test_receipts.py\n"
+        receipts = "assert receipt['first_failed_condition'] == 'state_current'\n"
+        big_other = ("x" * 200) + "\n"
+        self.write("runner.py", runner)
+        self.write("verify.sh", verify)
+        root = self.write("test_receipts.py", receipts)
+        self.write("big_other.py", big_other)
+        tight = len(runner) + len(verify) + len(receipts)
+        parts = self.df.source_excerpts(root, [A1S1], budget=tight)
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn(receipts.strip(), joined)
+        self.assertNotIn("--- source big_other.py ---", joined)
+        self.assertNotIn("x" * 20, joined)
+
+    def test_filename_boundary_prevents_substring_false_match(self) -> None:
+        self.write("runner.py", f"SCENARIO = '{A1S1}'\nrun(['python', 'extra.py'])\n")
+        root = self.write("a.py", "should_not_match\n")
+        parts = self.df.source_excerpts(root, [A1S1])
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn("--- source runner.py ---", joined)
+        self.assertNotIn("--- source a.py ---", joined)
+        self.assertNotIn("should_not_match", joined)
+
 
 class CheckAc(Case):
     """D0: draft AC lines before the EPIC exists (no scenarios yet)."""
