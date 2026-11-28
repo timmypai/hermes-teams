@@ -27,6 +27,7 @@ metadata:
 | `devflow checkpoint SLUG TASK [--dir DIR] [--base REF] [--test T] [--summary S]` | `Stop-After: implement` 時驗證已提交本機修改並記錄本機 checkpoint（不 push、不開 PR） |
 | `devflow epic advance SLUG EPIC [--stop-after STEP \| --to-end]` | 推進分段 EPIC 的 `Start-At:`／`Stop-After:` 往下一步或結尾 |
 | `devflow scope add SLUG TASK --add GLOB... [--note T]` | 驗證並原子合併核准的 `Allowed-Scope` glob（拒絕萬用與禁止範圍） |
+| `devflow scope check SLUG TASK --paths PATH... [--dir D]` | 唯讀查詢候選路徑是否屬 `Allowed-Scope`、`test_paths`/`artifact_paths` 豁免或禁止範圍 |
 | `devflow check ac [--said TEXT] < AC行` | D0：建 EPIC 前檢查 AC 草稿 |
 | `devflow check plan SLUG EPIC [--advise]` | 計畫確定性規則（含 Mode）與範圍風險 |
 | `devflow preflight SLUG [TASK] [--dir DIR] [--pr-title T]` | 送審前確定性自檢（範圍、檔數、保護檔、公版、測試） |

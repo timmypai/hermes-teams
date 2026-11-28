@@ -4459,6 +4459,42 @@ def cmd_scope_add(a) -> None:
         }, ensure_ascii=False))
 
 
+def cmd_scope_check(a) -> None:
+    """Read-only check of candidate paths against a card's effective scope, Out-of-Scope, and policy exemptions."""
+    repo_dir_arg = getattr(a, "dir", None)
+    repo_dir = Path(repo_dir_arg) if repo_dir_arg else Path(entry(a.slug)["path"])
+    repo_cfg = policy_lib.load_repo_config(repo_dir)
+    d = json.loads(kanban(a.slug, "show", a.task, "--json"))
+    cur_body = (d.get("task") or {}).get("body") or ""
+    epic_body = _owning_epic_body(a.slug, cur_body)
+    contract = scope_lib.parse_card_contract(cur_body)
+    epic_oos = scope_lib.extract_do_not_touch_paths(
+        scope_lib.parse_epic_sections(epic_body).get("不能碰")
+    ) if epic_body else []
+    merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *epic_oos]))
+    test_paths = policy_lib.repo_test_paths(repo_cfg, POLICY)
+    artifact_paths = policy_lib.repo_artifact_paths(repo_cfg, POLICY)
+    cls = scope_lib.classify_paths_against_scope(
+        list(a.paths),
+        allowed_scope=contract["allowed_scope"],
+        out_of_scope=merged_oos,
+        test_paths=test_paths,
+        exempt_paths=artifact_paths,
+    )
+    ok = not cls["out_of_scope"] and not cls["outside"]
+    print(json.dumps({
+        "ok": ok,
+        "board": a.slug,
+        "task": a.task,
+        "allowed_scope": contract["allowed_scope"],
+        "out_of_scope_rules": merged_oos,
+        "exempt_paths": {"test_paths": test_paths, "artifact_paths": artifact_paths},
+        **cls,
+    }, ensure_ascii=False, indent=2))
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_epic_advance(a) -> None:
     """Advance an EPIC's declarative `Start-At:` / `Stop-After:` forward cleanly under per-EPIC lock."""
     if os.environ.get("HERMES_KANBAN_TASK"):
@@ -5442,15 +5478,18 @@ def judgment_fingerprint(
     base_fp = pr["fingerprint"]
     extra_protected = sorted(policy_lib.repo_protected_paths(cfg))
     test_paths = sorted(policy_lib.repo_test_paths(cfg, POLICY))
+    artifact_paths = sorted(policy_lib.repo_artifact_paths(cfg, POLICY))
     max_files = policy_lib.repo_max_diff_files(cfg, POLICY)
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
     manual_only = policy_lib.repo_deploy_manual_only(cfg)
     allow_custom = policy_lib.repo_allow_custom_delivery(cfg)
     default_tests = sorted(policy_lib.repo_test_paths({}, POLICY))
+    default_artifacts = sorted(policy_lib.repo_artifact_paths({}, POLICY))
     if (
         goal_context is None
         and not extra_protected
         and test_paths == default_tests
+        and artifact_paths == default_artifacts
         and max_files == default_max
         and not manual_only
         and not allow_custom
@@ -5461,6 +5500,7 @@ def judgment_fingerprint(
         "pr_fingerprint": base_fp,
         "goal_context": goal_context,
         "protected_paths": extra_protected,
+        "artifact_paths": artifact_paths,
         "max_diff_files": max_files,
         "deploy_manual_only": manual_only,
         "allow_custom_delivery": allow_custom,
@@ -5563,6 +5603,7 @@ def judge(pr: dict, files: list[dict], *, goal_context: dict | None = None, repo
             allowed_scope=goal_context.get("allowed_scope"),
             out_of_scope=goal_context.get("out_of_scope"),
             test_paths=policy_lib.repo_test_paths(repo_cfg or {}, POLICY),
+            exempt_paths=policy_lib.repo_artifact_paths(repo_cfg or {}, POLICY),
             max_diff_files=policy_lib.repo_max_diff_files(repo_cfg or {}, POLICY),
             file_count=len(files),
         ))
@@ -7033,7 +7074,12 @@ def cmd_check_card(a) -> None:
             findings.extend(_arch_parent_scope_problems(board_arg or "", kind, parent_ids, contract["allowed_scope"], repo_cfg))
         if why := body_problem(kind, a.title, body):
             findings.append(why)
-    print(json.dumps({"ok": not findings, "kind": kind, "contract": contract, "findings": findings},
+    exempt_paths = {
+        "test_paths": policy_lib.repo_test_paths(repo_cfg, POLICY),
+        "artifact_paths": policy_lib.repo_artifact_paths(repo_cfg, POLICY),
+    }
+    print(json.dumps({"ok": not findings, "kind": kind, "contract": contract,
+                      "exempt_paths": exempt_paths, "findings": findings},
                      ensure_ascii=False, indent=2))
     if findings:
         sys.exit(1)
@@ -7291,6 +7337,11 @@ def main() -> None:
     p.add_argument("--add", nargs="+", required=True, help="repo-relative path globs to append")
     p.add_argument("--note", default="", help="audit note posted to card comments")
     p.set_defaults(fn=cmd_scope_add)
+    p = scope_cmd.add_parser("check", help="read-only check of candidate paths against effective scope & policy exemptions")
+    p.add_argument("slug"); p.add_argument("task")
+    p.add_argument("--paths", nargs="+", required=True, help="repo-relative candidate paths to verify")
+    p.add_argument("--dir", help="optional worktree or repo directory to load .devflow/config.env")
+    p.set_defaults(fn=cmd_scope_check)
     epic_cmd = sub.add_parser("epic").add_subparsers(dest="sub", required=True)
     p = epic_cmd.add_parser("advance", help="advance an EPIC's Stop-After / Start-At pipeline step forward")
     p.add_argument("board"); p.add_argument("epic")

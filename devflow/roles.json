@@ -32,6 +32,10 @@
       ".devflow/ui/**",
       ".devflow/verify.sh"
     ],
+    "default_artifact_paths": [
+      ".devflow/lessons/**",
+      ".devflow/scenarios.json"
+    ],
     "card_executors": {
       "RES": [
         {"assignee": "researcher", "workspace": "scratch"},
