@@ -149,6 +149,56 @@
           "deploy_run_url", "integration_run_url", "acceptance_report", "verify", "followups"
         ]
       }
+    },
+    "card_handoff_rules": {
+      "cards": ["DEV", "OPS"],
+      "done_heading": "## 本卡完成",
+      "done_text": "完成條件：PR 已開、exact-head CI 綠。審查在本卡自己的 review 欄進行，不是 [SHIP] 的事；合併與部署由 [SHIP] 負責。",
+      "excluded_sections": ["本卡完成"],
+      "excluded_fields": ["Non-Goals", "Out-of-Scope", "Allowed-Scope", "Verify", "EPIC"],
+      "negation_prefixes": [
+        "不(?:做|負責|含|包含|需|需要|要求|得|能|可|判|視為|宣稱|涵蓋|代替|替代|進行|涉|碰)",
+        "未(?:完成|取得|經|做|合併|部署|審查|批准|驗收|上線|通過)",
+        "(?:非|不是|不屬|不在)本卡(?:職責|範圍|任務|完成條件)?",
+        "排除",
+        "(?:交)?由\\s*\\[?SHIP\\]?\\s*負責",
+        "留待(?:後續|修正版|真人|\\[?SHIP\\]?)"
+      ],
+      "post_handoff_clauses": [
+        {
+          "id": "downstream_review_approval",
+          "stage": "review",
+          "label": "下游獨立審查／批准條件",
+          "patterns": [
+            "(?:獨立|正式|原生|exact[- ]?head|非作者)\\s*(?:GitHub\\s*)?(?:審查|review)",
+            "(?:審查|審核|review)\\s*(?:通過|核准|批准|放行|同意|成立|結果|結論|限|交由)",
+            "\\b(?:APPROVED|CHANGES_REQUESTED)\\b",
+            "(?:kanban_request_review|review\\s*欄(?:完成|通過|核准|執行|審查))"
+          ]
+        },
+        {
+          "id": "downstream_merge_deploy",
+          "stage": "ship",
+          "label": "下游合併／部署條件",
+          "patterns": [
+            "devflow\\s+ship\\s+merge",
+            "(?:合併|merge)\\s*(?:PR|至\\s*main|到\\s*main|並\\s*部署|後\\s*部署|上線|出貨)",
+            "(?:PR|pull\\s*request|分支|本卡|變更|修正)\\s*(?:須|需|要|應|已)?\\s*(?:合併|merge|部署上線)",
+            "(?:部署|deploy)\\s*(?:上線|至\\s*(?:正式|線上|Oracle|主機)|後\\s*(?:驗收|驗證|上線|交接))",
+            "\\[SHIP\\]\\s*(?:出貨|合併|部署)"
+          ]
+        },
+        {
+          "id": "downstream_human_acceptance",
+          "stage": "accept",
+          "label": "下游真人／線上驗收條件",
+          "patterns": [
+            "(?:真人|使用者|本人|人工)\\s*(?:實測|聽驗|線上)?\\s*(?:驗收|測試|確認)\\s*(?:通過|完成|成功)",
+            "(?:等待|完成|通過)\\s*(?:真人|本人|使用者)\\s*(?:驗收|聽驗)",
+            "真實\\s*Teams\\s*會議\\s*(?:驗收|聽驗|確認)"
+          ]
+        }
+      ]
     }
   },
   "worker_config": {
