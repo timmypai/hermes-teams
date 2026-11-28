@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -4719,35 +4720,73 @@ def scenario_steps(rep: dict | None, sid: str) -> list[dict] | None:
             for s in got.get("steps") or []]
 
 
-def source_excerpts(root: Path | None, ids: list[str], budget: int = 40_000) -> list[dict]:
-    """The report's copied scenario sources (`sources/`) that mention a scenario id: the whole file
-    when it fits the budget (data-driven specs keep ids in a table far from the shared assertions),
-    else the lines around each id."""
-    if root is None or not (root / "sources").is_dir():
+def source_excerpts(root: Path | None, ids: list[str], budget: int = 80_000) -> list[dict]:
+    """The report's copied scenario sources (`sources/`) that mention a scenario id or are explicitly
+    referenced by emitted source excerpts (deduplicated by content, bounded by `budget`)."""
+    if root is None or not ids or not (root / "sources").is_dir():
         return []
+    src_root = root / "sources"
     pat = re.compile("|".join(re.escape(x) + r"(?!\d)" for x in ids))
-    parts = []
-    for p in sorted(f for f in (root / "sources").rglob("*") if f.is_file()):
+    entries: list[tuple[Path, str]] = []
+    seen_hashes: set[str] = set()
+    for p in sorted(f for f in src_root.rglob("*") if f.is_file() and f.suffix.lower() not in IMAGES):
         whole = p.read_text(errors="replace")
-        if not pat.search(whole):
+        digest = hashlib.sha256(whole.encode()).hexdigest()
+        if digest in seen_hashes:
             continue
-        if len(whole) <= budget:
-            text = whole
-        else:
-            lines = whole.splitlines()
-            spans: list[list[int]] = []
-            for i, line in enumerate(lines):
-                if pat.search(line):
-                    lo, hi = max(0, i - 30), min(len(lines), i + 40)  # shell phase functions sit above the id
-                    if spans and lo <= spans[-1][1]:
-                        spans[-1][1] = max(spans[-1][1], hi)
-                    else:
-                        spans.append([lo, hi])
-            text = "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)[:budget]
-        parts.append({"type": "input_text", "text": f"--- source {p.relative_to(root / 'sources')} ---\n{text}"})
+        seen_hashes.add(digest)
+        entries.append((p.relative_to(src_root), whole))
+
+    def clip_matched(whole: str, limit: int) -> str:
+        if len(whole) <= limit:
+            return whole
+        lines = whole.splitlines()
+        spans: list[list[int]] = []
+        for i, line in enumerate(lines):
+            if pat.search(line):
+                lo, hi = max(0, i - 30), min(len(lines), i + 40)  # shell phase functions sit above the id
+                if spans and lo <= spans[-1][1]:
+                    spans[-1][1] = max(spans[-1][1], hi)
+                else:
+                    spans.append([lo, hi])
+        return "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)[:limit]
+
+    parts: list[dict] = []
+    emitted_idx: set[int] = set()
+    emitted_texts: list[str] = []
+
+    def emit(idx: int, text: str) -> None:
+        nonlocal budget
+        rel = entries[idx][0]
+        parts.append({"type": "input_text", "text": f"--- source {rel} ---\n{text}"})
+        emitted_idx.add(idx)
+        emitted_texts.append(text)
         budget -= len(text)
-        if budget <= 0:
+
+    for idx, (_, whole) in enumerate(entries):
+        if pat.search(whole):
+            emit(idx, clip_matched(whole, budget))
+            if budget <= 0:
+                return parts
+
+    if not parts:
+        return parts
+
+    name_pats = {
+        idx: re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape(entries[idx][0].name) + r"(?![A-Za-z0-9_.-])")
+        for idx in range(len(entries)) if idx not in emitted_idx
+    }
+    while budget > 0 and name_pats:
+        ref_counts = {
+            idx: sum(1 for body in emitted_texts if n_pat.search(body))
+            for idx, n_pat in name_pats.items()
+        }
+        ref_counts = {idx: cnt for idx, cnt in ref_counts.items() if cnt > 0}
+        if not ref_counts:
             break
+        pick = min(ref_counts, key=lambda idx: (-ref_counts[idx], len(entries[idx][1]), str(entries[idx][0])))
+        name_pats.pop(pick, None)
+        emit(pick, entries[pick][1][:budget])
     return parts
 
 
