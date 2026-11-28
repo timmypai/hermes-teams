@@ -5478,15 +5478,18 @@ def judgment_fingerprint(
     base_fp = pr["fingerprint"]
     extra_protected = sorted(policy_lib.repo_protected_paths(cfg))
     test_paths = sorted(policy_lib.repo_test_paths(cfg, POLICY))
+    artifact_paths = sorted(policy_lib.repo_artifact_paths(cfg, POLICY))
     max_files = policy_lib.repo_max_diff_files(cfg, POLICY)
     default_max = int(policy_lib.DEFAULT_POLICY["max_diff_files"])
     manual_only = policy_lib.repo_deploy_manual_only(cfg)
     allow_custom = policy_lib.repo_allow_custom_delivery(cfg)
     default_tests = sorted(policy_lib.repo_test_paths({}, POLICY))
+    default_artifacts = sorted(policy_lib.repo_artifact_paths({}, POLICY))
     if (
         goal_context is None
         and not extra_protected
         and test_paths == default_tests
+        and artifact_paths == default_artifacts
         and max_files == default_max
         and not manual_only
         and not allow_custom
@@ -5497,6 +5500,7 @@ def judgment_fingerprint(
         "pr_fingerprint": base_fp,
         "goal_context": goal_context,
         "protected_paths": extra_protected,
+        "artifact_paths": artifact_paths,
         "max_diff_files": max_files,
         "deploy_manual_only": manual_only,
         "allow_custom_delivery": allow_custom,

@@ -305,6 +305,39 @@ class ScopeCheckCliAndPreflightTests(unittest.TestCase):
         self.assertIn(".devflow/lessons/**", res["exempt_paths"]["artifact_paths"])
         self.assertIn("tests/**", res["exempt_paths"]["test_paths"])
 
+    def test_judgment_fingerprint_and_resolve_inputs_bind_artifact_paths(self) -> None:
+        pr = {"fingerprint": "abc123def456"}
+        fp_default = self.df.judgment_fingerprint(pr, repo_cfg={})
+        fp_none = self.df.judgment_fingerprint(pr, repo_cfg={"DEVFLOW_ARTIFACT_PATHS": "none"})
+        fp_custom = self.df.judgment_fingerprint(
+            pr, repo_cfg={"DEVFLOW_ARTIFACT_PATHS": ".devflow/lessons/**"}
+        )
+        self.assertEqual(len({fp_default, fp_none, fp_custom}), 3)
+
+        ctx = {"epic_id": "t_ep1", "allowed_scope": ["teams_transcription/b_browser_tx.py"]}
+        fp_ctx_default = self.df.judgment_fingerprint(pr, goal_context=ctx, repo_cfg={})
+        fp_ctx_none = self.df.judgment_fingerprint(
+            pr, goal_context=ctx, repo_cfg={"DEVFLOW_ARTIFACT_PATHS": "none"}
+        )
+        fp_ctx_custom = self.df.judgment_fingerprint(
+            pr, goal_context=ctx, repo_cfg={"DEVFLOW_ARTIFACT_PATHS": ".devflow/lessons/**"}
+        )
+        self.assertEqual(len({fp_ctx_default, fp_ctx_none, fp_ctx_custom}), 3)
+
+        # resolve_pr_judgment_inputs must reflect config.env DEVFLOW_ARTIFACT_PATHS changes immediately
+        pr_full = {
+            "number": 25,
+            "title": "feat: add lesson",
+            "body": "Kanban: t_dev1",
+            "headRefOid": "a" * 40,
+            "fingerprint": "deadbeef1234",
+        }
+        _, _, eff_default = self.df.resolve_pr_judgment_inputs("app", "o/r", 25, pr_full)
+        (self.repo / ".devflow" / "config.env").write_text("DEVFLOW_ARTIFACT_PATHS=none\n", encoding="utf-8")
+        _, cfg_none, eff_none = self.df.resolve_pr_judgment_inputs("app", "o/r", 25, pr_full)
+        self.assertEqual(cfg_none.get("DEVFLOW_ARTIFACT_PATHS"), "none")
+        self.assertNotEqual(eff_default, eff_none)
+
 
 if __name__ == "__main__":
     unittest.main()
