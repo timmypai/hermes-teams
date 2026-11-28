@@ -4780,15 +4780,210 @@ def scenario_steps(rep: dict | None, sid: str) -> list[dict] | None:
             for s in got.get("steps") or []]
 
 
-def source_excerpts(root: Path | None, ids: list[str], budget: int = 80_000) -> list[dict]:
-    """The report's copied scenario sources (`sources/`) that mention a scenario id or are explicitly
-    referenced by emitted source excerpts (deduplicated by content, bounded by `budget`)."""
-    if root is None or not ids or not (root / "sources").is_dir():
+_BOUND_ID_RE = re.compile(r"^\s*(?:const|let|var|export\s+const|local|readonly)?\s*([A-Za-z_][A-Za-z0-9_]{2,})\s*[:=]")
+_BOUND_ID_ASSIGN_RE = re.compile(r"^\s*(?:const|let|var|export\s+const|local|readonly)?\s*[A-Za-z_][A-Za-z0-9_]{2,}\s*[:=]\s*[\"']")
+_CLI_FLAG_RE = re.compile(r"(?<![A-Za-z0-9_-])--[A-Za-z0-9][A-Za-z0-9_-]{1,}(?![A-Za-z0-9_-])")
+_SYM_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{5,})\b")
+_GENERIC_TOKENS = frozenset({
+    "return", "import", "assert", "export", "default", "string", "object", "number",
+    "boolean", "function", "python", "python3", "result", "report", "status",
+    "passed", "failed", "stderr", "stdout", "timeout", "expected", "actual",
+    "scenario", "scenarios", "evidence", "sources", "verify", "runner", "passed",
+    "check_call", "check_output", "run_scenario",
+})
+
+
+def _extract_local_tokens(text: str) -> tuple[set[str], set[str]]:
+    flags = {f for f in _CLI_FLAG_RE.findall(text) if f not in ("--help", "--version", "--json", "--verbose", "--quiet")}
+    syms = {
+        s for s in _SYM_TOKEN_RE.findall(text)
+        if s.lower() not in _GENERIC_TOKENS and not s.startswith("__")
+    }
+    return flags, syms
+
+
+def _merge_line_windows(lines: list[str], hit_ranges: list[tuple[int, int]]) -> str:
+    spans: list[list[int]] = []
+    for lo, hi in sorted(hit_ranges):
+        lo_c, hi_c = max(0, lo), min(len(lines), hi)
+        if spans and lo_c <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], hi_c)
+        else:
+            spans.append([lo_c, hi_c])
+    return "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)
+
+
+def _scenario_local_context(whole: str, pat: re.Pattern) -> tuple[str, set[str], set[str]]:
+    """Extract only lines and local windows around scenario IDs and their bound identifiers."""
+    lines = whole.splitlines()
+    hit_ranges: list[tuple[int, int]] = []
+    bound_names: set[str] = set()
+    for i, line in enumerate(lines):
+        if pat.search(line):
+            m = _BOUND_ID_RE.match(line)
+            if m and _BOUND_ID_ASSIGN_RE.match(line):
+                bound_names.add(m.group(1))
+                hit_ranges.append((i - 2, i + 3))
+            else:
+                hit_ranges.append((i - 35, i + 35))
+    if bound_names:
+        ident_pat = re.compile(r"\b(?:" + "|".join(re.escape(x) for x in sorted(bound_names)) + r")\b")
+        for i, line in enumerate(lines):
+            if ident_pat.search(line) and not _BOUND_ID_ASSIGN_RE.match(line):
+                hit_ranges.append((i - 35, i + 35))
+    local_text = _merge_line_windows(lines, hit_ranges) if hit_ranges else whole
+    flags, syms = _extract_local_tokens(local_text)
+    return local_text, flags, syms
+
+
+def _companion_seed_text(whole: str, flags: set[str], syms: set[str]) -> str:
+    """When extracting transitive companion refs from a multi-purpose runner/wrapper, focus on the
+    branch/lines matching the scenario's CLI flags or symbols rather than unrelated entrypoints."""
+    lines = whole.splitlines()
+    if not lines:
+        return whole
+    flag_pat = re.compile("|".join(re.escape(f) + r"(?![A-Za-z0-9_-])" for f in sorted(flags))) if flags else None
+    if flag_pat:
+        flag_hits = [(i - 5, i + 30) for i, line in enumerate(lines) if flag_pat.search(line)]
+        if flag_hits:
+            return _merge_line_windows(lines, flag_hits)
+    sym_pat = re.compile(r"\b(?:" + "|".join(re.escape(s) for s in sorted(syms)) + r")\b") if syms else None
+    if sym_pat:
+        matched_idx = [i for i, line in enumerate(lines) if sym_pat.search(line)]
+        if matched_idx and len(matched_idx) * 2 <= max(1, sum(1 for ln in lines if ln.strip())):
+            return _merge_line_windows(lines, [(i - 10, i + 30) for i in matched_idx])
+    return whole
+
+
+def _clip_relevant(whole: str, limit: int, flags: set[str], syms: set[str]) -> str:
+    if len(whole) <= limit:
+        return whole
+    if limit <= 8:
+        return whole[:limit]
+    lines = whole.splitlines()
+    tokens = sorted(flags) + sorted(syms)
+    if tokens and lines:
+        tok_pat = re.compile("|".join(re.escape(t) for t in tokens))
+        hits = [(i - 20, i + 35) for i, line in enumerate(lines) if tok_pat.search(line)]
+        if hits:
+            focused = _merge_line_windows(lines, hits)
+            if len(focused) <= limit:
+                return focused
+            # Keep matched windows around the tail/later assertions too if focused still exceeds limit.
+            half = max(1, (limit - 3) // 2)
+            return focused[:half] + "\n…\n" + focused[-(limit - half - 3):]
+    half = max(1, (limit - 3) // 2)
+    return whole[:half] + "\n…\n" + whole[-(limit - half - 3):]
+
+
+def scenario_declared_sources(evidence: list[tuple[Path, dict]], ids: list[str]) -> list[str]:
+    """Optional scenario-declared `sources` paths from verified `acceptance.json` reports."""
+    declared: list[str] = []
+    for _, rep in evidence:
+        for sid in ids:
+            got = report_scenario(rep, sid)[0] or {}
+            for raw in got.get("sources") or []:
+                if isinstance(raw, str) and raw.strip() and raw.strip() not in declared:
+                    declared.append(raw.strip())
+    return declared
+
+
+def scenario_evidence_parts(evidence: list[tuple[Path, dict]], ids: list[str],
+                            budget: int | None = None) -> tuple[list[dict], list[dict]]:
+    """Bounded non-image structured evidence files referenced by scenarios in verified `acceptance.json`."""
+    if budget is None:
+        budget = int(POLICY.get("acceptance_evidence_budget", 20_000))
+    text_exts = (".json", ".txt", ".log", ".md", ".jsonl")
+    parts: list[dict] = []
+    manifest: list[dict] = []
+    seen_hashes: set[str] = set()
+    for root, rep in evidence:
+        base = root.resolve()
+        for sid in ids:
+            got = report_scenario(rep, sid)[0] or {}
+            for raw in got.get("evidence") or []:
+                rel_s = str(raw or "").strip()
+                if not rel_s or not rel_s.lower().endswith(text_exts):
+                    continue
+                p = (root / rel_s).resolve()
+                if not p.is_relative_to(base) or not p.is_file():
+                    continue
+                whole = p.read_text(errors="replace")
+                digest = hashlib.sha256(whole.encode()).hexdigest()
+                if digest in seen_hashes:
+                    continue
+                seen_hashes.add(digest)
+                if budget <= 0:
+                    continue
+                sent = whole[:budget]
+                truncated = len(sent) < len(whole)
+                rel = p.relative_to(base)
+                parts.append({"type": "input_text", "text": f"--- evidence {rel} ---\n{sent}"})
+                manifest.append({
+                    "path": str(rel),
+                    "total_chars": len(whole),
+                    "sent_chars": len(sent),
+                    "truncated": truncated,
+                    "reason": "scenario_evidence",
+                })
+                budget -= len(sent)
+    return parts, manifest
+
+
+def source_excerpts(root: Path | None, ids: list[str], budget: int | None = None, *,
+                    declared_sources: list[str] | None = None,
+                    manifest: list[dict] | None = None) -> list[dict]:
+    """Scenario assertion source excerpts: honors scenario-declared `sources` first; otherwise matches
+    scenario IDs and ranks companion files by local-context references (avoiding multi-EPIC bloat)."""
+    if budget is None:
+        budget = int(POLICY.get("acceptance_source_budget", 80_000))
+    if root is None or not ids or budget <= 0:
+        return []
+    parts: list[dict] = []
+    seen_hashes: set[str] = set()
+
+    def record(rel_str: str, total_chars: int, sent: str, reason: str) -> None:
+        nonlocal budget
+        parts.append({"type": "input_text", "text": f"--- source {rel_str} ---\n{sent}"})
+        if manifest is not None:
+            manifest.append({
+                "path": rel_str,
+                "total_chars": total_chars,
+                "sent_chars": len(sent),
+                "truncated": len(sent) < total_chars,
+                "reason": reason,
+            })
+        budget -= len(sent)
+
+    base = root.resolve()
+    if declared_sources:
+        for raw in declared_sources:
+            rel_s = str(raw or "").strip()
+            if not rel_s:
+                continue
+            cand = None
+            for root_dir in (root, root / "sources"):
+                p = (root_dir / rel_s).resolve()
+                if p.is_relative_to(base) and p.is_file() and p.suffix.lower() not in IMAGES:
+                    cand = p
+                    break
+            if cand is None or budget <= 0:
+                continue
+            whole = cand.read_text(errors="replace")
+            digest = hashlib.sha256(whole.encode()).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+            sent = whole[:budget]
+            record(str(cand.relative_to(base)), len(whole), sent, "declared_source")
+        if parts:
+            return parts
+
+    if not (root / "sources").is_dir():
         return []
     src_root = root / "sources"
     pat = re.compile("|".join(re.escape(x) + r"(?!\d)" for x in ids))
     entries: list[tuple[Path, str]] = []
-    seen_hashes: set[str] = set()
     for p in sorted(f for f in src_root.rglob("*") if f.is_file() and f.suffix.lower() not in IMAGES):
         whole = p.read_text(errors="replace")
         digest = hashlib.sha256(whole.encode()).hexdigest()
@@ -4811,21 +5006,21 @@ def source_excerpts(root: Path | None, ids: list[str], budget: int = 80_000) -> 
                     spans.append([lo, hi])
         return "\n…\n".join("\n".join(lines[lo:hi]) for lo, hi in spans)[:limit]
 
-    parts: list[dict] = []
     emitted_idx: set[int] = set()
-    emitted_texts: list[str] = []
+    direct_seed_texts: list[str] = []
+    companion_seed_texts: list[str] = []
+    local_flags: set[str] = set()
+    local_syms: set[str] = set()
 
-    def emit(idx: int, text: str) -> None:
-        nonlocal budget
-        rel = entries[idx][0]
-        parts.append({"type": "input_text", "text": f"--- source {rel} ---\n{text}"})
-        emitted_idx.add(idx)
-        emitted_texts.append(text)
-        budget -= len(text)
-
-    for idx, (_, whole) in enumerate(entries):
+    for idx, (rel, whole) in enumerate(entries):
         if pat.search(whole):
-            emit(idx, clip_matched(whole, budget))
+            sent = clip_matched(whole, budget)
+            emitted_idx.add(idx)
+            local_text, flags, syms = _scenario_local_context(whole, pat)
+            direct_seed_texts.append(local_text)
+            local_flags |= flags
+            local_syms |= syms
+            record(str(rel), len(whole), sent, "direct_id")
             if budget <= 0:
                 return parts
 
@@ -4837,16 +5032,24 @@ def source_excerpts(root: Path | None, ids: list[str], budget: int = 80_000) -> 
         for idx in range(len(entries)) if idx not in emitted_idx
     }
     while budget > 0 and name_pats:
-        ref_counts = {
-            idx: sum(1 for body in emitted_texts if n_pat.search(body))
+        direct_counts = {
+            idx: sum(1 for body in direct_seed_texts if n_pat.search(body))
             for idx, n_pat in name_pats.items()
         }
-        ref_counts = {idx: cnt for idx, cnt in ref_counts.items() if cnt > 0}
-        if not ref_counts:
+        trans_counts = {
+            idx: direct_counts[idx] + sum(1 for body in companion_seed_texts if n_pat.search(body))
+            for idx, n_pat in name_pats.items()
+        }
+        candidates = {idx for idx, cnt in trans_counts.items() if cnt > 0}
+        if not candidates:
             break
-        pick = min(ref_counts, key=lambda idx: (-ref_counts[idx], len(entries[idx][1]), str(entries[idx][0])))
+        pick = min(candidates, key=lambda idx: (-direct_counts[idx], -trans_counts[idx], len(entries[idx][1]), str(entries[idx][0])))
         name_pats.pop(pick, None)
-        emit(pick, entries[pick][1][:budget])
+        rel, whole = entries[pick]
+        sent = _clip_relevant(whole, budget, local_flags, local_syms)
+        reason = "companion_direct" if direct_counts[pick] > 0 else "companion_transitive"
+        record(str(rel), len(whole), sent, reason)
+        companion_seed_texts.append(_companion_seed_text(whole, local_flags, local_syms))
     return parts
 
 
@@ -5173,10 +5376,17 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
             scen = [{"id": s["id"], "description": s["description"], "smoke": s["smoke"], "given": s["given"],
                      "when": s["when"], "then": s["then"], "spec_hash": s["spec_hash"], **detail[s["id"]]}
                     for s in a["scenarios"]]
+            integ_root = evidence_roots["integration"][0][0] if evidence_roots["integration"] else None
+            manifest: list[dict] = []
+            ev_parts, ev_manifest = scenario_evidence_parts(roots, ids)
+            manifest.extend(ev_manifest)
             content = [{"type": "input_text", "text": intro},
                        {"type": "input_json", "data": {"ac": a["ac"], "type": a["type"], "criterion": a["text"],
                                                        "scenarios": scen}},
-                       *source_excerpts(evidence_roots["integration"][0][0] if evidence_roots["integration"] else None, ids)]
+                       *ev_parts,
+                       *source_excerpts(integ_root, ids, declared_sources=scenario_declared_sources(roots, ids),
+                                        manifest=manifest)]
+            row["excerpt_manifest"] = manifest
             for p in scenario_shots(roots, ids):
                 content += [{"type": "input_text", "text": f"--- screenshot {p.name} ---"}, image_part(p)]
         try:

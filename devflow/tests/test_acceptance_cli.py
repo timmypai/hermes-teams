@@ -299,6 +299,27 @@ class CheckAcceptance(Case):
         code, rep = self.check()
         self.assertEqual((code, self.rows(rep)["AC-1"]["verdict"]), (1, "FAIL"))
 
+    def test_final_acceptance_includes_structured_evidence_and_excerpt_manifest(self) -> None:
+        integ_ev = self.evidence("integration", D, self.integ_run, [
+            {**self.scenario(x), "evidence": ([f"shots/{x.replace('/', '__')}.png", "receipts.json"] if x == A1S1 else [f"shots/{x.replace('/', '__')}.png"])}
+            for x in self.ids["integration"]
+        ])
+        integ_ev["receipts.json"] = json.dumps({"marker": "structured_ok"})
+        orig_materialize = self.materialize
+
+        def materialize_with_structured() -> None:
+            orig_materialize()
+            self.gh.artifacts[self.integ_run["id"]][f"devflow-evidence-integration-{self.integ_run['head_sha']}-1"] = integ_ev
+
+        self.materialize = materialize_with_structured
+        code, rep = self.check()
+        self.assertEqual(code, 0, rep)
+        row_ac1 = {r["ac"]: r for r in rep["criteria"]}["AC-1"]
+        manifest_paths = [e["path"] for e in row_ac1["excerpt_manifest"]]
+        self.assertIn("receipts.json", manifest_paths)
+        ac1_text = json.dumps([p for p in self.decided[0][2] if p["type"] != "input_image"], ensure_ascii=False)
+        self.assertIn("structured_ok", ac1_text)
+
     def test_review_checks_the_open_pr_without_deploy_or_decisions(self) -> None:
         self.pr.update(state="OPEN", mergeCommit=None)
         code, rep = self.check(review=True)
@@ -810,6 +831,113 @@ class SourceExcerpts(Case):
         self.assertIn("--- source runner.py ---", joined)
         self.assertNotIn("--- source a.py ---", joined)
         self.assertNotIn("should_not_match", joined)
+
+    def test_shared_multi_epic_runner_ignores_unrelated_epic_companions(self) -> None:
+        shared_runner = (
+            f"SCENARIO_A = '{A1S1}'\n"
+            f"SCENARIO_B = '{A2S1}'\n"
+            + ("# spacing between constants and helpers\n" * 45)
+            + "def run_a():\n"
+            + "    run(['bash', 'verify.sh', '--mode-a'])\n"
+            + "    copy('operate_export.py')\n"
+            + "    return SCENARIO_A\n"
+            + ("# filler separating handlers\n" * 45)
+            + "def run_b():\n"
+            + "    run(['bash', 'verify.sh', '--mode-b'])\n"
+            + "    copy('test_b.py')\n"
+            + "    return SCENARIO_B\n"
+        )
+        verify_sh = (
+            "if [[ \"$1\" == \"--mode-b\" ]]; then\n"
+            "  python test_b.py\n"
+            "  exit 0\n"
+            "fi\n"
+            + ("# unrelated lines\n" * 35)
+            + "python operate_export.py\n"
+        )
+        self.write("runner.py", shared_runner)
+        self.write("verify.sh", verify_sh)
+        self.write("operate_export.py", "def test_export():\n" + ("# padding\n" * 50) + "    assert 'export_only'\n")
+        root = self.write(
+            "test_b.py",
+            ("def test_legacy(): pass\n" * 120) + "assert receipt['tail_marker'] == 'exact_b'\n",
+        )
+        manifest: list[dict] = []
+        parts = self.df.source_excerpts(root, [A2S1], manifest=manifest)
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn("assert receipt['tail_marker'] == 'exact_b'", joined)
+        self.assertNotIn("export_only", joined)
+        paths = [entry["path"] for entry in manifest]
+        self.assertNotIn("operate_export.py", paths)
+        tb = next(entry for entry in manifest if entry["path"] == "test_b.py")
+        self.assertFalse(tb["truncated"])
+
+    def test_declared_sources_override_fallback_and_block_traversal(self) -> None:
+        (self.root / "secret.py").write_text("SECRET_TOKEN = 'nope'\n")
+        self.write("unrelated.py", f"SCENARIO = '{A1S1}'\n# ignored once declared_sources exists\n")
+        root = self.write("target_spec.py", "assert target_receipt['ok'] is True\n")
+        manifest: list[dict] = []
+        parts = self.df.source_excerpts(
+            root,
+            [A1S1],
+            declared_sources=["../secret.py", "target_spec.py", "sources/missing.py"],
+            manifest=manifest,
+        )
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn("assert target_receipt['ok'] is True", joined)
+        self.assertNotIn("SECRET_TOKEN", joined)
+        self.assertNotIn("unrelated.py", joined)
+        self.assertEqual([e["reason"] for e in manifest], ["declared_source"])
+
+    def test_tight_budget_companion_clipping_preserves_symbol_match_and_reports_truncated(self) -> None:
+        runner = (
+            f"SCENARIO = '{A1S1}'\n"
+            "def check_special():\n"
+            "    run('verify.sh --special-check')\n"
+            "    # test_special.py target_tail_assertion\n"
+        )
+        self.write("runner.py", runner)
+        self.write("verify.sh", "if [[ \"$1\" == \"--special-check\" ]]; then python test_special.py; fi\n")
+        long_head = ("def legacy_case():\n    assert True\n" * 60)
+        tail_assert = "\ndef target_tail_assertion():\n    assert receipt['first_failed_condition'] == 'control_open'\n"
+        root = self.write("test_special.py", long_head + tail_assert)
+        manifest: list[dict] = []
+        tight = len(runner) + 120 + 750
+        parts = self.df.source_excerpts(root, [A1S1], budget=tight, manifest=manifest)
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn("target_tail_assertion", joined)
+        ts = next(e for e in manifest if e["path"] == "test_special.py")
+        self.assertTrue(ts["truncated"])
+
+    def test_policy_acceptance_budgets_override_via_env(self) -> None:
+        import os
+        old = {k: os.environ.get(k) for k in ("DEVFLOW_ACCEPTANCE_SOURCE_BUDGET", "DEVFLOW_ACCEPTANCE_EVIDENCE_BUDGET")}
+        try:
+            os.environ["DEVFLOW_ACCEPTANCE_SOURCE_BUDGET"] = "12345"
+            os.environ["DEVFLOW_ACCEPTANCE_EVIDENCE_BUDGET"] = "6789"
+            cfg = self.df.policy_lib.load_policy(self.root / "kit", {})
+            self.assertEqual(cfg["acceptance_source_budget"], 12345)
+            self.assertEqual(cfg["acceptance_evidence_budget"], 6789)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_scenario_structured_evidence_included_and_bounded(self) -> None:
+        root = self.root / "ev_struct"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "receipts.json").write_text(json.dumps({"tx_first_failure": {"site": "guard"}}))
+        (self.root / "escape.json").write_text('{"escape": true}')
+        rep = {"scenarios": [{"id": A1S1, "evidence": ["receipts.json", "../escape.json"]}]}
+        parts, manifest = self.df.scenario_evidence_parts([(root, rep)], [A1S1], budget=5000)
+        joined = "\n".join(p["text"] for p in parts)
+        self.assertIn('"site": "guard"', joined)
+        self.assertNotIn('"escape"', joined)
+        self.assertEqual(len(manifest), 1)
+        self.assertEqual((manifest[0]["path"], manifest[0]["reason"], manifest[0]["truncated"]),
+                         ("receipts.json", "scenario_evidence", False))
 
 
 class CheckAc(Case):
