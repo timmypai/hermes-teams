@@ -29,7 +29,7 @@ _KIT_DIR = Path(__file__).resolve().parents[1]
 if str(_KIT_DIR) not in sys.path:
     sys.path.insert(0, str(_KIT_DIR))
 
-from lib import breakers, handoff as handoff_lib, kanban_adapter, lint_engine, pipeline as pipeline_lib, policy as policy_lib, preflight as preflight_lib, prompt_audit, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
+from lib import breakers, clause_contract, handoff as handoff_lib, kanban_adapter, lint_engine, pipeline as pipeline_lib, policy as policy_lib, preflight as preflight_lib, prompt_audit, scope as scope_lib, standard as standard_lib, stats as stats_lib, trust as trust_lib  # noqa: E402
 
 ROOT = Path(os.environ.get("DEVFLOW_ROOT", "/opt/data/devflow"))
 DATA = Path(os.environ.get("DEVFLOW_HERMES_DATA", "/opt/data"))
@@ -996,6 +996,8 @@ def acceptance_spec(epic: str, body: str) -> list[dict]:
             missing = [p.capitalize() for p in PHASES if not s[p]]
             if missing:
                 a["problems"].append(f"情境 {s['id']} 缺少 {'/'.join(missing)}")
+            s.setdefault("then_clauses", [])
+            s.setdefault("clause_problems", [])
             s["spec_hash"] = hashlib.sha256("\n".join(s[p] for p in PHASES).encode()).hexdigest()[:12]
     return acs
 
@@ -1027,13 +1029,16 @@ def _parse_repo_scenarios(raw: object, epic: str) -> dict[str, list[dict]]:
         if not m or m.group(1) != epic:
             continue
         ac_id = m.group(2)
+        then_text, then_clauses, clause_errs = clause_contract.parse_then_clauses(v)
         sc = {
             "id": f"{epic}/{ac_id}.{m.group(3)}",
             "smoke": bool(v.get("smoke")),
             "description": norm(str(v.get("description") or "")),
             "given": norm(str(v.get("given") or "")),
             "when": norm(str(v.get("when") or "")),
-            "then": norm(str(v.get("then") or "")),
+            "then": then_text,
+            "then_clauses": then_clauses,
+            "clause_problems": clause_errs,
             "spec_hash": "",
         }
         sc["spec_hash"] = hashlib.sha256("\n".join(sc[p] for p in PHASES).encode()).hexdigest()[:12]
@@ -2001,6 +2006,14 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
     for a in spec:
         probs = [p for p in spec_problems(a) if not (skip_scenarios and "沒有任何情境" in p)]
         found += [f"{epic}: {p}" for p in probs]
+    if not skip_scenarios:
+        clause_root = _clause_repo_root(board, e.get("path"), cards)
+        eff_cfg = {**repo_cfg, **(policy_lib.load_repo_config(clause_root) if clause_root else {})}
+        req_clauses = policy_lib.repo_require_then_clauses(eff_cfg, POLICY)
+        _, clause_errs = _scenario_clause_findings(
+            board, epic, spec, clause_root, require_clauses=req_clauses
+        )
+        found.extend(f"{epic}: {msg}" for msg in clause_errs)
     found += plan_manual_rules(epic, spec)
     body_by_tid = {}
     for msg in plan_body_rules(cards):
@@ -7295,6 +7308,74 @@ def cmd_check_card(a) -> None:
         sys.exit(1)
 
 
+def _clause_repo_root(board: str, repo_path: str | Path | None, cards: dict[str, dict] | None,
+                      dir_arg: str | Path | None = None) -> Path | None:
+    if dir_arg:
+        p = Path(dir_arg)
+        return p if p.is_dir() else None
+    for cand_dir in [*_candidate_worktrees(board, cards), Path(repo_path) if repo_path else None]:
+        if cand_dir and (Path(cand_dir) / ".devflow" / "scenarios.json").is_file():
+            return Path(cand_dir)
+    if repo_path and Path(repo_path).is_dir():
+        return Path(repo_path)
+    return None
+
+
+def _scenario_clause_findings(board: str, epic: str, spec: list[dict], repo_root: Path | None, *,
+                              require_clauses: bool) -> tuple[dict[str, list[dict]], list[str]]:
+    clauses_by_scenario: dict[str, list[dict]] = {}
+    findings: list[str] = []
+    for ac in spec:
+        if ac["type"] == "manual":
+            continue
+        for sc in ac["scenarios"]:
+            clauses = list(sc.get("then_clauses") or [])
+            clauses_by_scenario[sc["id"]] = clauses
+            for msg in sc.get("clause_problems") or []:
+                findings.append(f"情境 {sc['id']}：{msg}")
+            findings.extend(
+                clause_contract.validate_scenario_clauses(
+                    sc["id"],
+                    sc.get("then") or "",
+                    clauses,
+                    repo_root=repo_root,
+                    require_clauses=require_clauses,
+                )
+            )
+    return clauses_by_scenario, findings
+
+
+def cmd_check_clauses(a) -> None:
+    """Read-only deterministic verification of EPIC scenario Then-clauses, test AST assertions,
+    and runner reachability."""
+    e = entry(a.slug)
+    cards = plan_cards(a.slug, a.epic)
+    if a.epic not in cards or card_type(cards[a.epic]["title"]) != "EPIC":
+        die(f"{a.epic} is not an [EPIC] card on {a.slug}")
+    repo_dir_arg = getattr(a, "dir", None)
+    extra_dirs = [Path(repo_dir_arg)] if repo_dir_arg else None
+    clause_root = _clause_repo_root(a.slug, e.get("path"), cards, repo_dir_arg)
+    main_cfg = policy_lib.load_repo_config(e.get("path"))
+    root_cfg = policy_lib.load_repo_config(clause_root) if clause_root else {}
+    repo_cfg = {**main_cfg, **root_cfg}
+    req_clauses = bool(getattr(a, "require", False)) or policy_lib.repo_require_then_clauses(repo_cfg, POLICY)
+    spec = epic_acceptance_spec(a.slug, a.epic, cards[a.epic]["body"], cards=cards, extra_dirs=extra_dirs)
+    clauses_by_scenario, findings = _scenario_clause_findings(
+        a.slug, a.epic, spec, clause_root, require_clauses=req_clauses
+    )
+    print(json.dumps({
+        "ok": not findings,
+        "board": a.slug,
+        "epic": a.epic,
+        "require_then_clauses": req_clauses,
+        "repo_root": str(clause_root) if clause_root else None,
+        "clauses_by_scenario": clauses_by_scenario,
+        "findings": findings,
+    }, ensure_ascii=False, indent=2))
+    if findings:
+        sys.exit(1)
+
+
 def cmd_check_handoff(a) -> None:
     """Validate structured step handoff `metadata` against `policy.handoff_schemas`."""
     meta: Any = {}
@@ -7486,6 +7567,11 @@ def main() -> None:
     p.add_argument("--metadata", help="inline JSON metadata object to validate")
     p.add_argument("--metadata-file", help="path to JSON metadata file to validate")
     p.set_defaults(fn=cmd_check_handoff)
+    p = check.add_parser("clauses", help="verify scenario Then-clause bindings, test AST assertions, and runner reachability")
+    p.add_argument("slug"); p.add_argument("epic")
+    p.add_argument("--dir", help="optional worktree or repo directory to inspect uncommitted scenarios/tests")
+    p.add_argument("--require", action="store_true", help="require every non-manual scenario to declare Then clauses")
+    p.set_defaults(fn=cmd_check_clauses)
     p = sub.add_parser("checkpoint", help="record a verified slice checkpoint when EPIC Stop-After is implement or ci")
     p.add_argument("slug"); p.add_argument("task")
     p.add_argument("--dir", default=".", help="worktree root (default: cwd)")
