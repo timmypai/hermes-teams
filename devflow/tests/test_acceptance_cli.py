@@ -194,6 +194,7 @@ class CheckAcceptance(Case):
         self.integ_run = wf_run(300, "ci.yml", "workflow_dispatch", D, "main")
         self.base = {A1S1: "red", A1S2: "green", A2S1: "red"}  # how each scenario ran on the base
         self.ids = {"pr": list(ALL), "deploy": [A1S2], "integration": list(ALL)}
+        self.deploy_artifact: dict[str, dict] | None = None
         self.identity: dict[str, dict] = {}  # kind -> identity overrides
         self.gh.compare[(M, D)] = "ahead"
 
@@ -237,8 +238,9 @@ class CheckAcceptance(Case):
                            "acceptance-base.json": {"identity": base_rep["identity"], "base_sha": "c" * 40, "results": [
                                {"id": x, "verdict": verdicts[how], "failed_phase": None, "error": "", "exempt": None}
                                for x, how in self.base.items()]}}},
-            dep["id"]: {f"devflow-evidence-deploy-{dep['head_sha']}-1": self.evidence(
-                "deploy", dep["head_sha"], dep, [self.scenario(x) for x in self.ids["deploy"]])},
+            dep["id"]: (self.deploy_artifact if self.deploy_artifact is not None else {
+                f"devflow-evidence-deploy-{dep['head_sha']}-1": self.evidence(
+                    "deploy", dep["head_sha"], dep, [self.scenario(x) for x in self.ids["deploy"]])}),
             integ["id"]: {f"devflow-evidence-integration-{integ['head_sha']}-1": self.evidence(
                 "integration", integ["head_sha"], integ, [self.scenario(x) for x in self.ids["integration"]])},
         }
@@ -694,6 +696,53 @@ class CheckAcceptance(Case):
             rep_bad = self.df.check_acceptance("b", EPIC, [5, 6], review=False, evidence=[], tmp=Path(tmp))
         self.assertEqual([r["verdict"] for r in rep_bad["criteria"]], ["FAIL"])
         self.assertTrue(any("改寫後的不同結果" in r for r in rep_bad["criteria"][0]["reasons"]), rep_bad["criteria"])
+
+    def _configure_no_smoke_epic(self) -> None:
+        self.body = (
+            "## 目標\n診斷交付\n\n## 驗收\n"
+            "- AC-1 [lib] 診斷回執只補白名單欄位\n"
+            "  - S1 離線驗證收據\n"
+            "    - Given 相同音訊\n"
+            "    - When 重放拒絕與換軌\n"
+            "    - Then 原行為不變\n"
+            "- AC-2 [manual] 標準流程上線\n"
+        )
+        self.pr["body"] = f"Diagnostics only.\n\nCovers: {A1S1}\n"
+        self.spec = {s["id"]: s for a in self.df.acceptance_spec(EPIC, self.body) for s in a["scenarios"]}
+        self.base = {A1S1: "red"}
+        self.ids = {"pr": [A1S1], "deploy": [], "integration": [A1S1]}
+        self.deploy_artifact = {
+            f"devflow-evidence-deploy-{D}-1": {"deploy-smoke.json": {"kind": "deploy-smoke", "head_sha": D, "ok": True}},
+        }
+
+    def test_no_smoke_scenarios_passes_without_deploy_acceptance_json(self) -> None:
+        self._configure_no_smoke_epic()
+        code, rep = self.check()
+        rows = self.rows(rep)
+        self.assertEqual(code, 0, rep)
+        self.assertEqual(rep["deploy_sha"], D)
+        self.assertEqual((rows["AC-1"]["verdict"], rows["AC-2"]["verdict"]), ("PASS", "PASS"))
+        self.assertIsNone(rows["AC-1"]["scenarios"][0]["deploy"])
+
+    def test_no_smoke_scenarios_still_fails_when_deploy_run_failed_or_missing(self) -> None:
+        self._configure_no_smoke_epic()
+        self.deploy_run["conclusion"] = "failure"
+        code, rep = self.check()
+        rows = self.rows(rep)
+        self.assertEqual((code, rows["AC-1"]["verdict"]), (1, "FAIL"))
+        self.assertTrue(any("failure" in r for r in rows["AC-1"]["reasons"]), rows["AC-1"]["reasons"])
+
+        self.gh.runs["deploy.yml"] = []
+        code_missing, rep_missing = self.check()
+        rows_missing = self.rows(rep_missing)
+        self.assertEqual((code_missing, rows_missing["AC-1"]["verdict"]), (1, "FAIL"))
+        self.assertTrue(any("deploy.yml run" in r for r in rows_missing["AC-1"]["reasons"]), rows_missing["AC-1"]["reasons"])
+
+    def test_smoke_scenario_still_fails_closed_when_deploy_artifact_missing_acceptance_json(self) -> None:
+        self.deploy_artifact = {
+            f"devflow-evidence-deploy-{D}-1": {"deploy-smoke.json": {"kind": "deploy-smoke", "head_sha": D, "ok": True}},
+        }
+        self.assert_fails(["AC-1", "AC-2"], "沒有 acceptance.json")
 
 
 class SourceExcerpts(Case):

@@ -4999,18 +4999,22 @@ def check_acceptance(board: str, epic: str, numbers: list[int], *, review: bool,
                               "或它沒通過部署驗證")
             else:
                 deploy_sha = tip
-                reps, root, errs = fetch_reports(repo, r, "deploy", deploy_sha, tmp)
-                if "acceptance.json" in reps:
-                    errs += identity_errors(reps["acceptance.json"], "deploy 報告", repo, deploy_sha, r, "deploy")
-                common += errs
-                if not errs:
-                    rep = reps["acceptance.json"]
-                    evidence_roots["deploy"].append((root, rep))
-                    for x, (row, sc, cell) in cells.items():
-                        if sc["smoke"]:
-                            cell["deploy"], reasons = proof_errors(rep, sc, "deploy")
-                            row["reasons"] += reasons
-                            detail[x]["deploy"] = scenario_steps(rep, x)
+                # Deploy runs only execute `[smoke]` scenarios; repos whose EPIC has none (e.g. `[lib]`/`[cli]`)
+                # may emit only deploy-smoke receipts without `acceptance.json`. Still require deploy.yml on `tip`
+                # to succeed and verify every automated scenario against the post-merge `workflow_dispatch` integration run.
+                if any(sc["smoke"] for _, sc, _ in cells.values()):
+                    reps, root, errs = fetch_reports(repo, r, "deploy", deploy_sha, tmp)
+                    if "acceptance.json" in reps:
+                        errs += identity_errors(reps["acceptance.json"], "deploy 報告", repo, deploy_sha, r, "deploy")
+                    common += errs
+                    if not errs:
+                        rep = reps["acceptance.json"]
+                        evidence_roots["deploy"].append((root, rep))
+                        for x, (row, sc, cell) in cells.items():
+                            if sc["smoke"]:
+                                cell["deploy"], reasons = proof_errors(rep, sc, "deploy")
+                                row["reasons"] += reasons
+                                detail[x]["deploy"] = scenario_steps(rep, x)
         if deploy_sha or not deploys:
             runs = workflow_runs(repo, "ci.yml", event="workflow_dispatch", branch=branch)
             r = pick_run(runs or [], "ci.yml", "workflow_dispatch", sha=deploy_sha, branch=branch, success=not deploys)
