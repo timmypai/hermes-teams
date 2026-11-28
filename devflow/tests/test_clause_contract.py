@@ -216,8 +216,20 @@ class ClauseContractCase(unittest.TestCase):
             "        self.assertTrue(True)\n\n"
             "    def test_exit_code_only(self):\n"
             "        res = subprocess.run(['true'])\n"
-            "        self.assertEqual(res.returncode, 0)\n"
-            "        assert subprocess.run(['true']).returncode == 0\n",
+            "        self.assertEqual(res.returncode, 0, f'err={res.stderr}')\n"
+            "        assert subprocess.run(['true']).returncode == 0\n\n"
+            "    def test_hidden_inner_assert(self):\n"
+            "        def inner():\n"
+            "            assert False\n"
+            "        pass\n\n"
+            "    def test_hidden_lambda(self):\n"
+            "        f = lambda: self.assertEqual(1, 2)\n"
+            "        x = 1\n\n"
+            "    def test_const_negative_tautology(self):\n"
+            "        assert 1 != 2\n"
+            "        assert not False\n"
+            "        self.assertNotEqual(1, 2)\n"
+            "        self.assertTrue(1 == 1)\n",
             encoding="utf-8",
         )
         (self.repo_dir / "tests" / "test_syntax_err.py").write_text("def broken(:\n", encoding="utf-8")
@@ -225,9 +237,13 @@ class ClauseContractCase(unittest.TestCase):
 
         cases = [
             ("../outside.py::test_evil", "路徑穿越"),
+            ("tests/test_bad_ast.py::test_evil\x00bad", "無效"),
             ("tests/test_bad_ast.py::BadAstTests::test_pass_only", "空測試"),
             ("tests/test_bad_ast.py::BadAstTests::test_tautology", "恆真斷言"),
             ("tests/test_bad_ast.py::BadAstTests::test_exit_code_only", "只檢查 exit code"),
+            ("tests/test_bad_ast.py::BadAstTests::test_hidden_inner_assert", "缺少實質斷言"),
+            ("tests/test_bad_ast.py::BadAstTests::test_hidden_lambda", "缺少實質斷言"),
+            ("tests/test_bad_ast.py::BadAstTests::test_const_negative_tautology", "恆真斷言"),
             ("tests/test_bad_ast.py::BadAstTests::test_missing_method", "找不到測試方法"),
             ("tests/test_syntax_err.py::test_any", "無法解析"),
         ]
@@ -241,24 +257,41 @@ class ClauseContractCase(unittest.TestCase):
                 )
                 self.assertTrue(any(needle in e for e in errs), (tid, errs))
 
-    def test_runner_reachability_catches_orphan_tests_and_accepts_discovered_or_referenced(self) -> None:
+    def test_runner_reachability_and_coverage_resist_bypasses(self) -> None:
         (self.repo_dir / "orphan").mkdir()
         (self.repo_dir / "orphan" / "test_unwired.py").write_text(
             "def test_never_run():\n    x = 1 + 1\n    assert x == 2\n"
         )
+        (self.repo_dir / "tests" / "sub").mkdir(parents=True)
+        (self.repo_dir / "tests" / "sub" / "test_sub.py").write_text(
+            "def test_in_sub():\n    x = 1 + 1\n    assert x == 2\n"
+        )
         (self.repo_dir / "tests" / "test_wired.py").write_text(
             "def test_in_tests():\n    x = 1 + 1\n    assert x == 2\n"
         )
+        # Comment mentioning pytest + `pip install pytest` + pattern `-p test_wired.py` must NOT mark orphan/sub reachable!
         (self.repo_dir / ".github" / "workflows" / "ci.yml").write_text(
-            "run: python -m unittest discover -s tests -p 'test_*.py'\n"
+            "# pytest 已支援\n"
+            "run: pip install -q pytest && python3 -m unittest discover -s tests -p test_wired.py\n"
         )
-        errs_orphan = clause_contract.validate_scenario_clauses(
+        for bad_tid in ("orphan/test_unwired.py::test_never_run", "tests/sub/test_sub.py::test_in_sub"):
+            errs_bad = clause_contract.validate_scenario_clauses(
+                f"{EPIC}/AC-1.S1",
+                "孤兒",
+                [{"id": "T1", "text": "孤兒", "kind": "changes", "tests": [bad_tid]}],
+                repo_root=self.repo_dir,
+            )
+            self.assertTrue(any("未被任何 CI workflow 或 .devflow runner 執行" in e for e in errs_bad), (bad_tid, errs_bad))
+
+        # Narrow `pytest -q tests/test_wired.py` does NOT cover orphan or other tests; covers only `test_wired.py`.
+        (self.repo_dir / ".github" / "workflows" / "ci.yml").write_text("run: pytest -q tests/test_wired.py\n")
+        errs_sub = clause_contract.validate_scenario_clauses(
             f"{EPIC}/AC-1.S1",
-            "孤兒",
-            [{"id": "T1", "text": "孤兒", "kind": "changes", "tests": ["orphan/test_unwired.py::test_never_run"]}],
+            "狹義",
+            [{"id": "T1", "text": "狹義", "kind": "changes", "tests": ["tests/sub/test_sub.py::test_in_sub"]}],
             repo_root=self.repo_dir,
         )
-        self.assertTrue(any("未被任何 CI workflow 或 .devflow runner 執行" in e for e in errs_orphan), errs_orphan)
+        self.assertTrue(any("未被任何 CI workflow 或 .devflow runner 執行" in e for e in errs_sub), errs_sub)
 
         errs_ok = clause_contract.validate_scenario_clauses(
             f"{EPIC}/AC-1.S1",
@@ -267,6 +300,37 @@ class ClauseContractCase(unittest.TestCase):
             repo_root=self.repo_dir,
         )
         self.assertEqual(errs_ok, [], errs_ok)
+
+        # Coverage anti-recombination & short-tail check:
+        bypass_cases = [
+            (
+                "舊版新增首錯",
+                [{"id": "T1", "text": "舊版回 revoked_other，診斷版新增首錯與場內順序", "kind": "manual"},
+                 {"id": "T2", "text": "無可靠信號則分類未知", "kind": "manual"}],
+            ),
+            (
+                "invalid input succeeds",
+                [{"id": "T1", "text": "valid input succeeds", "kind": "manual"},
+                 {"id": "T2", "text": "invalid token fails", "kind": "manual"}],
+            ),
+            (
+                "分享順序",
+                [{"id": "T1", "text": "重放分享", "kind": "manual"},
+                 {"id": "T2", "text": "順序相同", "kind": "manual"}],
+            ),
+            (
+                "兩版在各種不同設定下都能正常執行且結果完全相同，新指標",
+                [{"id": "T1", "text": "兩版在各種不同設定下都能正常執行且結果完全相同", "kind": "manual"}],
+            ),
+            (
+                "不合法輸入通過",
+                [{"id": "T1", "text": "合法輸入通過", "kind": "manual"},
+                 {"id": "T2", "text": "不得遺漏", "kind": "manual"}],
+            ),
+        ]
+        for claim, cls in bypass_cases:
+            cov_errs = clause_contract.check_clause_coverage(f"{EPIC}/AC-1.S1", claim, cls)
+            self.assertTrue(cov_errs, (claim, cov_errs))
 
     def test_cli_check_clauses_and_require_then_clauses_policy_flag(self) -> None:
         # Policy override via env & .devflow/config.env

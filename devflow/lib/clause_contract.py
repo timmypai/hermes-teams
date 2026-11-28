@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
 import re
+import shlex
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -10,7 +13,6 @@ VALID_CLAUSE_KINDS = frozenset({"changes", "preserves", "rejects", "manual"})
 VALID_REJECT_MODES = frozenset({"new", "preserves"})
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_PUNCT_SPACE_RE = re.compile(r"[\s,，;；.。:：()（）\[\]、`'\"“”‘’\-]+")
 _CLAIM_SPLIT_RE = re.compile(r"[;；]+")
 _EXIT_CODE_NAMES = frozenset({"returncode", "exit_code", "status_code"})
 
@@ -22,19 +24,27 @@ _NEGATIVE_ASSERT_CALLS = frozenset({
 _NEGATIVE_SUBSTRINGS = ("not", "raises", "reject", "refus", "deny", "invalid", "fail", "hidden", "disabled")
 _TAUTOLOGY_FALSE_CALLS = frozenset({"assertFalse"})
 _TAUTOLOGY_TRUE_CALLS = frozenset({"assertTrue"})
-_NEGATIVE_COMPARE_CALLS = frozenset({"assertEqual", "assertIs", "assert_equal"})
+_PAIR_COMPARE_CALLS = frozenset({"assertEqual", "assertNotEqual", "assertIs", "assertIsNot", "assert_equal"})
+_UNARY_ASSERT_CALLS = frozenset({"assertTrue", "assertFalse", "assertIsNone", "assertIsNotNone"})
+_BINARY_ASSERT_CALLS = frozenset({
+    "assertEqual", "assertNotEqual", "assertIs", "assertIsNot", "assertIn", "assertNotIn",
+    "assertLess", "assertLessEqual", "assertGreater", "assertGreaterEqual",
+    "assertRegex", "assertNotRegex", "assertAlmostEqual", "assertNotAlmostEqual",
+    "assertCountEqual", "assert_equal",
+})
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-k", "-m", "-c", "-o", "-p", "-n", "-W", "--rootdir", "--confcutdir", "--maxfail",
+    "--junitxml", "--junit-xml", "--ignore", "--ignore-glob", "--deselect", "--tb",
+    "--log-level", "--basetemp", "--capture",
+})
 
 
 def _norm(text: str | None) -> str:
     return " ".join((text or "").split())
 
 
-def _strip_punct(text: str) -> str:
-    return _PUNCT_SPACE_RE.sub("", (text or "").lower())
-
-
 def _is_safe_rel_path(rel_path: str) -> bool:
-    if not rel_path or rel_path.startswith(("/", "\\")):
+    if not rel_path or "\x00" in rel_path or rel_path.startswith(("/", "\\")):
         return False
     if "\\" in rel_path:
         return False
@@ -181,46 +191,59 @@ def split_then_claims(then_text: str) -> list[str]:
     return claims
 
 
-def _char_bigram_set(text: str) -> set[str]:
-    if len(text) < 2:
-        return {text} if text else set()
-    return {text[i:i + 2] for i in range(len(text) - 1)}
+def _norm_cov(text: str) -> str:
+    """Normalize punctuation to single spaces while preserving word boundaries for coverage matching."""
+    cleaned = re.sub(r"[,，;；.。:：()（）\[\]、`'\"“”‘’]+", " ", (text or "").lower())
+    return " ".join(cleaned.split())
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    prefix = r"(?<![a-z0-9_])" if phrase and phrase[0].isascii() and phrase[0].isalnum() else ""
+    suffix = r"(?![a-z0-9_])" if phrase and phrase[-1].isascii() and phrase[-1].isalnum() else ""
+    return re.compile(prefix + re.escape(phrase) + suffix)
 
 
 def check_clause_coverage(sid: str, then_text: str, clauses: list[dict[str, Any]]) -> list[str]:
-    """Verify every claim fragment in `then_text` is covered by `clauses`."""
+    """Verify every claim fragment in `then_text` is contiguously covered by declared `clauses`.
+
+    Rejects uncovered short tails, ASCII word-prefix inversions (`invalid` vs `valid`),
+    negation prefixes (`不`), and cross-clause word recombinations.
+    """
     if not clauses:
         return []
     claims = split_then_claims(then_text)
     if not claims:
         return []
     clause_norms = sorted(
-        (_strip_punct(c["text"]) for c in clauses if c.get("text")),
+        (_norm_cov(c["text"]) for c in clauses if c.get("text")),
         key=len,
         reverse=True,
     )
     clause_norms = [c for c in clause_norms if c]
     if not clause_norms:
         return [f"情境 {sid} 的 then_clauses 缺少有效文字說明"]
-    union_norm = "".join(clause_norms)
-    union_bigrams = _char_bigram_set(union_norm)
+    clause_pats = [(c, _phrase_pattern(c)) for c in clause_norms]
     errs: list[str] = []
     for claim in claims:
-        cnorm = _strip_punct(claim)
-        if not cnorm:
+        subparts = [_norm_cov(p) for p in re.split(r"[,，]+", claim) if _norm_cov(p)]
+        if not subparts:
             continue
-        if any(cnorm in c or (len(c) >= 4 and c == cnorm) for c in clause_norms):
-            continue
-        rem = cnorm
-        for c in clause_norms:
-            if len(c) >= 4 and c in rem:
-                rem = rem.replace(c, "")
-        if not rem:
-            continue
-        unmasked_ratio = len(rem) / len(cnorm)
-        rem_bigrams = _char_bigram_set(rem)
-        bigram_overlap = (len(rem_bigrams & union_bigrams) / len(rem_bigrams)) if rem_bigrams else 0.0
-        if (unmasked_ratio > 0.20 or len(rem) >= 4) and bigram_overlap < 0.80:
+        claim_uncovered = False
+        for part in subparts:
+            if any(_phrase_pattern(part).search(c) and len(part) >= 4 for c in clause_norms):
+                continue
+            rem = part
+            for c, pat in clause_pats:
+                if pat.search(rem):
+                    rem = pat.sub("\x00", rem)
+            leftovers = [seg.strip() for seg in rem.split("\x00") if seg.strip()]
+            for seg in leftovers:
+                if len(seg) < 4 or not any(_phrase_pattern(seg).search(c) for c in clause_norms):
+                    claim_uncovered = True
+                    break
+            if claim_uncovered:
+                break
+        if claim_uncovered:
             errs.append(f"情境 {sid} 的 Then 主張「{claim}」未被 then_clauses 覆蓋")
     return errs
 
@@ -232,8 +255,8 @@ def resolve_test_id(repo_root: Path, test_id: str) -> tuple[Path | None, str | N
     """
     base = repo_root.resolve()
     tid = str(test_id or "").strip()
-    if not tid:
-        return None, None, None, "test ID 不可為空"
+    if not tid or "\x00" in tid:
+        return None, None, None, f"test ID {tid!r} 無效"
 
     if "::" in tid:
         parts = tid.split("::")
@@ -248,7 +271,10 @@ def resolve_test_id(repo_root: Path, test_id: str) -> tuple[Path | None, str | N
             return None, None, None, f"test ID {tid!r} 類別名稱無效：{cls_name!r}"
         if not _IDENT_RE.fullmatch(fn_name):
             return None, None, None, f"test ID {tid!r} 函式名稱無效：{fn_name!r}"
-        cand = (base / rel).resolve()
+        try:
+            cand = (base / rel).resolve()
+        except ValueError:
+            return None, None, None, f"test ID {tid!r} 路徑無效"
         if not cand.is_relative_to(base) or not cand.is_file():
             return None, None, None, f"找不到測試檔 {rel!r}（來自 {tid!r}）"
         return cand, cls_name, fn_name, None
@@ -264,7 +290,10 @@ def resolve_test_id(repo_root: Path, test_id: str) -> tuple[Path | None, str | N
         for prefix in (base, base / "tests"):
             if not prefix.is_dir():
                 continue
-            cand = (prefix / mod_rel).resolve()
+            try:
+                cand = (prefix / mod_rel).resolve()
+            except ValueError:
+                continue
             if cand.is_relative_to(base) and cand.is_file():
                 cls_name = rem[0] if len(rem) == 2 else None
                 fn_name = rem[-1]
@@ -273,14 +302,15 @@ def resolve_test_id(repo_root: Path, test_id: str) -> tuple[Path | None, str | N
 
 
 def _iter_func_stmts_and_exprs(fn_node: ast.AST) -> list[ast.AST]:
-    """Collect AST nodes inside `fn_node` body without descending into nested `def`/`class` defs."""
+    """Collect AST nodes inside `fn_node` body without inspecting nested/deferred defs, classes, or lambdas."""
     out: list[ast.AST] = []
-    stack: list[ast.AST] = list(getattr(fn_node, "body", ()))
+    skipped = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    stack: list[ast.AST] = [st for st in getattr(fn_node, "body", ()) if not isinstance(st, skipped)]
     while stack:
         node = stack.pop()
         out.append(node)
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(child, skipped):
                 continue
             stack.append(child)
     return out
@@ -294,9 +324,66 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
+def _const_eval(expr: ast.AST) -> tuple[bool, Any]:
+    """Deterministically evaluate pure-constant expressions to detect tautologies."""
+    if isinstance(expr, ast.Constant):
+        return True, expr.value
+    if isinstance(expr, ast.UnaryOp):
+        ok, val = _const_eval(expr.operand)
+        if not ok:
+            return False, None
+        if isinstance(expr.op, ast.Not):
+            return True, not val
+        if isinstance(expr.op, ast.USub) and isinstance(val, (int, float)) and type(val) is not bool:
+            return True, -val
+        if isinstance(expr.op, ast.UAdd) and isinstance(val, (int, float)) and type(val) is not bool:
+            return True, +val
+        return False, None
+    if isinstance(expr, ast.BoolOp):
+        vals: list[Any] = []
+        for v in expr.values:
+            ok, val = _const_eval(v)
+            if not ok:
+                return False, None
+            vals.append(val)
+        return True, (all(vals) if isinstance(expr.op, ast.And) else any(vals))
+    if isinstance(expr, ast.Compare):
+        ok_l, left = _const_eval(expr.left)
+        if not ok_l:
+            return False, None
+        cur = left
+        for op, comp in zip(expr.ops, expr.comparators):
+            ok_r, right = _const_eval(comp)
+            if not ok_r:
+                return False, None
+            if isinstance(op, ast.Eq):
+                res = cur == right
+            elif isinstance(op, ast.NotEq):
+                res = cur != right
+            elif isinstance(op, ast.Is):
+                res = cur is right
+            elif isinstance(op, ast.IsNot):
+                res = cur is not right
+            elif isinstance(op, ast.Lt):
+                res = cur < right
+            elif isinstance(op, ast.LtE):
+                res = cur <= right
+            elif isinstance(op, ast.Gt):
+                res = cur > right
+            elif isinstance(op, ast.GtE):
+                res = cur >= right
+            else:
+                return False, None
+            if not res:
+                return True, False
+            cur = right
+        return True, True
+    return False, None
+
+
 def _is_exit_code_or_const(expr: ast.AST) -> tuple[bool, bool]:
     """Return `(only_exit_code_or_const, saw_exit_code)` for an assertion expression."""
-    if isinstance(expr, ast.Constant):
+    if _const_eval(expr)[0]:
         return True, False
     if isinstance(expr, ast.Name):
         if expr.id in _EXIT_CODE_NAMES:
@@ -321,37 +408,43 @@ def _is_exit_code_or_const(expr: ast.AST) -> tuple[bool, bool]:
     return False, False
 
 
-def _expr_references_only_exit_code(expr: ast.AST) -> bool:
-    ok, saw = _is_exit_code_or_const(expr)
-    return ok and saw
-
-
 def _is_tautology_assert(stmt: ast.Assert) -> bool:
-    test = stmt.test
-    if isinstance(test, ast.Constant):
-        return bool(test.value)
-    if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
-        left, right = test.left, test.comparators[0]
-        if isinstance(left, ast.Constant) and isinstance(right, ast.Constant) and isinstance(test.ops[0], ast.Eq):
-            return left.value == right.value
-    return False
+    return _const_eval(stmt.test)[0]
+
+
+def _asserted_call_value_args(node: ast.Call, cname: str) -> list[ast.AST]:
+    """Return value expressions asserted by `node`, excluding trailing message arguments (`msg=`)."""
+    kw_vals = {
+        kw.arg: kw.value
+        for kw in node.keywords
+        if kw.arg and kw.arg != "msg"
+    }
+    if cname in _UNARY_ASSERT_CALLS:
+        if node.args:
+            return [node.args[0]]
+        return [kw_vals["expr"]] if "expr" in kw_vals else []
+    if cname in _BINARY_ASSERT_CALLS:
+        vals = list(node.args[:2])
+        for k in ("first", "second", "member", "container", "a", "b", "text", "expected_regex"):
+            if len(vals) < 2 and k in kw_vals:
+                vals.append(kw_vals[k])
+        return vals
+    return list(node.args) + list(kw_vals.values())
 
 
 def _is_tautology_call(node: ast.Call, cname: str) -> bool:
-    if cname in _TAUTOLOGY_TRUE_CALLS and node.args and isinstance(node.args[0], ast.Constant):
-        return bool(node.args[0].value)
-    if cname in _TAUTOLOGY_FALSE_CALLS and node.args and isinstance(node.args[0], ast.Constant):
-        return not bool(node.args[0].value)
-    if cname in _NEGATIVE_COMPARE_CALLS and len(node.args) >= 2:
-        a, b = node.args[0], node.args[1]
-        if isinstance(a, ast.Constant) and isinstance(b, ast.Constant):
-            return a.value == b.value
+    vals = _asserted_call_value_args(node, cname)
+    if cname in _UNARY_ASSERT_CALLS and vals:
+        return _const_eval(vals[0])[0]
+    if cname in _PAIR_COMPARE_CALLS and len(vals) >= 2:
+        return _const_eval(vals[0])[0] and _const_eval(vals[1])[0]
     return False
 
 
 def _is_empty_or_falsy_const(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant):
-        return node.value in (False, None, 0, "")
+    ok, val = _const_eval(node)
+    if ok:
+        return val in (False, None, 0, "")
     if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
         return not (node.elts if hasattr(node, "elts") else node.keys)
     return False
@@ -377,8 +470,9 @@ def _call_is_negative(node: ast.Call, cname: str) -> bool:
     low = cname.lower()
     if any(tok in low for tok in _NEGATIVE_SUBSTRINGS):
         return True
-    if cname in _NEGATIVE_COMPARE_CALLS and len(node.args) >= 2:
-        if _is_empty_or_falsy_const(node.args[0]) or _is_empty_or_falsy_const(node.args[1]):
+    vals = _asserted_call_value_args(node, cname)
+    if cname in _PAIR_COMPARE_CALLS and len(vals) >= 2:
+        if _is_empty_or_falsy_const(vals[0]) or _is_empty_or_falsy_const(vals[1]):
             return True
     return False
 
@@ -447,10 +541,8 @@ def audit_test_ast(file_path: Path, class_name: str | None, func_name: str, *,
             if _is_tautology_call(node, cname):
                 tautology_count += 1
                 continue
-            for arg in node.args:
-                real_assert_exprs.append(arg)
-            if not node.args:
-                real_assert_exprs.append(node)
+            val_args = _asserted_call_value_args(node, cname)
+            real_assert_exprs.extend(val_args or [node])
             if _call_is_negative(node, cname):
                 has_negative = True
 
@@ -472,63 +564,160 @@ def audit_test_ast(file_path: Path, class_name: str | None, func_name: str, *,
 
 def _collect_runner_texts(repo_root: Path) -> list[str]:
     texts: list[str] = []
-    patterns = [
-        repo_root / ".github" / "workflows",
-        repo_root / ".devflow",
-    ]
-    for folder in patterns:
+    for folder in (repo_root / ".github" / "workflows", repo_root / ".devflow"):
         if not folder.is_dir():
             continue
         for p in sorted(folder.rglob("*")):
             if p.is_file() and p.suffix.lower() in (".yml", ".yaml", ".sh", ".py"):
                 if p.name == "scenarios.json":
                     continue
-                with AST_SUPPRESS_ERRORS:
+                with suppress(OSError, ValueError):
                     texts.append(p.read_text(encoding="utf-8", errors="replace"))
     for root_file in ("pyproject.toml", "Makefile"):
         rf = repo_root / root_file
         if rf.is_file():
-            with AST_SUPPRESS_ERRORS:
+            with suppress(OSError, ValueError):
                 texts.append(rf.read_text(encoding="utf-8", errors="replace"))
     return texts
 
 
-class _IgnoreOS(Exception):
-    pass
+def _split_shell_segments(runner_text: str) -> list[list[str]]:
+    segments: list[list[str]] = []
+    for raw_line in runner_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Strip simple YAML step prefixes (`- run:` / `run:`) before shell tokenization.
+        stripped = re.sub(r"^(?:-\s*)?run:\s*", "", stripped)
+        for chunk in re.split(r"(?:&&|\|\||;|\|)", stripped):
+            chunk = chunk.strip()
+            if not chunk or chunk.startswith("#"):
+                continue
+            try:
+                toks = shlex.split(chunk, comments=True)
+            except ValueError:
+                toks = chunk.split()
+            while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*", toks[0]):
+                toks = toks[1:]
+            if toks:
+                segments.append(toks)
+    return segments
 
 
-from contextlib import suppress as _suppress  # noqa: E402
-AST_SUPPRESS_ERRORS = _suppress(OSError, ValueError)
+def _is_python_bin(tok: str) -> bool:
+    name = PurePosixPath(tok).name
+    return name == "python" or name.startswith("python3")
+
+
+def _unittest_discover_match(toks: list[str], rel_posix: str, filename: str) -> bool:
+    if not filename.endswith(".py"):
+        return False
+    # Expect `python [-flags] -m unittest discover ...` or `unittest discover ...`
+    idx = 0
+    if _is_python_bin(toks[0]):
+        idx = 1
+        while idx < len(toks) and toks[idx] != "-m":
+            if toks[idx] in ("-c", "-W"):
+                idx += 2
+            else:
+                idx += 1
+        if idx + 1 >= len(toks) or toks[idx] != "-m" or toks[idx + 1] != "unittest":
+            return False
+        idx += 2
+    elif toks[0] == "unittest":
+        idx = 1
+    else:
+        return False
+    if idx >= len(toks) or toks[idx] != "discover":
+        return False
+    args = toks[idx + 1:]
+    start_dir = ""
+    pattern = "test*.py"
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-s", "--start-directory") and i + 1 < len(args):
+            start_dir = args[i + 1].strip("./")
+            i += 2
+            continue
+        if arg.startswith("--start-directory="):
+            start_dir = arg.split("=", 1)[1].strip("./")
+        elif arg.startswith("-s") and len(arg) > 2:
+            start_dir = arg[2:].strip("./")
+        elif arg in ("-p", "--pattern") and i + 1 < len(args):
+            pattern = args[i + 1]
+            i += 2
+            continue
+        elif arg.startswith("--pattern="):
+            pattern = arg.split("=", 1)[1]
+        elif arg.startswith("-p") and len(arg) > 2:
+            pattern = arg[2:]
+        i += 1
+    if not fnmatch.fnmatchcase(filename, pattern):
+        return False
+    parent_dir = PurePosixPath(rel_posix).parent.as_posix()
+    if not start_dir or start_dir == ".":
+        return parent_dir == "." or parent_dir.startswith("tests")
+    return parent_dir == start_dir or parent_dir.startswith(start_dir + "/")
+
+
+def _pytest_invocation_match(toks: list[str], rel_posix: str, filename: str) -> bool:
+    if not (filename.startswith("test_") and filename.endswith(".py")) and not filename.endswith("_test.py"):
+        return False
+    idx = -1
+    if PurePosixPath(toks[0]).name == "pytest":
+        idx = 1
+    elif _is_python_bin(toks[0]):
+        j = 1
+        while j < len(toks) and toks[j] != "-m":
+            j += 2 if toks[j] in ("-c", "-W") else 1
+        if j + 1 < len(toks) and toks[j] == "-m" and toks[j + 1] == "pytest":
+            idx = j + 2
+    if idx < 0:
+        return False
+    args = toks[idx:]
+    pos_targets: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _PYTEST_VALUE_FLAGS and i + 1 < len(args):
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        pos_targets.append(arg.split("::", 1)[0].strip("./"))
+        i += 1
+    if not pos_targets:
+        return True
+    for tgt in pos_targets:
+        if not tgt or tgt == ".":
+            return True
+        if rel_posix == tgt or rel_posix.startswith(tgt.rstrip("/") + "/"):
+            return True
+    return False
 
 
 def _runner_discovers_path(runner_text: str, rel_posix: str, filename: str) -> bool:
     if not filename.endswith(".py"):
         return False
-    if re.search(rf"(?<![A-Za-z0-9_./-]){re.escape(rel_posix)}(?![A-Za-z0-9_.-])", runner_text):
+    non_comment_lines = [ln for ln in runner_text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    active_text = "\n".join(non_comment_lines)
+    if re.search(rf"(?<![A-Za-z0-9_./-]){re.escape(rel_posix)}(?![A-Za-z0-9_.-])", active_text):
         return True
-    if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(filename)}(?![A-Za-z0-9_.-])", runner_text):
+    if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(filename)}(?![A-Za-z0-9_.-])", active_text):
         return True
-    if not filename.startswith("test_"):
-        return False
-    parent_dir = PurePosixPath(rel_posix).parent.as_posix()
-    for line in runner_text.splitlines():
-        low = line.lower()
-        if "unittest" in low and "discover" in low:
-            m = re.search(r"(?:^|\s)-s\s+['\"]?([A-Za-z0-9_./-]+)['\"]?", line)
-            target_dir = m.group(1).strip("./") if m else ""
-            if not target_dir and (parent_dir == "tests" or parent_dir == "."):
-                return True
-            if target_dir and (parent_dir == target_dir or parent_dir.startswith(target_dir + "/")):
-                return True
-        if re.search(r"\bpytest\b", low):
-            if not re.search(r"\bpytest\b\s+[^\s-]+\.py\b", line):
-                return True
+    for toks in _split_shell_segments(runner_text):
+        if _unittest_discover_match(toks, rel_posix, filename):
+            return True
+        if _pytest_invocation_match(toks, rel_posix, filename):
+            return True
     return False
 
 
 def check_runner_reachability(repo_root: Path, test_path: Path, class_name: str | None, func_name: str, *,
                               require_runner: bool = False) -> list[str]:
-    """Verify `test_path` is referenced or discovered by CI/devflow runner entrypoints."""
+    """Verify `test_path` is referenced or discovered by non-comment CI/devflow runner entrypoints."""
     base = repo_root.resolve()
     try:
         rel_posix = test_path.resolve().relative_to(base).as_posix()
@@ -539,11 +728,12 @@ def check_runner_reachability(repo_root: Path, test_path: Path, class_name: str 
         return ["找不到任何 CI 或 .devflow runner 執行定義，無法驗證可達性"] if require_runner else []
     filename = test_path.name
     for txt in runner_texts:
+        active_text = "\n".join(ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#"))
         if _runner_discovers_path(txt, rel_posix, filename):
             return []
-        if class_name and re.search(rf"\b{re.escape(class_name)}\b", txt):
+        if class_name and re.search(rf"\b{re.escape(class_name)}\b", active_text):
             return []
-        if re.search(rf"\b{re.escape(func_name)}\b", txt):
+        if re.search(rf"\b{re.escape(func_name)}\b", active_text):
             return []
     return [f"測試 {rel_posix}::{func_name} 未被任何 CI workflow 或 .devflow runner 執行／探索到"]
 

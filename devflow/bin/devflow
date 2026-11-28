@@ -2008,8 +2008,8 @@ def plan_rules(board: str, epic: str, cards: dict[str, dict]) -> list[str]:
         found += [f"{epic}: {p}" for p in probs]
     if not skip_scenarios:
         clause_root = _clause_repo_root(board, e.get("path"), cards)
-        eff_cfg = policy_lib.load_repo_config(clause_root) if clause_root else repo_cfg
-        req_clauses = policy_lib.repo_require_then_clauses(eff_cfg or repo_cfg, POLICY)
+        eff_cfg = {**repo_cfg, **(policy_lib.load_repo_config(clause_root) if clause_root else {})}
+        req_clauses = policy_lib.repo_require_then_clauses(eff_cfg, POLICY)
         _, clause_errs = _scenario_clause_findings(
             board, epic, spec, clause_root, require_clauses=req_clauses
         )
@@ -7355,7 +7355,9 @@ def cmd_check_clauses(a) -> None:
     repo_dir_arg = getattr(a, "dir", None)
     extra_dirs = [Path(repo_dir_arg)] if repo_dir_arg else None
     clause_root = _clause_repo_root(a.slug, e.get("path"), cards, repo_dir_arg)
-    repo_cfg = policy_lib.load_repo_config(clause_root or e.get("path"))
+    main_cfg = policy_lib.load_repo_config(e.get("path"))
+    root_cfg = policy_lib.load_repo_config(clause_root) if clause_root else {}
+    repo_cfg = {**main_cfg, **root_cfg}
     req_clauses = bool(getattr(a, "require", False)) or policy_lib.repo_require_then_clauses(repo_cfg, POLICY)
     spec = epic_acceptance_spec(a.slug, a.epic, cards[a.epic]["body"], cards=cards, extra_dirs=extra_dirs)
     clauses_by_scenario, findings = _scenario_clause_findings(
