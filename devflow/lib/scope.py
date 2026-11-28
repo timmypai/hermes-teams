@@ -185,42 +185,78 @@ def allowed_scope_problems(allowed_scope: list[str] | None, *, required: bool = 
     return []
 
 
+def classify_paths_against_scope(
+    filenames: list[str],
+    *,
+    allowed_scope: list[str] | None = None,
+    out_of_scope: list[str] | None = None,
+    test_paths: list[str] | None = None,
+    exempt_paths: list[str] | None = None,
+) -> dict[str, list[str]]:
+    """Classify repo-relative paths into effective scope buckets (Out-of-Scope always wins)."""
+    files = sorted(set(filenames))
+    oos_pats = [p.strip() for p in (out_of_scope or []) if p and p.strip()]
+    allow_pats = [p.strip() for p in (allowed_scope or []) if p and p.strip()]
+    test_pats = [p.strip() for p in (test_paths or []) if p and p.strip()]
+    exempt_pats = [p.strip() for p in (exempt_paths or []) if p and p.strip()]
+    buckets: dict[str, list[str]] = {
+        "out_of_scope": [],
+        "allowed": [],
+        "exempt_test": [],
+        "exempt_artifact": [],
+        "outside": [],
+    }
+    for f in files:
+        is_oos = bool(oos_pats and any(match_glob(f, pat) for pat in oos_pats))
+        if is_oos:
+            buckets["out_of_scope"].append(f)
+        in_allow = not allow_pats or any(match_glob(f, pat) for pat in allow_pats)
+        in_test = any(match_glob(f, pat) for pat in test_pats)
+        in_exempt = any(match_glob(f, pat) for pat in exempt_pats)
+        if not in_allow and not in_test and not in_exempt:
+            buckets["outside"].append(f)
+        elif not is_oos:
+            if in_allow:
+                buckets["allowed"].append(f)
+            elif in_test:
+                buckets["exempt_test"].append(f)
+            else:
+                buckets["exempt_artifact"].append(f)
+    return buckets
+
+
 def check_files_against_scope(
     filenames: list[str],
     *,
     allowed_scope: list[str] | None = None,
     out_of_scope: list[str] | None = None,
     test_paths: list[str] | None = None,
+    exempt_paths: list[str] | None = None,
     max_diff_files: int | None = None,
     file_count: int | None = None,
 ) -> list[str]:
     """Deterministic diff scope checks: Out-of-Scope forbidden, Allowed-Scope bounded, file count capped.
-    Declared `test_paths` (`DEVFLOW_TEST_PATHS`) are exempted alongside `allowed_scope` but NEVER
-    override `out_of_scope`."""
+    Declared `test_paths` (`DEVFLOW_TEST_PATHS`) and `exempt_paths` (`DEVFLOW_ARTIFACT_PATHS` /
+    `policy.default_artifact_paths`) are exempted alongside `allowed_scope` but NEVER override `out_of_scope`."""
     findings: list[str] = []
     files = sorted(set(filenames))
-    if out_of_scope:
-        violated = [f for f in files if any(match_glob(f, pat) for pat in out_of_scope)]
-        if violated:
-            findings.append(
-                f"改動觸及卡片禁止範圍（Out-of-Scope）：{', '.join(violated[:10])}"
-                + (f" 等共 {len(violated)} 檔" if len(violated) > 10 else "")
-            )
-    if allowed_scope:
-        extra_tests = [p.strip() for p in (test_paths or []) if p and p.strip()]
-        # Allow declared DEVFLOW_TEST_PATHS and standard lesson/scenario paths alongside Allowed-Scope
-        # (Out-of-Scope above still strictly forbids matching paths).
-        outside = [
-            f for f in files
-            if not any(match_glob(f, pat) for pat in allowed_scope)
-            and not any(match_glob(f, pat) for pat in extra_tests)
-            and not f.startswith((".devflow/lessons/", ".devflow/scenarios.json"))
-        ]
-        if outside:
-            findings.append(
-                f"改動超出卡片宣告範圍（Allowed-Scope={', '.join(allowed_scope)}）：{', '.join(outside[:10])}"
-                + (f" 等共 {len(outside)} 檔" if len(outside) > 10 else "")
-            )
+    cls = classify_paths_against_scope(
+        files,
+        allowed_scope=allowed_scope,
+        out_of_scope=out_of_scope,
+        test_paths=test_paths,
+        exempt_paths=exempt_paths,
+    )
+    if violated := cls["out_of_scope"]:
+        findings.append(
+            f"改動觸及卡片禁止範圍（Out-of-Scope）：{', '.join(violated[:10])}"
+            + (f" 等共 {len(violated)} 檔" if len(violated) > 10 else "")
+        )
+    if outside := cls["outside"]:
+        findings.append(
+            f"改動超出卡片宣告範圍（Allowed-Scope={', '.join(allowed_scope or [])}）：{', '.join(outside[:10])}"
+            + (f" 等共 {len(outside)} 檔" if len(outside) > 10 else "")
+        )
     effective_count = len(files) if file_count is None else int(file_count)
     if max_diff_files and max_diff_files > 0 and effective_count > max_diff_files:
         findings.append(

@@ -27,6 +27,11 @@ DEFAULT_TEST_PATHS: list[str] = [
     ".devflow/verify.sh",
 ]
 
+DEFAULT_ARTIFACT_PATHS: list[str] = [
+    ".devflow/lessons/**",
+    ".devflow/scenarios.json",
+]
+
 DEFAULT_CARD_EXECUTORS: dict[str, list[dict[str, str]]] = {
     "RES": [
         {"assignee": "researcher", "workspace": "scratch"},
@@ -209,6 +214,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "require_allowed_scope": True,
     "max_role_prompt_chars": 12000,
     "default_test_paths": list(DEFAULT_TEST_PATHS),
+    "default_artifact_paths": list(DEFAULT_ARTIFACT_PATHS),
     "card_executors": {k: [dict(item) for item in v] for k, v in DEFAULT_CARD_EXECUTORS.items()},
     "modes": {k: dict(v) for k, v in DEFAULT_MODES.items()},
     "pipelines": {k: dict(v) for k, v in DEFAULT_PIPELINES.items()},
@@ -324,18 +330,34 @@ def repo_protected_paths(repo_cfg: dict[str, str]) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
-def repo_test_paths(repo_cfg: dict[str, str], policy: dict[str, Any] | None = None) -> list[str]:
-    """Optional comma-separated declared test path globs from `.devflow/config.env` (`DEVFLOW_TEST_PATHS`),
-    falling back to declarative `policy.default_test_paths` when `policy` is given.
-    Set `DEVFLOW_TEST_PATHS=none` (or `off`/`false`) in a repo to disable default test path exemptions."""
-    raw = (repo_cfg.get("DEVFLOW_TEST_PATHS") or "").strip()
+def _repo_path_list(
+    repo_cfg: dict[str, str],
+    env_key: str,
+    policy: dict[str, Any] | None,
+    policy_key: str,
+) -> list[str]:
+    raw = (repo_cfg.get(env_key) or "").strip()
     if raw:
         if raw.lower() in ("none", "off", "false", "0"):
             return []
         return [p.strip() for p in raw.split(",") if p.strip()]
     if policy is not None:
-        return [str(p).strip() for p in (policy.get("default_test_paths") or []) if str(p).strip()]
+        return [str(p).strip() for p in (policy.get(policy_key) or []) if str(p).strip()]
     return []
+
+
+def repo_test_paths(repo_cfg: dict[str, str], policy: dict[str, Any] | None = None) -> list[str]:
+    """Optional comma-separated declared test path globs from `.devflow/config.env` (`DEVFLOW_TEST_PATHS`),
+    falling back to declarative `policy.default_test_paths` when `policy` is given.
+    Set `DEVFLOW_TEST_PATHS=none` (or `off`/`false`) in a repo to disable default test path exemptions."""
+    return _repo_path_list(repo_cfg, "DEVFLOW_TEST_PATHS", policy, "default_test_paths")
+
+
+def repo_artifact_paths(repo_cfg: dict[str, str], policy: dict[str, Any] | None = None) -> list[str]:
+    """Optional comma-separated declared devflow artifact globs from `.devflow/config.env`
+    (`DEVFLOW_ARTIFACT_PATHS`), falling back to `policy.default_artifact_paths` when `policy` is given.
+    Set `DEVFLOW_ARTIFACT_PATHS=none` (or `off`/`false`/`0`) in a repo to disable default artifact exemptions."""
+    return _repo_path_list(repo_cfg, "DEVFLOW_ARTIFACT_PATHS", policy, "default_artifact_paths")
 
 
 def valid_modes(policy: dict[str, Any] | None = None) -> frozenset[str]:

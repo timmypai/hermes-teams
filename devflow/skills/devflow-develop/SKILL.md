@@ -15,7 +15,7 @@ cwd 是本卡專屬 worktree（分支 `wt/<task-id>`）。沙箱內 `.git` 唯�
 
 ## 1. 讀契約、鎖範圍（先定案再改碼）
 1. `kanban_show` 讀目標、`覆蓋：AC-n`、`Allowed-Scope:`、`Out-of-Scope:`、`Non-Goals:`、`Verify:`、parent 結論與退件理由；再 `kanban_show(<EPIC>)` 讀 `## 使用者原話`、`## 不能碰` 與對應情境。
-2. 動手前確認：預計改哪些檔、全在 `Allowed-Scope`（或測試路徑）內、不碰 `Out-of-Scope` 與未授權保護路徑、不做 `Non-Goals`。若確定必須修改範圍外檔案，**不繞過、不硬改**，直接 `kanban_block(kind="needs_input")` 列出所需精確路徑與理由，請使用者透過 `devflow answer ... --add-scope ...` 核准後再續。
+2. 動手前確認：預計改哪些檔都在有效範圍內（`Allowed-Scope` 加上 `policy`／repo 宣告的 `test_paths` 與 `artifact_paths`，如 `.devflow/lessons/**`、`.devflow/scenarios.json`）、不碰 `Out-of-Scope`／保護路徑、不做 `Non-Goals`。有疑慮一律先跑 `/opt/data/devflow/bin/devflow scope check <slug> <task-id> --dir . --paths <路徑...>`；只有回報 `outside` 才停止不硬改，`kanban_block(kind="needs_input")` 列路徑請使用者 `--add-scope` 核准。
 3. 需要時 `git fetch origin && git rebase origin/<default>`。
 
 ## 2. 先紅後綠、最小改動
@@ -24,7 +24,7 @@ cwd 是本卡專屬 worktree（分支 `wt/<task-id>`）。沙箱內 `.git` 唯�
   - `[ui]`／`[api]`：寫在 `.devflow/ui/*.spec.ts`（用 `ac.ts` 的 `scenario()`）。
   - `[cli]`／`[lib]`：寫在 `.devflow/verify.sh`（打建出的成品，不直接呼叫原始碼）。
   - 正式服務 UI 操作腳本：`.devflow/ui/ops/<op>.spec.ts`（參數讀 `DEVFLOW_OP_ARGS`、秘密只讀環境變數、結果寫 `DEVFLOW_OP_RESULT`）。
-- **修 bug／退件／部署失敗（`fix:`／`revert:` PR）**：先用會失敗的測試重現，只交付證據支持的最小修正；同類錯誤可能再犯時新增 `.devflow/lessons/L-NNNN.toml` 並在 PR 說明寫 `Lesson: L-NNNN`（或寫至少 10 字的 `No-lesson: <理由>`）；舊教訓復發要更新原教訓。
+- **修 bug／退件／部署失敗（`fix:`／`revert:` PR）**：先用會失敗的測試重現，只交付證據支持的最小修正；同類錯誤可能再犯時新增 `.devflow/lessons/L-NNNN.toml` 並在 PR 說明寫 `Lesson: L-NNNN`（或寫至少 10 字的 `No-lesson: <理由>`）；舊教訓復發要更新原教訓。非 `fix:`／`revert:` PR 勿無故加 `No-lesson:`（會觸發 `weak_exemption`）。
 - 新專案或 `[OPS]`：`devflow contract <slug> .`（有畫面加 `--ui`）補契約檔；偏離公版時 `--sync-standard` 還原。
 
 ## 3. 單一提交入口（前移卡控）

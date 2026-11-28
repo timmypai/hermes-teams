@@ -14,6 +14,7 @@ from . import lint_engine
 from .policy import (
     env_values,
     load_repo_config,
+    repo_artifact_paths,
     repo_max_diff_files,
     repo_protected_paths,
     repo_require_allowed_scope,
@@ -247,6 +248,7 @@ def run_preflight(
     contract = parse_card_contract(card_body)
     max_files = repo_max_diff_files(repo_cfg, policy)
     test_paths = repo_test_paths(repo_cfg, policy)
+    artifact_paths = repo_artifact_paths(repo_cfg, policy)
     epic_oos = extract_do_not_touch_paths(parse_epic_sections(epic_body).get("不能碰")) if epic_body else []
     merged_oos = list(dict.fromkeys([*contract["out_of_scope"], *epic_oos]))
     all_touched = touched_paths(files)
@@ -261,6 +263,7 @@ def run_preflight(
         allowed_scope=contract["allowed_scope"],
         out_of_scope=merged_oos,
         test_paths=test_paths,
+        exempt_paths=artifact_paths,
         max_diff_files=max_files,
         file_count=len(files),
     ))
